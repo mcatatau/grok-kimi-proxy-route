@@ -1,6 +1,9 @@
 import "./style.css";
 import "./app.css";
 
+import { marked } from "marked";
+import DOMPurify from "dompurify";
+
 import {
   GetBootstrap,
   ListModels,
@@ -16,6 +19,13 @@ import {
   GetStats,
 } from "../wailsjs/go/main/App";
 import { EventsOn } from "../wailsjs/runtime/runtime";
+
+// Markdown like ChatGPT: GFM, breaks for soft newlines
+marked.setOptions({
+  gfm: true,
+  breaks: true,
+  pedantic: false,
+});
 
 const state = {
   settings: {},
@@ -209,6 +219,48 @@ function escapeHtml(s) {
     .replaceAll("<", "&lt;")
     .replaceAll(">", "&gt;")
     .replaceAll('"', "&quot;");
+}
+
+/** Render markdown safely for chat bubbles (assistant + optional user). */
+function renderMarkdown(text) {
+  const raw = String(text ?? "");
+  if (!raw.trim()) return "";
+  try {
+    const html = marked.parse(raw, { async: false });
+    return DOMPurify.sanitize(html, {
+      USE_PROFILES: { html: true },
+      ADD_ATTR: ["target", "rel"],
+    });
+  } catch {
+    return `<p>${escapeHtml(raw)}</p>`;
+  }
+}
+
+function enhanceMarkdownRoot(root) {
+  if (!root) return;
+  // External links open safely
+  root.querySelectorAll("a[href]").forEach((a) => {
+    a.setAttribute("target", "_blank");
+    a.setAttribute("rel", "noopener noreferrer");
+  });
+  // Copy button on code blocks
+  root.querySelectorAll("pre").forEach((pre) => {
+    if (pre.querySelector(".code-copy")) return;
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "code-copy";
+    btn.textContent = "Copiar";
+    btn.onclick = async (e) => {
+      e.stopPropagation();
+      const code = pre.querySelector("code")?.innerText || pre.innerText;
+      try {
+        await navigator.clipboard.writeText(code);
+        btn.textContent = "Copiado";
+        setTimeout(() => (btn.textContent = "Copiar"), 1200);
+      } catch (_) {}
+    };
+    pre.appendChild(btn);
+  });
 }
 
 function globalUsage() {
@@ -629,27 +681,32 @@ function paintMessages() {
     return;
   }
 
-  // Rebuild stream (simple + consistent; streaming updates call this)
+  // Rebuild stream with markdown for assistant (and light md for user)
   const html = state.messages
     .map((m, i) => {
       if (m.role === "user") {
+        // User: preserve plain text layout but allow simple md if they paste it
+        const body = m.content?.includes("`") || m.content?.includes("**") || m.content?.includes("\n")
+          ? renderMarkdown(m.content)
+          : `<p>${escapeHtml(m.content).replaceAll("\n", "<br>")}</p>`;
         return `
           <section class="turn turn-user" data-i="${i}">
             <div class="turn-label">Você</div>
-            <div class="turn-body">${escapeHtml(m.content)}</div>
+            <div class="turn-body md">${body}</div>
           </section>
         `;
       }
       const think = m.thinking
         ? `<div class="think">${escapeHtml(m.thinking)}</div>`
         : "";
-      const cursor = m.streaming ? `<span class="cursor"></span>` : "";
+      const cursor = m.streaming ? `<span class="cursor" aria-hidden="true"></span>` : "";
       const meta = m.meta ? `<div class="turn-meta">${escapeHtml(m.meta)}</div>` : "";
+      const answer = renderMarkdown(m.content || "") + cursor;
       return `
         <section class="turn turn-assistant" data-i="${i}">
           <div class="turn-label">Grok</div>
           ${think}
-          <div class="answer">${escapeHtml(m.content || "")}${cursor}</div>
+          <div class="answer md">${answer}</div>
           ${meta}
         </section>
       `;
@@ -659,6 +716,7 @@ function paintMessages() {
   const stream = $("#stream");
   const nearBottom = stream.scrollHeight - stream.scrollTop - stream.clientHeight < 120;
   inner.innerHTML = html;
+  enhanceMarkdownRoot(inner);
   if (nearBottom || state.streaming) {
     stream.scrollTop = stream.scrollHeight;
   }
