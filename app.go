@@ -100,6 +100,8 @@ func (a *App) startup(ctx context.Context) {
 	} else {
 		runtime.LogErrorf(ctx, "sso watch mkdir: %v", err)
 	}
+	go a.autoRegisterLoop()
+
 	if settings.ProxyEnabled {
 		listen := settings.ProxyListen
 		if listen == "" {
@@ -1101,6 +1103,142 @@ func (a *App) CreateAccount(verificationURL, userCode string) *register.Result {
 		return &register.Result{Status: "error", Reason: err.Error()}
 	}
 	return result
+}
+
+func (a *App) activeAccountCount() int {
+	accounts := a.store.ListAccounts()
+	count := 0
+	for _, acc := range accounts {
+		if acc.AccessToken == "" {
+			continue
+		}
+		if acc.Expired() {
+			continue
+		}
+		if acc.IsExhausted() {
+			continue
+		}
+		count++
+	}
+	return count
+}
+
+func (a *App) autoRegisterLoop() {
+	const interval = 5 * time.Minute
+	for {
+		time.Sleep(interval)
+		if a.ctx == nil {
+			continue
+		}
+		select {
+		case <-a.ctx.Done():
+			return
+		default:
+		}
+		n := a.activeAccountCount()
+		runtime.LogInfof(a.ctx, "auto-register check: %d active accounts (need >= 2)", n)
+		if n >= 2 {
+			continue
+		}
+		need := 2 - n
+		if need > 5 {
+			need = 5
+		}
+		runtime.LogInfof(a.ctx, "auto-register: creating %d account(s)...", need)
+		for i := 0; i < need; i++ {
+			result, err := a.CreateAccountFromDevice()
+			if err != nil || result == nil || result.Status != "success" {
+				reason := "unknown"
+				if err != nil {
+					reason = err.Error()
+				} else if result != nil {
+					reason = result.Reason
+				}
+				runtime.LogErrorf(a.ctx, "auto-register: attempt %d failed: %s", i+1, reason)
+				break
+			}
+			runtime.LogInfof(a.ctx, "auto-register: account %d/%d created", i+1, need)
+		}
+	}
+}
+
+// CreateAccountFromDevice starts a device login, runs the bot, and polls for the token.
+func (a *App) CreateAccountFromDevice() (*register.Result, error) {
+	// 1. Start device login
+	dlCtx, dlCancel := context.WithTimeout(a.ctx, 180*time.Second)
+	defer dlCancel()
+
+	start, err := a.oauth.StartDevice(dlCtx)
+	if err != nil {
+		return nil, fmt.Errorf("device start: %w", err)
+	}
+	url := start.VerificationURIComplete
+	if url == "" {
+		url = start.VerificationURI
+	}
+
+	// 2. Run the bot
+	botCtx, botCancel := context.WithTimeout(a.ctx, 180*time.Second)
+	defer botCancel()
+
+	result, err := a.register.CreateAccount(botCtx, url, start.UserCode, func(p register.Progress) {
+		runtime.LogInfof(a.ctx, "register step: %s", p.Step)
+	})
+	if err != nil {
+		return nil, fmt.Errorf("bot: %w", err)
+	}
+	if result == nil || result.Status != "success" {
+		return result, nil
+	}
+
+	// 3. Poll for the token
+	token, err := a.oauth.PollDevice(dlCtx, start.DeviceCode, start.Interval)
+	if err != nil {
+		return nil, fmt.Errorf("poll device: %w", err)
+	}
+
+	// 4. Import the token as a normal account
+	_, err = a.ImportSSO(token.AccessToken)
+	if err != nil {
+		return nil, fmt.Errorf("import sso: %w", err)
+	}
+
+	return result, nil
+}
+
+// CreateAccounts is the Wails binding: creates up to n accounts (max 5).
+func (a *App) CreateAccounts(n int) []map[string]any {
+	results := make([]map[string]any, 0, n)
+	if n > 5 {
+		n = 5
+	}
+	for i := 0; i < n; i++ {
+		cur := a.activeAccountCount()
+		if cur >= 5 {
+			runtime.LogInfof(a.ctx, "CreateAccounts: already 5+ active, stopping")
+			break
+		}
+		result, err := a.CreateAccountFromDevice()
+		entry := map[string]any{
+			"attempt": i + 1,
+		}
+		if err != nil {
+			entry["status"] = "error"
+			entry["reason"] = err.Error()
+		} else if result == nil {
+			entry["status"] = "error"
+			entry["reason"] = "no result"
+		} else {
+			entry["status"] = result.Status
+			entry["reason"] = result.Reason
+			if result.Creds != nil {
+				entry["creds"] = result.Creds
+			}
+		}
+		results = append(results, entry)
+		runtime.LogInfof(a.ctx, "CreateAccounts: %d/%d: %s", i+1, n, entry["status"])
+	}
+	return results
 }
 
 func strMap(m map[string]any, k string) string {

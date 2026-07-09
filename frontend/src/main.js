@@ -17,6 +17,7 @@ import {
   StartDeviceLogin,
   CancelDeviceLogin,
   CreateAccount,
+  CreateAccounts,
   OpenExternal,
   UpdateSettings,
   SendChat,
@@ -307,6 +308,7 @@ function ensureShell() {
           <div class="rail-actions" style="margin-top:10px">
             <button class="btn btn-solid" id="btn-add">+ Adicionar conta</button>
             <button class="btn btn-quiet" id="btn-auto-register" style="margin-top:4px">+ Criar automático</button>
+            <button class="btn btn-quiet" id="btn-batch-create" style="margin-top:4px">+ Gerar contas</button>
             <button class="btn btn-quiet" id="btn-import-sso" style="margin-top:6px">Importar SSO</button>
             <button class="btn btn-quiet" id="btn-import-file" style="margin-top:4px">Importar de arquivo</button>
           </div>
@@ -392,6 +394,7 @@ function ensureShell() {
 
   $("#btn-add").onclick = startLogin;
   $("#btn-auto-register").onclick = showAutoRegisterModal;
+  $("#btn-batch-create").onclick = showBatchCreateModal;
   $("#btn-import-sso").onclick = importSSO;
   $("#btn-import-file").onclick = importSSOFile;
   $("#btn-stats").onclick = openStatsModal;
@@ -838,6 +841,57 @@ function showDeviceModal(st) {
     state.device = null;
     overlay.remove();
   };
+}
+
+function showBatchCreateModal() {
+  document.querySelector(".overlay")?.remove();
+  const overlay = document.createElement("div");
+  overlay.className = "overlay";
+  overlay.innerHTML = `
+    <div class="sheet">
+      <h3>Gerar contas automaticamente</h3>
+      <p>Quantas contas criar? (máx 5, descontando as ativas)</p>
+      <input type="number" id="bc-count" value="2" min="1" max="5" style="width:80px;box-sizing:border-box" />
+      <div class="sheet-actions" style="margin-top:12px">
+        <button class="btn btn-solid" id="bc-start">Gerar</button>
+        <button class="btn btn-quiet" id="bc-cancel">Cancelar</button>
+      </div>
+      <div id="bc-progress" style="margin-top:10px;font-size:13px;color:var(--text-dim);max-height:300px;overflow-y:auto"></div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+
+  $("#bc-start", overlay).onclick = async () => {
+    const n = parseInt($("#bc-count", overlay)?.value || "2", 10);
+    const btn = $("#bc-start", overlay);
+    const prog = $("#bc-progress", overlay);
+    btn.disabled = true;
+    btn.textContent = "Gerando...";
+    prog.innerHTML = '<div style="color:#888">Aguarde, criando contas...</div>';
+    try {
+      const results = await CreateAccounts(n);
+      prog.innerHTML = results.map((r, i) => {
+        const status = r.status === "success" ? "✅" : "❌";
+        const creds = r.creds ? ` <span style="font-size:11px;color:var(--text-dim)">${escapeHtml(r.creds.email)}</span>` : "";
+        const reason = r.reason ? ` — ${escapeHtml(r.reason)}` : "";
+        return `<div>${status} Conta ${i + 1}: ${r.status}${reason}${creds}</div>`;
+      }).join("");
+      if (results.some(r => r.status === "success")) {
+        setTimeout(async () => {
+          overlay.remove();
+          await paintChrome();
+        }, 3000);
+      } else {
+        btn.disabled = false;
+        btn.textContent = "Gerar";
+      }
+    } catch (e) {
+      prog.innerHTML = `<div style="color:red">Erro: ${escapeHtml(String(e))}</div>`;
+      btn.disabled = false;
+      btn.textContent = "Gerar";
+    }
+  };
+  $("#bc-cancel", overlay).onclick = () => overlay.remove();
 }
 
 function showAutoRegisterModal() {

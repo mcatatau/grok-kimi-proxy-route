@@ -49,6 +49,31 @@ export namespace main {
 
 }
 
+export namespace register {
+	
+	export class Result {
+	    status: string;
+	    reason?: string;
+	    step?: string;
+	    screenshot?: string;
+	    creds?: Record<string, string>;
+	
+	    static createFrom(source: any = {}) {
+	        return new Result(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.status = source["status"];
+	        this.reason = source["reason"];
+	        this.step = source["step"];
+	        this.screenshot = source["screenshot"];
+	        this.creds = source["creds"];
+	    }
+	}
+
+}
+
 export namespace skills {
 	
 	export class Skill {

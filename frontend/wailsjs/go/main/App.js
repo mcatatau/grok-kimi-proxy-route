@@ -10,6 +10,18 @@ export function CancelDeviceLogin() {
   return window['go']['main']['App']['CancelDeviceLogin']();
 }
 
+export function CreateAccount(arg1, arg2) {
+  return window['go']['main']['App']['CreateAccount'](arg1, arg2);
+}
+
+export function CreateAccountFromDevice() {
+  return window['go']['main']['App']['CreateAccountFromDevice']();
+}
+
+export function CreateAccounts(arg1) {
+  return window['go']['main']['App']['CreateAccounts'](arg1);
+}
+
 export function CreateSkill(arg1, arg2, arg3) {
   return window['go']['main']['App']['CreateSkill'](arg1, arg2, arg3);
 }
