@@ -2,8 +2,8 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -11,22 +11,24 @@ import (
 	"github.com/google/uuid"
 	"github.com/wailsapp/wails/v2/pkg/runtime"
 
+	"grok-desktop/internal/mcpconfig"
 	"grok-desktop/internal/oauth"
 	"grok-desktop/internal/pricing"
 	"grok-desktop/internal/proxyhttp"
+	"grok-desktop/internal/skills"
 	"grok-desktop/internal/store"
 	"grok-desktop/internal/upstream"
-	"grok-desktop/internal/websearch"
 )
 
 type App struct {
 	ctx context.Context
 
-	store     *store.Store
-	oauth     *oauth.Client
-	upstream  *upstream.Client
-	proxy     *proxyhttp.Server
-	websearch *websearch.Client
+	store    *store.Store
+	oauth    *oauth.Client
+	upstream *upstream.Client
+	proxy    *proxyhttp.Server
+	skills   *skills.Store
+	mcp      *mcpconfig.Store
 
 	mu           sync.Mutex
 	deviceCancel context.CancelFunc
@@ -68,8 +70,17 @@ func (a *App) startup(ctx context.Context) {
 	a.store = st
 	a.oauth = oauth.New()
 	a.upstream = upstream.New()
-	a.websearch = websearch.New()
 	a.proxy = proxyhttp.New(st, a.upstream, a.ensureCreds)
+	if sk, err := skills.Open(filepath.Join(st.Root(), "skills")); err == nil {
+		a.skills = sk
+	} else {
+		runtime.LogErrorf(ctx, "skills: %v", err)
+	}
+	if mc, err := mcpconfig.Open(filepath.Join(st.Root(), "mcp_servers.json")); err == nil {
+		a.mcp = mc
+	} else {
+		runtime.LogErrorf(ctx, "mcpconfig: %v", err)
+	}
 
 	settings := st.Settings()
 	if settings.ProxyEnabled {
@@ -129,6 +140,16 @@ func (a *App) GetBootstrap() map[string]any {
 	if a.store != nil {
 		dataDir = a.store.Root()
 	}
+	skillsList := []skills.Skill{}
+	if a.skills != nil {
+		if list, err := a.skills.List(); err == nil {
+			skillsList = list
+		}
+	}
+	mcpList := []map[string]any{}
+	if a.mcp != nil {
+		mcpList = a.mcp.List(true)
+	}
 	return map[string]any{
 		"settings":       s,
 		"accounts":       a.store.PublicAccounts(),
@@ -138,6 +159,11 @@ func (a *App) GetBootstrap() map[string]any {
 		"proxy_base":     fmt.Sprintf("http://%s/v1", proxyAddr),
 		"data_dir":       dataDir,
 		"active_request": a.GetActiveRequest(),
+		"skills":         skillsList,
+		"mcp_servers":    mcpList,
+		"endpoints": []string{
+			"/v1/models", "/v1/chat/completions", "/v1/responses", "/v1/messages",
+		},
 	}
 }
 
@@ -511,7 +537,7 @@ func (a *App) SendChat(req upstream.ChatRequest) error {
 				a.setPhase("thinking")
 			case "content":
 				a.setPhase("content")
-			case "tool_call", "search_query":
+			case "tool_call", "search_query", "search_results":
 				a.setPhase("searching")
 			}
 			if ev.Account == "" {
@@ -520,23 +546,34 @@ func (a *App) SendChat(req upstream.ChatRequest) error {
 			if ev.Email == "" {
 				ev.Email = acc.Email
 			}
-			// Fan-out search UI events from tool protocol
+			// Fan-out search UI events (native xAI web_search / x_search)
 			switch ev.Type {
 			case "search_query":
-				runtime.EventsEmit(a.ctx, "search:start", map[string]any{
-					"query": ev.Text, "provider": "DuckDuckGo", "tool_call_id": ev.ID,
-				})
+				payload := map[string]any{
+					"query": ev.Text, "provider": "xAI", "tool_call_id": ev.ID,
+				}
+				if ev.Payload != nil {
+					for k, v := range ev.Payload {
+						payload[k] = v
+					}
+				}
+				runtime.EventsEmit(a.ctx, "search:start", payload)
+			case "search_results":
+				payload := map[string]any{"query": ev.Text, "provider": "xAI", "tool_call_id": ev.ID}
+				if ev.Payload != nil {
+					for k, v := range ev.Payload {
+						payload[k] = v
+					}
+				}
+				runtime.EventsEmit(a.ctx, "search:results", payload)
+				runtime.EventsEmit(a.ctx, "search:done", map[string]any{"query": ev.Text, "tool_call_id": ev.ID})
 			case "tool_call":
 				runtime.EventsEmit(a.ctx, "tool:call", map[string]any{
-					"id": ev.ID, "name": ev.Text,
-				})
-			case "tool_args":
-				runtime.EventsEmit(a.ctx, "tool:args", map[string]any{
-					"id": ev.ID, "arguments": ev.Text,
+					"id": ev.ID, "name": ev.Text, "payload": ev.Payload,
 				})
 			case "tool_done":
 				runtime.EventsEmit(a.ctx, "tool:done", map[string]any{
-					"id": ev.ID, "name": ev.Text,
+					"id": ev.ID, "name": ev.Text, "payload": ev.Payload,
 				})
 			case "tool_error":
 				runtime.EventsEmit(a.ctx, "search:error", map[string]any{
@@ -575,52 +612,16 @@ func (a *App) SendChat(req upstream.ChatRequest) error {
 			}
 		}
 
-		// Agent tools ON for chat: model decides when to call web_search.
-		// Responses API path stays plain stream (no tools yet).
-		modelID := req.Model
-		if modelID == "" {
-			modelID = settings.DefaultModel
-		}
-		mode := strings.ToLower(req.APIMode)
-		if mode == "" {
-			mode = strings.ToLower(settings.APIMode)
-		}
-		forceTools := mode != "responses" && !strings.Contains(strings.ToLower(modelID), "responses")
-		// normalize model id for upstream
-		if i := strings.Index(strings.ToLower(modelID), "-responses"); i > 0 {
-			modelID = modelID[:i]
-		}
+		// Always Responses + native server-side web_search / x_search.
 		if req.ReasoningEffort == "" {
 			req.ReasoningEffort = settings.ReasoningEffort
 		}
+		req.APIMode = "responses"
 
-		var err error
-		if forceTools {
-			err = a.upstream.StreamChatWithTools(ctx, token, settings, modelID, req.ReasoningEffort, req, emit,
-				func(ctx context.Context, query string) (string, error) {
-					res, err := a.websearch.Search(ctx, query, 8)
-					if err != nil {
-						return "", err
-					}
-					// Pretty UI payload
-					runtime.EventsEmit(a.ctx, "search:results", res)
-					runtime.EventsEmit(a.ctx, "search:done", map[string]any{"query": query})
-					// Compact JSON for the tool role
-					b, _ := json.Marshal(map[string]any{
-						"provider":    res.Provider,
-						"query":       res.Query,
-						"abstract":    res.Abstract,
-						"answer":      res.Answer,
-						"answer_url":  res.AnswerURL,
-						"duration_ms": res.DurationMs,
-						"results":     res.Results,
-					})
-					return string(b), nil
-				},
-			)
-		} else {
-			err = a.upstream.StreamChat(ctx, token, settings, label, acc.Email, req, emit)
-		}
+		// Inject skills + MCP catalog into conversation context.
+		req.Messages = a.injectAgentContext(req.Messages)
+
+		err := a.upstream.StreamChat(ctx, token, settings, label, acc.Email, req, emit)
 		if err != nil && ctx.Err() == nil {
 			runtime.EventsEmit(a.ctx, "chat:event", upstream.StreamEvent{Type: "error", Error: err.Error()})
 			runtime.EventsEmit(a.ctx, "chat:event", upstream.StreamEvent{Type: "done"})
@@ -669,4 +670,160 @@ func (a *App) ensureCreds(ctx context.Context) (string, *store.Account, store.Se
 		return "", nil, settings, fmt.Errorf("conta sem access_token")
 	}
 	return acc.AccessToken, acc, settings, nil
+}
+
+func (a *App) injectAgentContext(msgs []upstream.ChatMessage) []upstream.ChatMessage {
+	var blocks []string
+	if a.skills != nil {
+		if cat := a.skills.CatalogPrompt(); cat != "" {
+			blocks = append(blocks, cat)
+		}
+	}
+	if a.mcp != nil {
+		if cat := a.mcp.CatalogPrompt(); cat != "" {
+			blocks = append(blocks, cat)
+		}
+	}
+	blocks = append(blocks, `Skills authoring: when the user asks you to create or update a skill, call the app capability by describing it clearly as:
+CREATE_SKILL:
+name: <id-or-title>
+description: <one line>
+---
+<body markdown>
+The desktop app can persist skills under AppData/skills. MCP servers with API keys (e.g. Context7) are configured in Settings → MCP with environment secrets.`)
+	if len(blocks) == 0 {
+		return msgs
+	}
+	extra := ""
+	for i, b := range blocks {
+		if i > 0 {
+			extra += "\n\n"
+		}
+		extra += b
+	}
+	if len(msgs) > 0 && msgs[0].Role == "system" {
+		if !containsStr(msgs[0].Content, "Available local skills") && !containsStr(msgs[0].Content, "CREATE_SKILL:") {
+			msgs[0].Content = msgs[0].Content + "\n\n" + extra
+		}
+		return msgs
+	}
+	return append([]upstream.ChatMessage{{Role: "system", Content: extra}}, msgs...)
+}
+
+func containsStr(s, sub string) bool {
+	return strings.Contains(s, sub)
+}
+
+// ---------- Skills ----------
+
+func (a *App) ListSkills() ([]skills.Skill, error) {
+	if a.skills == nil {
+		return nil, fmt.Errorf("skills store not ready")
+	}
+	return a.skills.List()
+}
+
+func (a *App) GetSkill(id string) (*skills.Skill, error) {
+	if a.skills == nil {
+		return nil, fmt.Errorf("skills store not ready")
+	}
+	return a.skills.Get(id)
+}
+
+func (a *App) CreateSkill(name, description, body string) (*skills.Skill, error) {
+	if a.skills == nil {
+		return nil, fmt.Errorf("skills store not ready")
+	}
+	sk, err := a.skills.Create(name, description, body)
+	if err != nil {
+		return nil, err
+	}
+	return sk, nil
+}
+
+func (a *App) UpdateSkill(id, name, description, body string) (*skills.Skill, error) {
+	if a.skills == nil {
+		return nil, fmt.Errorf("skills store not ready")
+	}
+	return a.skills.Update(id, name, description, body)
+}
+
+func (a *App) DeleteSkill(id string) error {
+	if a.skills == nil {
+		return fmt.Errorf("skills store not ready")
+	}
+	return a.skills.Delete(id)
+}
+
+// ---------- MCP servers (with API key / SK support) ----------
+
+func (a *App) ListMCPServers() []map[string]any {
+	if a.mcp == nil {
+		return nil
+	}
+	return a.mcp.List(true)
+}
+
+func (a *App) UpsertMCPServer(cfg map[string]any) (map[string]any, error) {
+	if a.mcp == nil {
+		return nil, fmt.Errorf("mcp store not ready")
+	}
+	sv := mcpconfig.Server{
+		ID:      strMap(cfg, "id"),
+		Name:    strMap(cfg, "name"),
+		Type:    strMap(cfg, "type"),
+		URL:     strMap(cfg, "url"),
+		Enabled: true,
+	}
+	if v, ok := cfg["enabled"].(bool); ok {
+		sv.Enabled = v
+	}
+	if v, ok := cfg["timeout_ms"].(float64); ok {
+		sv.TimeoutMs = int(v)
+	}
+	if cmd, ok := cfg["command"].([]any); ok {
+		for _, c := range cmd {
+			if s, ok := c.(string); ok {
+				sv.Command = append(sv.Command, s)
+			}
+		}
+	}
+	if env, ok := cfg["environment"].(map[string]any); ok {
+		sv.Environment = map[string]string{}
+		for k, v := range env {
+			if s, ok := v.(string); ok {
+				sv.Environment[k] = s
+			}
+		}
+	}
+	if hdr, ok := cfg["headers"].(map[string]any); ok {
+		sv.Headers = map[string]string{}
+		for k, v := range hdr {
+			if s, ok := v.(string); ok {
+				sv.Headers[k] = s
+			}
+		}
+	}
+	if sv.ID == "" {
+		return nil, fmt.Errorf("id required")
+	}
+	if err := a.mcp.Upsert(sv); err != nil {
+		return nil, err
+	}
+	got, _ := a.mcp.Get(sv.ID)
+	return got.Public(true), nil
+}
+
+func (a *App) DeleteMCPServer(id string) error {
+	if a.mcp == nil {
+		return fmt.Errorf("mcp store not ready")
+	}
+	return a.mcp.Delete(id)
+}
+
+func strMap(m map[string]any, k string) string {
+	if v, ok := m[k].(string); ok {
+		return v
+	}
+	return ""
 }

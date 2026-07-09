@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"time"
 
@@ -37,9 +38,9 @@ type ChatRequest struct {
 	APIMode            string        `json:"api_mode"` // chat | responses
 	Temperature        float64       `json:"temperature"`
 	MaxTokens          int           `json:"max_tokens"`
-	// WebSearch runs DuckDuckGo before the model call and injects results.
-	WebSearch bool   `json:"web_search"`
-	SearchQuery string `json:"search_query"` // optional override; default = last user message
+	// WebSearch is legacy (ignored). Native xAI web_search/x_search run server-side on Responses.
+	WebSearch   bool   `json:"web_search"`
+	SearchQuery string `json:"search_query,omitempty"`
 }
 
 type ChatMessage struct {
@@ -62,6 +63,8 @@ type StreamEvent struct {
 	LatencyMs int64  `json:"latency_ms,omitempty"`
 	TTFTMs    int64  `json:"ttft_ms,omitempty"`
 	Estimated bool   `json:"estimated,omitempty"`
+	// Payload carries structured search/tool data for the UI.
+	Payload map[string]any `json:"payload,omitempty"`
 }
 
 type Usage struct {
@@ -178,7 +181,7 @@ func (c *Client) StreamChat(
 	req ChatRequest,
 	emit func(StreamEvent),
 ) error {
-	model, forceResp := stripResponsesSuffix(req.Model)
+	model, _ := stripResponsesSuffix(req.Model)
 	if model == "" {
 		model = settings.DefaultModel
 	}
@@ -186,11 +189,7 @@ func (c *Client) StreamChat(
 	if effort == "" {
 		effort = settings.ReasoningEffort
 	}
-	mode := strings.ToLower(req.APIMode)
-	if mode == "" {
-		mode = strings.ToLower(settings.APIMode)
-	}
-	useResponses := forceResp || mode == "responses" || extractPrevID(req) != ""
+	// Native web_search / x_search only work on Responses — always use it for desktop chat.
 
 	emit(StreamEvent{
 		Type:    "meta",
@@ -199,12 +198,12 @@ func (c *Client) StreamChat(
 		Model:   model,
 	})
 
-	if useResponses {
-		// Responses path: no agent tools yet — plain stream
-		return c.streamResponses(ctx, token, settings, model, effort, req, emit)
+	// Inject current date/year so the model knows the present (e.g. 2026).
+	if len(req.Messages) > 0 {
+		req.Messages = ensureTemporalContext(append([]ChatMessage{}, req.Messages...))
 	}
-	// Tool-capable agent loop is orchestrated by the app via StreamChatWithTools.
-	return c.streamChatCompletions(ctx, token, settings, model, effort, req, emit)
+
+	return c.streamResponses(ctx, token, settings, model, effort, req, emit)
 }
 
 func (c *Client) streamChatCompletions(
@@ -364,6 +363,12 @@ func (c *Client) streamResponses(
 			"effort":  effort,
 			"summary": "auto",
 		},
+		// Native xAI server-side search (replaces client-side DuckDuckGo).
+		"tools": []map[string]any{
+			{"type": "web_search"},
+			{"type": "x_search"},
+		},
+		"tool_choice": "auto",
 	}
 	if settings.StoreResponses || prev != "" {
 		body["store"] = true
@@ -394,6 +399,8 @@ func (c *Client) streamResponses(
 	var usage *Usage
 	var id, outModel string
 	var contentLen, thinkLen int
+	// Track in-flight search items until output_item.done fills query/sources.
+	pendingSearch := map[string]map[string]any{}
 	promptEst := estimatePromptTokens(req.Messages)
 	if strings.TrimSpace(req.Input) != "" {
 		promptEst = int64((len(req.Input) + 3) / 4)
@@ -447,6 +454,39 @@ func (c *Client) streamResponses(
 				}
 				contentLen += len(d)
 				emit(StreamEvent{Type: "content", Text: d, ID: id, Model: outModel})
+			}
+		case "response.output_item.added":
+			if item, ok := obj["item"].(map[string]any); ok {
+				handleSearchItemStart(item, id, outModel, pendingSearch, emit)
+			}
+		case "response.web_search_call.in_progress", "response.web_search_call.searching":
+			itemID := strField(obj["item_id"])
+			if itemID != "" {
+				if _, ok := pendingSearch[itemID]; !ok {
+					pendingSearch[itemID] = map[string]any{"kind": "web", "query": ""}
+				}
+				emit(StreamEvent{
+					Type: "search_query", ID: itemID, Model: outModel, Text: strField(pendingSearch[itemID]["query"]),
+					Payload: map[string]any{"provider": "xAI", "kind": "web", "status": "searching"},
+				})
+			}
+		case "response.output_item.done":
+			if item, ok := obj["item"].(map[string]any); ok {
+				handleSearchItemDone(item, id, outModel, pendingSearch, t0, emit)
+			}
+		case "response.output_text.annotation.added":
+			if ann, ok := obj["annotation"].(map[string]any); ok {
+				emit(StreamEvent{
+					Type:  "citation",
+					ID:    id,
+					Model: outModel,
+					Text:  strField(ann["url"]),
+					Payload: map[string]any{
+						"url":   strField(ann["url"]),
+						"title": strField(ann["title"]),
+						"type":  strField(ann["type"]),
+					},
+				})
 			}
 		case "response.completed":
 			if r, ok := obj["response"].(map[string]any); ok {
@@ -507,6 +547,198 @@ func messagesToResponsesInput(msgs []ChatMessage) any {
 		})
 	}
 	return out
+}
+
+func searchKindFromItem(item map[string]any) string {
+	t := strings.ToLower(strField(item["type"]))
+	name := strings.ToLower(strField(item["name"]))
+	switch {
+	case strings.Contains(t, "x_search") || strings.HasPrefix(name, "x_") || name == "x_search":
+		return "x"
+	case strings.Contains(t, "web_search") || name == "web_search":
+		return "web"
+	case t == "custom_tool_call" && (strings.Contains(name, "search") || strings.HasPrefix(name, "x_")):
+		if strings.HasPrefix(name, "x_") {
+			return "x"
+		}
+		return "web"
+	default:
+		return ""
+	}
+}
+
+func extractSearchQuery(item map[string]any) string {
+	if action, ok := item["action"].(map[string]any); ok {
+		if q := strField(action["query"]); q != "" {
+			return q
+		}
+	}
+	if q := strField(item["query"]); q != "" {
+		return q
+	}
+	// custom_tool_call input may be JSON string
+	if in := strField(item["input"]); in != "" {
+		var m map[string]any
+		if json.Unmarshal([]byte(in), &m) == nil {
+			if q, ok := m["query"].(string); ok && q != "" {
+				return q
+			}
+		}
+		return strings.TrimSpace(in)
+	}
+	return ""
+}
+
+func extractSearchResults(item map[string]any) []map[string]any {
+	var sources []any
+	if action, ok := item["action"].(map[string]any); ok {
+		if s, ok := action["sources"].([]any); ok {
+			sources = s
+		}
+	}
+	if sources == nil {
+		if s, ok := item["sources"].([]any); ok {
+			sources = s
+		}
+	}
+	out := make([]map[string]any, 0, len(sources))
+	for _, raw := range sources {
+		src, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		u := strField(src["url"])
+		if u == "" {
+			continue
+		}
+		title := strField(src["title"])
+		domain := ""
+		if parsed, err := parseHost(u); err == nil {
+			domain = parsed
+		}
+		if title == "" {
+			title = domain
+		}
+		out = append(out, map[string]any{
+			"url":    u,
+			"title":  title,
+			"domain": domain,
+			"type":   strField(src["type"]),
+		})
+	}
+	return out
+}
+
+func parseHost(rawURL string) (string, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return "", err
+	}
+	h := u.Hostname()
+	if h == "" {
+		return "", fmt.Errorf("no host")
+	}
+	return h, nil
+}
+
+func handleSearchItemStart(
+	item map[string]any,
+	respID, model string,
+	pending map[string]map[string]any,
+	emit func(StreamEvent),
+) {
+	kind := searchKindFromItem(item)
+	if kind == "" {
+		return
+	}
+	itemID := strField(item["id"])
+	if itemID == "" {
+		itemID = respID
+	}
+	q := extractSearchQuery(item)
+	pending[itemID] = map[string]any{"kind": kind, "query": q}
+	emit(StreamEvent{
+		Type:  "tool_call",
+		ID:    itemID,
+		Model: model,
+		Text:  kindLabel(kind),
+		Payload: map[string]any{
+			"provider": "xAI",
+			"kind":     kind,
+			"name":     kindLabel(kind),
+			"status":   "running",
+		},
+	})
+	emit(StreamEvent{
+		Type:  "search_query",
+		ID:    itemID,
+		Model: model,
+		Text:  q,
+		Payload: map[string]any{
+			"provider": "xAI",
+			"kind":     kind,
+			"query":    q,
+			"status":   "searching",
+		},
+	})
+}
+
+func handleSearchItemDone(
+	item map[string]any,
+	respID, model string,
+	pending map[string]map[string]any,
+	t0 time.Time,
+	emit func(StreamEvent),
+) {
+	kind := searchKindFromItem(item)
+	if kind == "" {
+		return
+	}
+	itemID := strField(item["id"])
+	if itemID == "" {
+		itemID = respID
+	}
+	q := extractSearchQuery(item)
+	if q == "" {
+		if p, ok := pending[itemID]; ok {
+			q = strField(p["query"])
+		}
+	}
+	results := extractSearchResults(item)
+	ms := time.Since(t0).Milliseconds()
+	emit(StreamEvent{
+		Type:  "search_results",
+		ID:    itemID,
+		Model: model,
+		Text:  q,
+		Payload: map[string]any{
+			"provider":    "xAI",
+			"kind":        kind,
+			"query":       q,
+			"results":     results,
+			"duration_ms": ms,
+			"status":      "done",
+		},
+	})
+	emit(StreamEvent{
+		Type:  "tool_done",
+		ID:    itemID,
+		Model: model,
+		Text:  kindLabel(kind),
+		Payload: map[string]any{
+			"provider": "xAI",
+			"kind":     kind,
+			"status":   "done",
+		},
+	})
+	delete(pending, itemID)
+}
+
+func kindLabel(kind string) string {
+	if kind == "x" {
+		return "x_search"
+	}
+	return "web_search"
 }
 
 func parseChatUsage(u map[string]any) *Usage {

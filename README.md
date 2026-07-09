@@ -40,7 +40,7 @@ Use it with **Cursor, Open Code, Continue, Open WebUI**, or any client that spea
 | **Streaming + thinking** | Real-time reasoning and answer stream |
 | **Token & cost stats** | Usage, latency charts, estimated Grok 4.5 pricing |
 | **Chat or Responses API** | Full history chat, or token-saving `last_response_id` chains |
-| **Local OpenAI proxy** | `POST /v1/chat/completions`, `POST /v1/responses`, `GET /v1/models` |
+| **Local API proxy** | OpenAI: `POST /v1/chat/completions`, `POST /v1/responses`, `GET /v1/models` · Anthropic: `POST /v1/messages` |
 | **Cross-platform build** | Windows + Linux via GitHub Actions |
 
 ---
@@ -144,7 +144,9 @@ Copy from the in-app **Stats** modal (recommended), or:
 | Mode | Endpoint | Notes |
 |------|----------|--------|
 | **chat** | `/v1/chat/completions` | Classic OpenAI chat + `reasoning_content` stream |
-| **responses** | `/v1/responses` | Multi-turn with `last_response_id` / `previous_response_id` (saves tokens) |
+| **responses** | `/v1/responses` | Multi-turn + native `web_search` / `x_search` (tools sanitized for OpenCode) |
+| **messages** | `/v1/messages` | Anthropic Messages API (stream + tools) |
+| ~~completions~~ | `/v1/completions` | **Not supported** (legacy) |
 
 ---
 

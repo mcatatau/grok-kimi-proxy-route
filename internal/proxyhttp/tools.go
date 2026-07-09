@@ -1,0 +1,322 @@
+package proxyhttp
+
+import (
+	"strings"
+)
+
+// xAI Responses API accepts only these tool type variants.
+var allowedToolTypes = map[string]bool{
+	"function":          true,
+	"web_search":        true,
+	"x_search":          true,
+	"collections_search": true,
+	"file_search":       true,
+	"code_execution":    true,
+	"code_interpreter":  true,
+	"mcp":               true,
+	"shell":             true,
+}
+
+func nativeSearchTools() []any {
+	return []any{
+		map[string]any{"type": "web_search"},
+		map[string]any{"type": "x_search"},
+	}
+}
+
+// sanitizeResponsesTools fixes OpenCode/OpenAI tool payloads so xAI accepts them.
+// Rejects unknown types like "namespace" (causes 422: unknown variant `namespace`).
+// Converts nested OpenAI function tools into xAI flat function tools.
+// Always ensures native web_search + x_search are available.
+func sanitizeResponsesTools(raw any) []any {
+	out := sanitizeResponsesToolsCore(raw)
+	hasWeb, hasX := false, false
+	for _, item := range out {
+		m, _ := item.(map[string]any)
+		switch strings.ToLower(asString(m["type"])) {
+		case "web_search":
+			hasWeb = true
+		case "x_search":
+			hasX = true
+		}
+	}
+	if !hasWeb {
+		out = append(out, map[string]any{"type": "web_search"})
+	}
+	if !hasX {
+		out = append(out, map[string]any{"type": "x_search"})
+	}
+	return out
+}
+
+func sanitizeResponsesToolsCore(raw any) []any {
+	list := flattenToolList(raw)
+	out := make([]any, 0, len(list)+2)
+	seenFn := map[string]bool{}
+	hasWeb, hasX := false, false
+
+	for _, item := range list {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		// Unwrap nested groups OpenCode sometimes sends as type=namespace / type=provider
+		typ := strings.ToLower(strings.TrimSpace(asString(m["type"])))
+		if typ == "namespace" || typ == "provider" || typ == "group" {
+			if nested, ok := m["tools"].([]any); ok {
+				for _, n := range sanitizeResponsesToolsCore(nested) {
+					nm, _ := n.(map[string]any)
+					nt := strings.ToLower(asString(nm["type"]))
+					if nt == "function" {
+						name := asString(nm["name"])
+						if name == "" || seenFn[name] {
+							continue
+						}
+						seenFn[name] = true
+					}
+					if nt == "web_search" {
+						if hasWeb {
+							continue
+						}
+						hasWeb = true
+					}
+					if nt == "x_search" {
+						if hasX {
+							continue
+						}
+						hasX = true
+					}
+					out = append(out, n)
+				}
+			}
+			continue
+		}
+		norm := normalizeOneTool(m)
+		if norm == nil {
+			continue
+		}
+		nt := strings.ToLower(asString(norm["type"]))
+		switch nt {
+		case "web_search":
+			if hasWeb {
+				continue
+			}
+			hasWeb = true
+		case "x_search":
+			if hasX {
+				continue
+			}
+			hasX = true
+		case "function":
+			name := asString(norm["name"])
+			if name == "" || seenFn[name] {
+				continue
+			}
+			seenFn[name] = true
+		}
+		out = append(out, norm)
+	}
+	return out
+}
+
+func flattenToolList(raw any) []any {
+	switch t := raw.(type) {
+	case nil:
+		return nil
+	case []any:
+		return t
+	case map[string]any:
+		// Some clients send tools as object map name→def
+		out := make([]any, 0, len(t))
+		for name, def := range t {
+			if m, ok := def.(map[string]any); ok {
+				cp := cloneMap(m)
+				if asString(cp["type"]) == "" {
+					cp["type"] = "function"
+				}
+				if asString(cp["name"]) == "" {
+					cp["name"] = name
+				}
+				// nested OpenAI shape under value
+				if fn, ok := cp["function"].(map[string]any); ok {
+					if asString(fn["name"]) == "" {
+						fn["name"] = name
+						cp["function"] = fn
+					}
+				}
+				out = append(out, cp)
+			}
+		}
+		return out
+	default:
+		return nil
+	}
+}
+
+func normalizeOneTool(m map[string]any) map[string]any {
+	typ := strings.ToLower(strings.TrimSpace(asString(m["type"])))
+
+	// Nested OpenAI: {type:function, function:{name,description,parameters}}
+	if fn, ok := m["function"].(map[string]any); ok {
+		name := asString(fn["name"])
+		if name == "" {
+			name = asString(m["name"])
+		}
+		if name == "" {
+			return nil
+		}
+		out := map[string]any{
+			"type":        "function",
+			"name":        name,
+			"description": firstNonEmpty(asString(fn["description"]), asString(m["description"])),
+		}
+		if p := fn["parameters"]; p != nil {
+			out["parameters"] = p
+		} else if p := fn["input_schema"]; p != nil {
+			out["parameters"] = p
+		} else if p := m["parameters"]; p != nil {
+			out["parameters"] = p
+		} else {
+			out["parameters"] = map[string]any{"type": "object", "properties": map[string]any{}}
+		}
+		return out
+	}
+
+	// Anthropic tool shape (no type or type tool): name + input_schema
+	if typ == "" || typ == "tool" {
+		name := asString(m["name"])
+		if name == "" {
+			return nil
+		}
+		out := map[string]any{
+			"type":        "function",
+			"name":        name,
+			"description": asString(m["description"]),
+		}
+		if p := m["input_schema"]; p != nil {
+			out["parameters"] = p
+		} else if p := m["parameters"]; p != nil {
+			out["parameters"] = p
+		} else {
+			out["parameters"] = map[string]any{"type": "object", "properties": map[string]any{}}
+		}
+		return out
+	}
+
+	if !allowedToolTypes[typ] {
+		// Drop unknown variants (namespace, custom, provider-defined, etc.)
+		return nil
+	}
+
+	// Built-in server tools — pass only type (+ known optional filters)
+	if typ != "function" {
+		out := map[string]any{"type": typ}
+		// preserve safe optional knobs
+		for _, k := range []string{"filters", "allowed_domains", "excluded_domains", "enable_image_understanding", "enable_image_search", "vector_store_ids", "max_num_results"} {
+			if v, ok := m[k]; ok {
+				out[k] = v
+			}
+		}
+		return out
+	}
+
+	// Flat function tool (xAI style)
+	name := asString(m["name"])
+	if name == "" {
+		return nil
+	}
+	out := map[string]any{
+		"type":        "function",
+		"name":        name,
+		"description": asString(m["description"]),
+	}
+	if p := m["parameters"]; p != nil {
+		out["parameters"] = p
+	} else if p := m["input_schema"]; p != nil {
+		out["parameters"] = p
+	} else {
+		out["parameters"] = map[string]any{"type": "object", "properties": map[string]any{}}
+	}
+	return out
+}
+
+// sanitizeChatTools keeps only function tools in OpenAI nested shape for /chat/completions.
+func sanitizeChatTools(raw any) []any {
+	list := flattenToolList(raw)
+	out := make([]any, 0, len(list))
+	seen := map[string]bool{}
+	for _, item := range list {
+		m, ok := item.(map[string]any)
+		if !ok {
+			continue
+		}
+		typ := strings.ToLower(asString(m["type"]))
+		if typ == "namespace" || typ == "provider" || typ == "group" {
+			if nested, ok := m["tools"].([]any); ok {
+				out = append(out, sanitizeChatTools(nested)...)
+			}
+			continue
+		}
+		// Convert to OpenAI nested function form
+		var name, desc string
+		var params any
+		if fn, ok := m["function"].(map[string]any); ok {
+			name = asString(fn["name"])
+			desc = asString(fn["description"])
+			params = fn["parameters"]
+			if params == nil {
+				params = fn["input_schema"]
+			}
+		} else if typ == "function" || typ == "" || typ == "tool" {
+			name = asString(m["name"])
+			desc = asString(m["description"])
+			params = m["parameters"]
+			if params == nil {
+				params = m["input_schema"]
+			}
+		} else {
+			// skip server-side types on chat completions (xAI rejects many)
+			continue
+		}
+		if name == "" || seen[name] {
+			continue
+		}
+		seen[name] = true
+		if params == nil {
+			params = map[string]any{"type": "object", "properties": map[string]any{}}
+		}
+		out = append(out, map[string]any{
+			"type": "function",
+			"function": map[string]any{
+				"name":        name,
+				"description": desc,
+				"parameters":   params,
+			},
+		})
+	}
+	return out
+}
+
+func asString(v any) string {
+	switch t := v.(type) {
+	case string:
+		return t
+	default:
+		return ""
+	}
+}
+
+func firstNonEmpty(a, b string) string {
+	if strings.TrimSpace(a) != "" {
+		return a
+	}
+	return b
+}
+
+func cloneMap(m map[string]any) map[string]any {
+	out := make(map[string]any, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}

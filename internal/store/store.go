@@ -184,7 +184,7 @@ func defaultSettings() Settings {
 	return Settings{
 		DefaultModel:    DefaultModel,
 		ReasoningEffort: DefaultEffort,
-		APIMode:         "chat",
+		APIMode:         "responses",
 		UpstreamBase:    DefaultUpstream,
 		ClientVersion:   DefaultClientVersion,
 		ProxyListen:     "127.0.0.1:8787",

@@ -372,7 +372,7 @@ function ensureShell() {
                 <div id="c-model"></div>
                 <div id="c-effort"></div>
                 <div id="c-api"></div>
-                <span class="tool-hint" title="O modelo chama web_search sozinho quando precisa">tools: web_search</span>
+                <span class="tool-hint" title="Pesquisa nativa xAI (web + X) via Responses">search: xAI</span>
               </div>
               <button class="send" id="send" title="Enviar">↑</button>
             </div>
@@ -703,8 +703,7 @@ function paintMessages() {
           </section>
         `;
       }
-      const toolsUI = renderToolsPanel(m.tools);
-      const searchUI = m.search ? renderSearchPanel(m.search, m.search.status === "searching") : "";
+      const searchUI = renderSearchBlock(m);
       const think = m.thinking
         ? `<div class="think">${escapeHtml(m.thinking)}</div>`
         : "";
@@ -712,14 +711,17 @@ function paintMessages() {
       const meta = m.meta ? `<div class="turn-meta">${escapeHtml(m.meta)}</div>` : "";
       const answer = renderMarkdown(m.content || "") + cursor;
       const hasAnswer = !!(m.content && m.content.trim());
-      const showAnswer = hasAnswer || (m.streaming && !m.search?.status && !(m.tools && m.tools.length));
+      const searching =
+        m.search?.status === "searching" ||
+        (m.searches || []).some((s) => s.status === "searching") ||
+        (m.tools || []).some((t) => t.status === "running");
+      const showAnswer = hasAnswer || (m.streaming && !searching);
       return `
         <section class="turn turn-assistant" data-i="${i}">
           <div class="turn-label">Grok</div>
-          ${toolsUI}
           ${searchUI}
           ${think}
-          ${hasAnswer || showAnswer ? `<div class="answer md">${answer || (m.streaming ? cursor : "")}</div>` : m.streaming && (searchUI || toolsUI) ? "" : `<div class="answer md">${answer}</div>`}
+          ${hasAnswer || showAnswer ? `<div class="answer md">${answer || (m.streaming ? cursor : "")}</div>` : m.streaming && searchUI ? "" : `<div class="answer md">${answer}</div>`}
           ${meta}
         </section>
       `;
@@ -820,8 +822,10 @@ async function submit() {
     content: "",
     thinking: "",
     streaming: true,
-    tools: [], // [{id, name, args, status, search}]
+    tools: [],
+    searches: [],
     search: null,
+    citations: [],
   });
   promptEl.value = "";
   autoGrow(promptEl);
@@ -898,100 +902,36 @@ function schedulePaintMessages() {
   });
 }
 
-function renderToolsPanel(tools) {
-  if (!tools || !tools.length) return "";
-  return `
-    <div class="tools-panel">
-      ${tools
-        .map((t) => {
-          const st = t.status || "running";
-          const q = t.query ? `<span class="tool-query">${escapeHtml(t.query)}</span>` : "";
-          return `
-            <div class="tool-row ${st}">
-              <span class="tool-dot"></span>
-              <div class="tool-main">
-                <div class="tool-name">
-                  <span class="tool-pill">tool</span>
-                  <code>${escapeHtml(t.name || "web_search")}</code>
-                  ${st === "running" ? `<span class="search-spin sm"></span>` : st === "done" ? `<span class="tool-ok">done</span>` : ""}
-                </div>
-                ${q}
-              </div>
-            </div>
-          `;
-        })
-        .join("")}
-    </div>
-  `;
+function domainFromUrl(u) {
+  try {
+    return new URL(u).hostname.replace(/^www\./, "");
+  } catch {
+    return "";
+  }
 }
 
-function renderSearchPanel(search, searching) {
-  if (!search && !searching) return "";
-  const q = search?.query || "…";
-  const status = search?.status || (searching ? "searching" : "done");
-  const results = search?.results || [];
-  const ms = search?.duration_ms;
+function kindLabel(kind) {
+  if (kind === "x") return "X";
+  return "Web";
+}
 
-  let body = "";
-  if (status === "searching") {
-    body = `
-      <div class="search-loading">
-        <span class="search-spin"></span>
-        <span>Buscando no DuckDuckGo…</span>
-      </div>
-      <div class="search-skeleton">
-        <div class="sk-row"></div>
-        <div class="sk-row short"></div>
-        <div class="sk-row"></div>
-      </div>
-    `;
-  } else if (status === "error") {
-    body = `<div class="search-error">Falha na busca: ${escapeHtml(search?.error || "erro")}</div>`;
-  } else {
-    const abs =
-      search?.answer || search?.abstract
-        ? `<div class="search-abstract">
-            ${search.answer ? `<div class="search-answer">${escapeHtml(search.answer)}</div>` : ""}
-            ${search.abstract ? `<p>${escapeHtml(search.abstract)}</p>` : ""}
-            ${search.answer_url ? `<a href="${escapeHtml(search.answer_url)}" target="_blank" rel="noopener">fonte</a>` : ""}
-          </div>`
-        : "";
-    const cards = results
-      .map((r, idx) => {
-        const domain = r.domain || "";
-        const icon = r.icon
-          ? `<img class="fav" src="${escapeHtml(r.icon)}" alt="" loading="lazy" onerror="this.style.display='none'"/>`
-          : `<span class="fav-fallback">${escapeHtml((domain || "?")[0] || "?")}</span>`;
-        return `
-          <a class="search-card" href="${escapeHtml(r.url)}" target="_blank" rel="noopener noreferrer" style="animation-delay:${idx * 40}ms">
-            <div class="search-card-top">
-              ${icon}
-              <div class="search-card-meta">
-                <span class="domain">${escapeHtml(domain)}</span>
-                <strong>${escapeHtml(r.title || r.url)}</strong>
-              </div>
-            </div>
-            ${r.snippet ? `<p>${escapeHtml(r.snippet)}</p>` : ""}
-          </a>
-        `;
-      })
-      .join("");
-    body = `
-      ${abs}
-      <div class="search-grid">${cards || `<div class="search-empty">Nenhum resultado web</div>`}</div>
-    `;
+function ensureSearch(last, id, kind) {
+  if (!last.searches) last.searches = [];
+  let s = last.searches.find((x) => x.id === id);
+  if (!s) {
+    s = {
+      id,
+      kind: kind || "web",
+      query: "",
+      results: [],
+      status: "searching",
+      provider: "xAI",
+    };
+    last.searches.push(s);
   }
-
-  return `
-    <div class="search-panel ${status}">
-      <div class="search-head">
-        <span class="search-badge">DuckDuckGo</span>
-        <span class="search-q">${escapeHtml(q)}</span>
-        ${ms != null ? `<span class="search-ms">${fmt(ms)} ms</span>` : ""}
-      </div>
-      ${body}
-    </div>
-  `;
+  // keep legacy single search pointer for paint/compat
+  last.search = s;
+  return s;
 }
 
 function ensureTool(last, id, name) {
@@ -1004,102 +944,182 @@ function ensureTool(last, id, name) {
   return t;
 }
 
+function renderSearchBlock(m) {
+  const items = m.searches?.length
+    ? m.searches
+    : m.search
+      ? [m.search]
+      : [];
+  if (!items.length && !(m.tools || []).some((t) => t.status === "running")) {
+    return "";
+  }
+
+  // If only tools running without search record yet
+  if (!items.length) {
+    return `
+      <div class="src-block">
+        <div class="src-row live">
+          <span class="src-pulse"></span>
+          <span class="src-label">Searching</span>
+        </div>
+      </div>
+    `;
+  }
+
+  return `
+    <div class="src-block">
+      ${items
+        .map((s) => {
+          const st = s.status || "searching";
+          const kind = kindLabel(s.kind || "web");
+          const q = s.query || "";
+          if (st === "searching" || st === "running") {
+            return `
+              <div class="src-row live">
+                <span class="src-pulse"></span>
+                <span class="src-kind">${escapeHtml(kind)}</span>
+                <span class="src-query">${escapeHtml(q || "…")}</span>
+              </div>
+            `;
+          }
+          if (st === "error") {
+            return `
+              <div class="src-row err">
+                <span class="src-kind">${escapeHtml(kind)}</span>
+                <span class="src-query">${escapeHtml(s.error || "failed")}</span>
+              </div>
+            `;
+          }
+          const results = s.results || [];
+          const chips = results
+            .slice(0, 8)
+            .map((r) => {
+              const domain = r.domain || domainFromUrl(r.url) || r.title || "source";
+              return `
+                <a class="src-chip" href="${escapeHtml(r.url)}" target="_blank" rel="noopener noreferrer" title="${escapeHtml(r.title || r.url || domain)}">
+                  <span class="src-dot"></span>
+                  <span>${escapeHtml(domain)}</span>
+                </a>
+              `;
+            })
+            .join("");
+          const extra = results.length > 8 ? `<span class="src-more">+${results.length - 8}</span>` : "";
+          return `
+            <div class="src-group">
+              <div class="src-row">
+                <span class="src-kind done">${escapeHtml(kind)}</span>
+                ${q ? `<span class="src-query">${escapeHtml(q)}</span>` : ""}
+                <span class="src-count">${results.length || 0}</span>
+              </div>
+              ${chips || extra ? `<div class="src-chips">${chips}${extra}</div>` : ""}
+            </div>
+          `;
+        })
+        .join("")}
+    </div>
+  `;
+}
+
 function onSearchEvent(type, payload) {
   const last = state.messages.at(-1);
   if (!last || last.role !== "assistant") return;
 
+  const kind =
+    payload?.kind === "x" || String(payload?.name || "").startsWith("x_")
+      ? "x"
+      : "web";
+  const id = payload?.tool_call_id || payload?.id || "search";
+
   if (type === "search:start") {
-    const id = payload?.tool_call_id || "search";
-    const t = ensureTool(last, id, "web_search");
+    const s = ensureSearch(last, id, kind);
+    s.status = "searching";
+    s.query = payload?.query || s.query || "";
+    s.kind = payload?.kind || kind;
+    s.provider = "xAI";
+    const t = ensureTool(last, id, kind === "x" ? "x_search" : "web_search");
     t.status = "running";
-    t.query = payload?.query || t.query || "";
-    last.search = {
-      query: payload?.query || "",
-      results: [],
-      status: "searching",
-      provider: payload?.provider || "DuckDuckGo",
-    };
+    t.query = s.query;
   } else if (type === "search:results") {
-    last.search = {
-      ...(last.search || {}),
-      query: payload?.query || last.search?.query || "",
-      results: payload?.results || [],
-      abstract: payload?.abstract || "",
-      answer: payload?.answer || "",
-      answer_url: payload?.answer_url || "",
-      duration_ms: payload?.duration_ms,
-      status: "done",
-      provider: payload?.provider || "DuckDuckGo",
-    };
-    if (last.tools?.length) {
-      last.tools.forEach((t) => {
-        if (t.name === "web_search") t.status = "done";
-      });
-    }
-  } else if (type === "search:error") {
-    last.search = {
-      ...(last.search || {}),
-      query: payload?.query || last.search?.query || "",
-      status: "error",
-      error: payload?.error || "erro",
-    };
-    if (payload?.tool_call_id) {
-      const t = ensureTool(last, payload.tool_call_id, "web_search");
-      t.status = "error";
-    }
-  } else if (type === "search:done") {
-    if (last.search && last.search.status === "searching") {
-      last.search.status = "done";
-    }
-  } else if (type === "tool:call") {
-    ensureTool(last, payload?.id || "tool", payload?.name || "web_search");
-  } else if (type === "tool:args") {
-    const t = ensureTool(last, payload?.id || "tool", "web_search");
-    try {
-      const j = JSON.parse(payload?.arguments || "{}");
-      if (j.query) t.query = j.query;
-    } catch (_) {
-      t.query = payload?.arguments || "";
-    }
-  } else if (type === "tool:done") {
-    const t = ensureTool(last, payload?.id || "tool", payload?.name || "web_search");
+    const s = ensureSearch(last, id, payload?.kind || kind);
+    s.query = payload?.query || s.query || "";
+    s.results = (payload?.results || []).map((r) => ({
+      ...r,
+      domain: r.domain || domainFromUrl(r.url),
+    }));
+    s.duration_ms = payload?.duration_ms;
+    s.status = "done";
+    s.kind = payload?.kind || s.kind || kind;
+    s.provider = "xAI";
+    const t = ensureTool(last, id, s.kind === "x" ? "x_search" : "web_search");
     t.status = "done";
+    t.query = s.query;
+  } else if (type === "search:error") {
+    const s = ensureSearch(last, id, kind);
+    s.status = "error";
+    s.error = payload?.error || "erro";
+    const t = ensureTool(last, id, "web_search");
+    t.status = "error";
+  } else if (type === "search:done") {
+    const s = last.searches?.find((x) => x.id === id) || last.search;
+    if (s && s.status === "searching") s.status = "done";
+  } else if (type === "tool:call") {
+    const name = payload?.name || "web_search";
+    const k = name.includes("x_") || name === "x_search" ? "x" : "web";
+    ensureTool(last, id, name);
+    ensureSearch(last, id, k).status = "searching";
+  } else if (type === "tool:done") {
+    const t = ensureTool(last, id, payload?.name || "web_search");
+    t.status = "done";
+    const s = last.searches?.find((x) => x.id === id);
+    if (s && s.status === "searching") s.status = "done";
   }
   schedulePaintMessages();
 }
 
 function onChatEventTool(ev) {
-  // map chat.event tool_* into tools panel
   const last = state.messages.at(-1);
   if (!last || last.role !== "assistant") return false;
+
   if (ev.type === "tool_call") {
-    ensureTool(last, ev.id || "tool", ev.text || "web_search");
-    schedulePaintMessages();
-    return true;
-  }
-  if (ev.type === "tool_args") {
-    const t = ensureTool(last, ev.id || "tool", "web_search");
-    try {
-      const j = JSON.parse(ev.text || "{}");
-      if (j.query) t.query = j.query;
-    } catch (_) {
-      if (ev.text) t.query = ev.text;
-    }
-    schedulePaintMessages();
+    onSearchEvent("tool:call", {
+      id: ev.id,
+      name: ev.text,
+      kind: ev.payload?.kind,
+    });
     return true;
   }
   if (ev.type === "search_query") {
-    onSearchEvent("search:start", { query: ev.text, tool_call_id: ev.id, provider: "DuckDuckGo" });
+    onSearchEvent("search:start", {
+      query: ev.text,
+      tool_call_id: ev.id,
+      provider: "xAI",
+      kind: ev.payload?.kind,
+    });
+    return true;
+  }
+  if (ev.type === "search_results") {
+    onSearchEvent("search:results", {
+      ...(ev.payload || {}),
+      query: ev.text || ev.payload?.query,
+      tool_call_id: ev.id,
+      provider: "xAI",
+    });
     return true;
   }
   if (ev.type === "tool_done") {
-    const t = ensureTool(last, ev.id || "tool", ev.text || "web_search");
-    t.status = "done";
-    schedulePaintMessages();
+    onSearchEvent("tool:done", { id: ev.id, name: ev.text });
     return true;
   }
   if (ev.type === "tool_error") {
     onSearchEvent("search:error", { error: ev.error, tool_call_id: ev.id });
+    return true;
+  }
+  if (ev.type === "citation") {
+    if (!last.citations) last.citations = [];
+    const url = ev.payload?.url || ev.text;
+    if (url && !last.citations.some((c) => c.url === url)) {
+      last.citations.push({ url, title: ev.payload?.title || "" });
+    }
     return true;
   }
   return false;
