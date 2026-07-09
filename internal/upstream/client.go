@@ -37,6 +37,9 @@ type ChatRequest struct {
 	APIMode            string        `json:"api_mode"` // chat | responses
 	Temperature        float64       `json:"temperature"`
 	MaxTokens          int           `json:"max_tokens"`
+	// WebSearch runs DuckDuckGo before the model call and injects results.
+	WebSearch bool   `json:"web_search"`
+	SearchQuery string `json:"search_query"` // optional override; default = last user message
 }
 
 type ChatMessage struct {

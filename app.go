@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,15 +15,17 @@ import (
 	"grok-desktop/internal/proxyhttp"
 	"grok-desktop/internal/store"
 	"grok-desktop/internal/upstream"
+	"grok-desktop/internal/websearch"
 )
 
 type App struct {
 	ctx context.Context
 
-	store    *store.Store
-	oauth    *oauth.Client
-	upstream *upstream.Client
-	proxy    *proxyhttp.Server
+	store     *store.Store
+	oauth     *oauth.Client
+	upstream  *upstream.Client
+	proxy     *proxyhttp.Server
+	websearch *websearch.Client
 
 	mu           sync.Mutex
 	deviceCancel context.CancelFunc
@@ -64,6 +67,7 @@ func (a *App) startup(ctx context.Context) {
 	a.store = st
 	a.oauth = oauth.New()
 	a.upstream = upstream.New()
+	a.websearch = websearch.New()
 	a.proxy = proxyhttp.New(st, a.upstream, a.ensureCreds)
 
 	settings := st.Settings()
@@ -479,6 +483,10 @@ func (a *App) SendChat(req upstream.ChatRequest) error {
 	if label == "" {
 		label = acc.Email
 	}
+	phase := "thinking"
+	if req.WebSearch {
+		phase = "searching"
+	}
 	a.activeReq = &ActiveRequest{
 		ID:        reqID,
 		AccountID: acc.ID,
@@ -486,7 +494,7 @@ func (a *App) SendChat(req upstream.ChatRequest) error {
 		Label:     label,
 		Model:     req.Model,
 		StartedAt: time.Now().UTC().Format(time.RFC3339),
-		Phase:     "thinking",
+		Phase:     phase,
 	}
 	a.mu.Unlock()
 	runtime.EventsEmit(a.ctx, "request:active", a.GetActiveRequest())
@@ -499,6 +507,50 @@ func (a *App) SendChat(req upstream.ChatRequest) error {
 			a.mu.Unlock()
 			runtime.EventsEmit(a.ctx, "request:active", nil)
 		}()
+
+		// Optional DuckDuckGo web search before model
+		if req.WebSearch && a.websearch != nil {
+			q := strings.TrimSpace(req.SearchQuery)
+			if q == "" {
+				// last user message
+				for i := len(req.Messages) - 1; i >= 0; i-- {
+					if req.Messages[i].Role == "user" && strings.TrimSpace(req.Messages[i].Content) != "" {
+						q = req.Messages[i].Content
+						break
+					}
+				}
+			}
+			if q == "" && strings.TrimSpace(req.Input) != "" {
+				q = req.Input
+			}
+			runtime.EventsEmit(a.ctx, "search:start", map[string]any{
+				"query": q, "provider": "DuckDuckGo",
+			})
+			a.setPhase("searching")
+			searchRes, sErr := a.websearch.Search(ctx, q, 8)
+			if sErr != nil {
+				runtime.EventsEmit(a.ctx, "search:error", map[string]any{"error": sErr.Error(), "query": q})
+			} else if searchRes != nil {
+				runtime.EventsEmit(a.ctx, "search:results", searchRes)
+				ctxBlock := websearch.FormatForPrompt(searchRes)
+				if len(req.Messages) > 0 {
+					// Keep prior history; rewrite last user turn to include sources
+					msgs := make([]upstream.ChatMessage, len(req.Messages))
+					copy(msgs, req.Messages)
+					for i := len(msgs) - 1; i >= 0; i-- {
+						if msgs[i].Role == "user" {
+							msgs[i].Content = ctxBlock + "\n---\nUser question:\n" + msgs[i].Content
+							break
+						}
+					}
+					req.Messages = msgs
+				} else if req.Input != "" {
+					req.Input = ctxBlock + "\n---\nUser question:\n" + req.Input
+				}
+			}
+			runtime.EventsEmit(a.ctx, "search:done", map[string]any{"query": q})
+			a.setPhase("thinking")
+		}
 
 		err := a.upstream.StreamChat(ctx, token, settings, label, acc.Email, req, func(ev upstream.StreamEvent) {
 			if ev.Type == "thinking" {

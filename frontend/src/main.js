@@ -42,6 +42,7 @@ const state = {
   shellBuilt: false,
   sessionCost: 0,
   sessionLat: null,
+  webSearch: false,
   // custom dropdowns
   picks: {
     effort: "high",
@@ -368,6 +369,10 @@ function ensureShell() {
             <textarea id="prompt" rows="1" placeholder="Pergunte qualquer coisa…"></textarea>
             <div class="composer-row">
               <div class="tools">
+                <button type="button" class="web-toggle" id="web-toggle" title="Busca web (DuckDuckGo)">
+                  <span class="web-ico">⌕</span>
+                  <span>Web</span>
+                </button>
                 <div id="c-account"></div>
                 <div id="c-model"></div>
                 <div id="c-effort"></div>
@@ -384,6 +389,12 @@ function ensureShell() {
   $("#btn-add").onclick = startLogin;
   $("#btn-stats").onclick = openStatsModal;
   $("#btn-stats-top").onclick = openStatsModal;
+  const webBtn = $("#web-toggle");
+  webBtn.classList.toggle("on", state.webSearch);
+  webBtn.onclick = () => {
+    state.webSearch = !state.webSearch;
+    webBtn.classList.toggle("on", state.webSearch);
+  };
 
   const effortOpts = [
     { value: "low", label: "Low" },
@@ -648,7 +659,13 @@ function paintStatus() {
   const req = state.activeRequest;
   if (req) {
     el.classList.add("live");
-    text.innerHTML = `Request → <strong>${escapeHtml(req.label || req.email || "conta")}</strong> · ${escapeHtml(req.phase || "…")}`;
+    const phase =
+      req.phase === "searching"
+        ? "pesquisando na web"
+        : req.phase === "thinking"
+          ? "thinking"
+          : req.phase || "…";
+    text.innerHTML = `Request → <strong>${escapeHtml(req.label || req.email || "conta")}</strong> · ${escapeHtml(phase)}`;
   } else {
     el.classList.remove("live");
     const n = state.accounts.length;
@@ -696,17 +713,20 @@ function paintMessages() {
           </section>
         `;
       }
+      const searchUI = m.search || m.webSearch ? renderSearchPanel(m.search, m.webSearch && m.streaming) : "";
       const think = m.thinking
         ? `<div class="think">${escapeHtml(m.thinking)}</div>`
         : "";
       const cursor = m.streaming ? `<span class="cursor" aria-hidden="true"></span>` : "";
       const meta = m.meta ? `<div class="turn-meta">${escapeHtml(m.meta)}</div>` : "";
       const answer = renderMarkdown(m.content || "") + cursor;
+      const hasAnswer = !!(m.content && m.content.trim()) || m.streaming;
       return `
         <section class="turn turn-assistant" data-i="${i}">
           <div class="turn-label">Grok</div>
+          ${searchUI}
           ${think}
-          <div class="answer md">${answer}</div>
+          ${hasAnswer || !searchUI ? `<div class="answer md">${answer}</div>` : ""}
           ${meta}
         </section>
       `;
@@ -807,6 +827,8 @@ async function submit() {
     content: "",
     thinking: "",
     streaming: true,
+    webSearch: state.webSearch,
+    search: null, // { query, results, status, abstract, answer }
   });
   promptEl.value = "";
   autoGrow(promptEl);
@@ -837,6 +859,8 @@ async function submit() {
     stream: true,
     reasoning_effort: effort,
     api_mode: apiMode,
+    web_search: !!state.webSearch,
+    search_query: text,
   };
 
   // full history for chat mode continuity in UI only; for API send context
@@ -881,6 +905,115 @@ function schedulePaintMessages() {
     paintScheduled = false;
     paintMessages();
   });
+}
+
+function renderSearchPanel(search, searching) {
+  if (!search && !searching) return "";
+  const q = search?.query || "…";
+  const status = search?.status || (searching ? "searching" : "done");
+  const results = search?.results || [];
+  const ms = search?.duration_ms;
+
+  let body = "";
+  if (status === "searching") {
+    body = `
+      <div class="search-loading">
+        <span class="search-spin"></span>
+        <span>Consultando DuckDuckGo…</span>
+      </div>
+      <div class="search-skeleton">
+        <div class="sk-row"></div>
+        <div class="sk-row short"></div>
+        <div class="sk-row"></div>
+      </div>
+    `;
+  } else if (status === "error") {
+    body = `<div class="search-error">Falha na busca: ${escapeHtml(search?.error || "erro")}</div>`;
+  } else {
+    const abs =
+      search?.answer || search?.abstract
+        ? `<div class="search-abstract">
+            ${search.answer ? `<div class="search-answer">${escapeHtml(search.answer)}</div>` : ""}
+            ${search.abstract ? `<p>${escapeHtml(search.abstract)}</p>` : ""}
+            ${search.answer_url ? `<a href="${escapeHtml(search.answer_url)}" target="_blank" rel="noopener">fonte</a>` : ""}
+          </div>`
+        : "";
+    const cards = results
+      .map((r, idx) => {
+        const domain = r.domain || "";
+        const icon = r.icon
+          ? `<img class="fav" src="${escapeHtml(r.icon)}" alt="" loading="lazy" onerror="this.style.display='none'"/>`
+          : `<span class="fav-fallback">${escapeHtml((domain || "?")[0] || "?")}</span>`;
+        return `
+          <a class="search-card" href="${escapeHtml(r.url)}" target="_blank" rel="noopener noreferrer" style="animation-delay:${idx * 40}ms">
+            <div class="search-card-top">
+              ${icon}
+              <div class="search-card-meta">
+                <span class="domain">${escapeHtml(domain)}</span>
+                <strong>${escapeHtml(r.title || r.url)}</strong>
+              </div>
+            </div>
+            ${r.snippet ? `<p>${escapeHtml(r.snippet)}</p>` : ""}
+          </a>
+        `;
+      })
+      .join("");
+    body = `
+      ${abs}
+      <div class="search-grid">${cards || `<div class="search-empty">Nenhum resultado web</div>`}</div>
+    `;
+  }
+
+  return `
+    <div class="search-panel ${status}">
+      <div class="search-head">
+        <span class="search-badge">DuckDuckGo</span>
+        <span class="search-q">${escapeHtml(q)}</span>
+        ${ms != null ? `<span class="search-ms">${fmt(ms)} ms</span>` : ""}
+      </div>
+      ${body}
+    </div>
+  `;
+}
+
+function onSearchEvent(type, payload) {
+  const last = state.messages.at(-1);
+  if (!last || last.role !== "assistant") return;
+  if (!last.search) last.search = { query: "", results: [], status: "searching" };
+
+  if (type === "search:start") {
+    last.webSearch = true;
+    last.search = {
+      query: payload?.query || "",
+      results: [],
+      status: "searching",
+      provider: payload?.provider || "DuckDuckGo",
+    };
+  } else if (type === "search:results") {
+    last.search = {
+      ...(last.search || {}),
+      query: payload?.query || last.search?.query || "",
+      results: payload?.results || [],
+      abstract: payload?.abstract || "",
+      answer: payload?.answer || "",
+      answer_url: payload?.answer_url || "",
+      duration_ms: payload?.duration_ms,
+      status: "done",
+      provider: payload?.provider || "DuckDuckGo",
+    };
+  } else if (type === "search:error") {
+    last.search = {
+      ...(last.search || {}),
+      query: payload?.query || last.search?.query || "",
+      status: "error",
+      error: payload?.error || "erro",
+    };
+  } else if (type === "search:done") {
+    if (last.search && last.search.status === "searching") {
+      last.search.status = "done";
+    }
+  }
+  schedulePaintMessages();
 }
 
 function onChatEvent(ev) {
@@ -962,6 +1095,10 @@ async function refreshBootstrap(full = true) {
 
 function wireEvents() {
   EventsOn("chat:event", onChatEvent);
+  EventsOn("search:start", (p) => onSearchEvent("search:start", p));
+  EventsOn("search:results", (p) => onSearchEvent("search:results", p));
+  EventsOn("search:error", (p) => onSearchEvent("search:error", p));
+  EventsOn("search:done", (p) => onSearchEvent("search:done", p));
   EventsOn("request:active", (req) => {
     state.activeRequest = req;
     paintStatus();
