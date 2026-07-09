@@ -19,16 +19,18 @@ type Progress struct {
 
 // Result is the final outcome from the bot.
 type Result struct {
-	Status     string `json:"status"`     // "success" | "error"
-	Reason     string `json:"reason,omitempty"`
-	Step       string `json:"step,omitempty"`
-	Screenshot string `json:"screenshot,omitempty"`
+	Status     string            `json:"status"`     // "success" | "error"
+	Reason     string            `json:"reason,omitempty"`
+	Step       string            `json:"step,omitempty"`
+	Screenshot string            `json:"screenshot,omitempty"`
+	Creds      map[string]string `json:"creds,omitempty"` // email, name, password, provider
 }
 
 // Runner manages the Python Playwright bot subprocess.
 type Runner struct {
 	PythonPath string // default "python3"
 	BotDir     string // path to grok-signup-bot/
+	CredsDir   string // directory to save auto_creds.json
 }
 
 // New creates a Runner with sensible defaults.
@@ -57,6 +59,9 @@ func (r *Runner) CreateAccount(
 	if userCode != "" {
 		args = append(args, "--user-code", userCode)
 	}
+	if r.CredsDir != "" {
+		args = append(args, "--creds-dir", r.CredsDir)
+	}
 
 	cmd := exec.CommandContext(ctx, r.PythonPath, args...)
 
@@ -75,6 +80,7 @@ func (r *Runner) CreateAccount(
 	}
 
 	resultCh := make(chan *Result, 1)
+	var creds map[string]string
 	go func() {
 		defer close(resultCh)
 		sc := bufio.NewScanner(stdout)
@@ -84,7 +90,6 @@ func (r *Runner) CreateAccount(
 				continue
 			}
 			if line == "__STEP__ done" {
-				// Final success
 				continue
 			}
 			if len(line) > 9 && line[:9] == "__STEP__ " {
@@ -95,6 +100,16 @@ func (r *Runner) CreateAccount(
 				}
 				continue
 			}
+			if len(line) > 8 && line[:8] == "__CREDS__ " {
+				payload := line[8:]
+				var c map[string]string
+				if err := json.Unmarshal([]byte(payload), &c); err != nil {
+					log.Printf("register: bad creds json: %v", err)
+					continue
+				}
+				creds = c
+				continue
+			}
 			if len(line) > 10 && line[:10] == "__RESULT__ " {
 				payload := line[10:]
 				var res Result
@@ -102,6 +117,7 @@ func (r *Runner) CreateAccount(
 					log.Printf("register: bad result json: %v", err)
 					continue
 				}
+				res.Creds = creds
 				resultCh <- &res
 				return
 			}

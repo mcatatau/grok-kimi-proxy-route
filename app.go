@@ -89,6 +89,7 @@ func (a *App) startup(ctx context.Context) {
 		runtime.LogErrorf(ctx, "mcpconfig: %v", err)
 	}
 	a.register = register.New("python3", filepath.Join(st.Root(), "..", "grok-signup-bot"))
+	a.register.CredsDir = st.Root()
 
 	settings := st.Settings()
 	// Auto-watch APPDATA/sso-watch/ for SSO token files (E2E, zero config)

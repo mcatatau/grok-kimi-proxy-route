@@ -869,11 +869,19 @@ function showAutoRegisterModal() {
     try {
       const result = await CreateAccount(url, "");
       if (result?.status === "success") {
-        prog.textContent = "Conta criada! Recarregando...";
+        const c = result?.creds || {};
+        const credsHtml = c.email ? `
+          <div style="margin-top:10px;padding:8px;background:var(--bg2);border-radius:6px;font-size:12px;font-family:monospace">
+            <div>Email: ${escapeHtml(c.email)}</div>
+            <div>Senha: ${escapeHtml(c.password)}</div>
+            <div>Nome: ${escapeHtml(c.name)}</div>
+          </div>
+        ` : "";
+        prog.innerHTML = "Conta criada!" + credsHtml;
         setTimeout(async () => {
           overlay.remove();
           await paintChrome();
-        }, 1500);
+        }, 5000);
       } else {
         prog.textContent = "Erro: " + (result?.reason || "desconhecido");
         btn.disabled = false;

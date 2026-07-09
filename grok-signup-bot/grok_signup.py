@@ -15,21 +15,16 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import random
-import string
 import sys
 import time
-import uuid
 
 from playwright.sync_api import Page, Playwright, sync_playwright, expect
+
+from creds import CredsStore, random_name, random_password
 
 
 def log(msg: str) -> None:
     print(msg, flush=True)
-
-
-def rstring(n: int = 12) -> str:
-    return "".join(random.choices(string.ascii_lowercase + string.digits, k=n))
 
 
 def resolve(
@@ -100,6 +95,7 @@ def run_signup(
     headless: bool = True,
     proxy_url: str | None = None,
     user_code: str | None = None,
+    creds_dir: str | None = None,
 ) -> None:
     log("__STEP__ launching")
 
@@ -124,6 +120,8 @@ def run_signup(
         ),
     )
     page = context.new_page()
+
+    creds_store = CredsStore(creds_dir or os.environ.get("CREDS_DIR", ""))
 
     try:
         log("__STEP__ device")
@@ -206,8 +204,8 @@ def run_signup(
 
         # 5. Fill name + password
         log("__STEP__ profile")
-        name = "User " + rstring(8)
-        password = rstring(16) + "Aa1!"
+        name = random_name()
+        password = random_password()
 
         wait_and_fill(
             page,
@@ -279,6 +277,8 @@ def run_signup(
             time.sleep(1.5)
 
         log("__STEP__ done")
+        entry = creds_store.save(email_addr, name, password, inbox.get("provider", ""))
+        log(f"__CREDS__ {json.dumps(entry)}")
         log('__RESULT__ {"status":"success"}')
 
     except Exception as e:
@@ -294,6 +294,7 @@ def main() -> None:
     parser.add_argument("--user-code")
     parser.add_argument("--headless", default="true")
     parser.add_argument("--proxy")
+    parser.add_argument("--creds-dir", default="", help="directory to save auto_creds.json")
     args = parser.parse_args()
 
     headless = args.headless.lower() not in ("false", "0", "no")
@@ -305,6 +306,7 @@ def main() -> None:
             headless=headless,
             proxy_url=args.proxy,
             user_code=args.user_code,
+            creds_dir=args.creds_dir,
         )
 
 
