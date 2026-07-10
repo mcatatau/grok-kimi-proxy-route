@@ -106,15 +106,20 @@ func (r *Runner) CreateAccount(
 		args = append(args, "--duckmail-key", r.DuckMailKey)
 	}
 
-	// On Windows, `py -3 script.py` needs the -3 flag before the script.
+	// Do not use CommandContext — we need to kill the full process tree (Chrome)
+	// ourselves on cancel, and hide the console on Windows.
 	var cmd *exec.Cmd
 	base := strings.ToLower(filepath.Base(r.PythonPath))
 	if runtime.GOOS == "windows" && (base == "py" || base == "py.exe") {
-		cmd = exec.CommandContext(ctx, r.PythonPath, append([]string{"-3"}, args...)...)
+		cmd = exec.Command(r.PythonPath, append([]string{"-3"}, args...)...)
 	} else {
-		cmd = exec.CommandContext(ctx, r.PythonPath, args...)
+		cmd = exec.Command(r.PythonPath, args...)
 	}
 	cmd.Dir = r.BotDir
+	// PYTHONUTF8 reduces cp1252 issues on Windows consoles
+	cmd.Env = append(os.Environ(), "PYTHONUTF8=1", "PYTHONIOENCODING=utf-8")
+	hideConsoleWindow(cmd)
+	prepareProcessGroup(cmd)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -135,11 +140,26 @@ func (r *Runner) CreateAccount(
 	}
 
 	var (
-		stderrMu   sync.Mutex
-		stderrBuf  strings.Builder
-		resultCh   = make(chan *Result, 1)
-		creds      map[string]string
+		stderrMu  sync.Mutex
+		stderrBuf strings.Builder
+		resultCh  = make(chan *Result, 1)
+		creds     map[string]string
+		waitErr   error
 	)
+	waitDone := make(chan struct{})
+	go func() {
+		waitErr = cmd.Wait()
+		close(waitDone)
+	}()
+
+	// Kill tree if context cancelled while bot is still running.
+	go func() {
+		select {
+		case <-ctx.Done():
+			killProcessTree(cmd)
+		case <-waitDone:
+		}
+	}()
 
 	go func() {
 		defer close(resultCh)
@@ -192,14 +212,12 @@ func (r *Runner) CreateAccount(
 		}
 	}()
 
-	// Capture stderr for diagnostics (import errors, chrome missing, etc.)
 	go func() {
 		b, _ := io.ReadAll(stderr)
 		if len(b) > 0 {
 			stderrMu.Lock()
 			stderrBuf.Write(b)
 			stderrMu.Unlock()
-			// log truncated
 			msg := string(b)
 			if len(msg) > 2000 {
 				msg = msg[:2000] + "…"
@@ -208,16 +226,18 @@ func (r *Runner) CreateAccount(
 		}
 	}()
 
-	// Wait for result or context cancellation
 	var result *Result
 	select {
 	case res := <-resultCh:
 		result = res
 	case <-ctx.Done():
-		result = &Result{Status: "error", Reason: "timeout/cancelled"}
+		killProcessTree(cmd)
+		result = &Result{Status: "error", Reason: "timeout/cancelled" + killHint()}
+	case <-waitDone:
+		// process exited before __RESULT__
 	}
 
-	waitErr := cmd.Wait()
+	<-waitDone
 
 	if result == nil {
 		stderrMu.Lock()
@@ -228,7 +248,6 @@ func (r *Runner) CreateAccount(
 			reason = fmt.Sprintf("no result from bot (exit: %v)", waitErr)
 		}
 		if errText != "" {
-			// Keep reason short for UI; full stderr already logged
 			snip := errText
 			if len(snip) > 400 {
 				snip = snip[:400] + "…"
