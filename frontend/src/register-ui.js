@@ -3,6 +3,7 @@ import {
   ImportSSOFromFile,
   StartDeviceLogin,
   CancelDeviceLogin,
+  CancelRegisterBatch,
   CreateAccounts,
   OpenExternal,
   SetActiveAccount,
@@ -251,15 +252,18 @@ export function showBatchCreateModal(paintChrome) {
     if (!Number.isFinite(n) || n < 1) n = 1;
     if (n > 5) n = 5;
     const btn = $("#bc-start", overlay);
+    const cancelBtn = $("#bc-cancel", overlay);
     const prog = $("#bc-progress", overlay);
     btn.disabled = true;
     btn.textContent = "Gerando...";
+    if (cancelBtn) cancelBtn.textContent = "Parar";
     state.batchCreating = true;
-    prog.innerHTML = `<div class="muted">Aguarde, criando ${n} conta(s)…</div>`;
+    prog.innerHTML = `<div class="muted">Aguarde, criando ${n} conta(s)… (Parar cancela o lote)</div>`;
     try {
       const results = await CreateAccounts(n);
       const list = Array.isArray(results) ? results : [];
       const okN = list.filter((r) => r.status === "success").length;
+      const cancelled = list.some((r) => String(r.reason || "").includes("cancel"));
       prog.innerHTML =
         list
           .map((r, i) => {
@@ -272,9 +276,13 @@ export function showBatchCreateModal(paintChrome) {
             return `<div>${status} Tentativa ${r.attempt || i + 1}: ${escapeHtml(r.status || "?")}${reason}${creds}</div>`;
           })
           .join("") || `<div class="sheet-err">Nenhum resultado (pediu ${n})</div>`;
-      prog.innerHTML += `<div class="muted" style="margin-top:8px">Pedido: ${n} · Criadas: ${okN}/${list.length}</div>`;
+      if (cancelled) {
+        prog.innerHTML += `<div class="muted" style="margin-top:8px">Lote cancelado · Criadas: ${okN}/${list.length}</div>`;
+      } else {
+        prog.innerHTML += `<div class="muted" style="margin-top:8px">Pedido: ${n} · Criadas: ${okN}/${list.length}</div>`;
+      }
       await paintChrome?.();
-      if (list.some((r) => r.status === "success")) {
+      if (list.some((r) => r.status === "success") && !cancelled) {
         setTimeout(async () => {
           if (document.body.contains(overlay)) overlay.remove();
           state.batchCreating = false;
@@ -284,15 +292,25 @@ export function showBatchCreateModal(paintChrome) {
         state.batchCreating = false;
         btn.disabled = false;
         btn.textContent = "Gerar";
+        if (cancelBtn) cancelBtn.textContent = "Cancelar";
       }
     } catch (e) {
       state.batchCreating = false;
       prog.innerHTML = `<div class="sheet-err">Erro: ${escapeHtml(String(e))}</div>`;
       btn.disabled = false;
       btn.textContent = "Gerar";
+      if (cancelBtn) cancelBtn.textContent = "Cancelar";
     }
   };
   $("#bc-cancel", overlay).onclick = () => {
+    if (state.batchCreating) {
+      CancelRegisterBatch();
+      const prog = $("#bc-progress", overlay);
+      if (prog) {
+        prog.innerHTML += `<div class="muted" style="margin-top:6px">Cancelando… (encerrando bot/poll)</div>`;
+      }
+      return;
+    }
     state.batchCreating = false;
     overlay.remove();
   };

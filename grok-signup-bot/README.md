@@ -21,18 +21,30 @@ Plan: [`plan/executed/auto-register-plan-v1.md`](../plan/executed/auto-register-
 
 ```bash
 cd /path/to/grok-proxy-plus
+
+# Linux / macOS
 python3 -m venv .venv
 .venv/bin/pip install -r grok-signup-bot/requirements.txt
+
+# Windows (PowerShell) — use real python.org install, not the Store stub
+python -m venv .venv
+.\.venv\Scripts\pip install -r grok-signup-bot\requirements.txt
 ```
 
-Deps: `DrissionPage`, `curl_cffi`, `pyvirtualdisplay`, `playwright-captcha` (see `requirements.txt`).
+Deps: `DrissionPage`, `curl_cffi`, optional `pyvirtualdisplay` (Linux), `playwright-captcha` (see `requirements.txt`).
 
-Desktop (dev) expects:
+**Browser:** Chrome or Edge must be installed (Windows paths auto-detected in `grok_signup.py`).
 
-- Python: `<repo>/.venv/bin/python3`
-- Bot dir: `<repo>/grok-signup-bot`
+Desktop path resolution (`app.go` / settings):
 
-(Hardcoded relative to the Wails binary in `app.go` `startup`.)
+| | Dev monorepo | Bare release .exe | Portable zip |
+|--|--------------|-------------------|--------------|
+| Python | `.venv` | `python` / `py` on PATH or settings | same |
+| Bot dir | `<repo>/grok-signup-bot` | **embedded** → `%LOCALAPPDATA%\GrokDesktop\signup-bot\<ver>\` | sibling `grok-signup-bot\` |
+
+Source of embed: `internal/register/bot/` (synced from this folder at build time).
+
+On cancel/timeout the Go runner kills the **process tree** (Windows `taskkill /T`; Unix process group) so Chrome does not stay orphaned.
 
 ### Email providers
 

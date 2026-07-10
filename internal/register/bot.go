@@ -7,8 +7,12 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
+	"strings"
+	"sync"
 )
 
 // Progress represents a step event from the signup bot.
@@ -19,7 +23,7 @@ type Progress struct {
 
 // Result is the final outcome from the bot.
 type Result struct {
-	Status      string            `json:"status"`     // "success" | "error"
+	Status      string            `json:"status"` // "success" | "error"
 	Reason      string            `json:"reason,omitempty"`
 	Step        string            `json:"step,omitempty"`
 	Screenshot  string            `json:"screenshot,omitempty"`
@@ -29,7 +33,7 @@ type Result struct {
 
 // Runner manages the Python signup bot subprocess (DrissionPage).
 type Runner struct {
-	PythonPath     string // default "python3"
+	PythonPath     string // default "python3" / "python" on Windows
 	BotDir         string // path to grok-signup-bot/
 	CredsDir       string // directory to save auto_creds.json
 	EmailProviders []string
@@ -40,7 +44,11 @@ type Runner struct {
 // New creates a Runner with sensible defaults.
 func New(pythonPath, botDir string) *Runner {
 	if pythonPath == "" {
-		pythonPath = "python3"
+		if runtime.GOOS == "windows" {
+			pythonPath = "python"
+		} else {
+			pythonPath = "python3"
+		}
 	}
 	return &Runner{PythonPath: pythonPath, BotDir: botDir}
 }
@@ -55,6 +63,49 @@ func (r *Runner) CreateAccount(
 	progress func(Progress),
 ) (*Result, error) {
 	script := filepath.Join(r.BotDir, "grok_signup.py")
+	if st, err := os.Stat(script); err != nil || st.IsDir() {
+		return &Result{
+			Status: "error",
+			Reason: fmt.Sprintf(
+				"bot script missing: %s — bot should extract under AppData (embedded) or put grok-signup-bot next to the .exe / set bot_dir",
+				script,
+			),
+			Step: "start",
+		}, nil
+	}
+	if _, err := exec.LookPath(r.PythonPath); err != nil {
+		// absolute path may not be on PATH
+		if st, err2 := os.Stat(r.PythonPath); err2 != nil || st.IsDir() {
+			return &Result{
+				Status: "error",
+				Reason: fmt.Sprintf("python not found: %q (install Python 3 + pip, or set python_path in settings)", r.PythonPath),
+				Step:   "start",
+			}, nil
+		}
+	}
+
+	// Auto venv + pip install under AppData (DrissionPage etc.)
+	if r.CredsDir != "" {
+		if progress != nil {
+			progress(Progress{Step: "deps", Message: "checking python packages"})
+		}
+		py, err := EnsureBotDeps(ctx, r.CredsDir, r.PythonPath, r.BotDir, func(msg string) {
+			if progress != nil {
+				progress(Progress{Step: "deps", Message: msg})
+			}
+		})
+		if err != nil {
+			return &Result{
+				Status: "error",
+				Reason: fmt.Sprintf("bot deps: %v", err),
+				Step:   "deps",
+			}, nil
+		}
+		if py != "" {
+			r.PythonPath = py
+		}
+	}
+
 	args := []string{
 		script,
 		"--verification-url", verificationURL,
@@ -80,7 +131,21 @@ func (r *Runner) CreateAccount(
 		args = append(args, "--duckmail-key", r.DuckMailKey)
 	}
 
-	cmd := exec.CommandContext(ctx, r.PythonPath, args...)
+	// Do not use CommandContext — we need to kill the full process tree (Chrome)
+	// ourselves on cancel, and hide the console on Windows.
+	var cmd *exec.Cmd
+	base := strings.ToLower(filepath.Base(r.PythonPath))
+	if runtime.GOOS == "windows" && (base == "py" || base == "py.exe") {
+		cmd = exec.Command(r.PythonPath, append([]string{"-3"}, args...)...)
+	} else {
+		cmd = exec.Command(r.PythonPath, args...)
+	}
+	cmd.Dir = r.BotDir
+	// PYTHONUTF8 reduces cp1252 issues on Windows consoles
+	cmd.Env = append(os.Environ(), "PYTHONUTF8=1", "PYTHONIOENCODING=utf-8")
+	// Visible Chrome: do not CREATE_NO_WINDOW / HideWindow on Windows.
+	allowGUIChildren(cmd)
+	prepareProcessGroup(cmd)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -93,11 +158,35 @@ func (r *Runner) CreateAccount(
 	}
 
 	if err := cmd.Start(); err != nil {
-		return nil, fmt.Errorf("register start: %w", err)
+		return &Result{
+			Status: "error",
+			Reason: fmt.Sprintf("failed to start bot: %v (python=%s script=%s)", err, r.PythonPath, script),
+			Step:   "start",
+		}, nil
 	}
 
-	resultCh := make(chan *Result, 1)
-	var creds map[string]string
+	var (
+		stderrMu  sync.Mutex
+		stderrBuf strings.Builder
+		resultCh  = make(chan *Result, 1)
+		creds     map[string]string
+		waitErr   error
+	)
+	waitDone := make(chan struct{})
+	go func() {
+		waitErr = cmd.Wait()
+		close(waitDone)
+	}()
+
+	// Kill tree if context cancelled while bot is still running.
+	go func() {
+		select {
+		case <-ctx.Done():
+			killProcessTree(cmd)
+		case <-waitDone:
+		}
+	}()
+
 	go func() {
 		defer close(resultCh)
 		sc := bufio.NewScanner(stdout)
@@ -149,28 +238,53 @@ func (r *Runner) CreateAccount(
 		}
 	}()
 
-	// Capture stderr for diagnostics
 	go func() {
-		stderrData, _ := io.ReadAll(stderr)
-		if len(stderrData) > 0 {
-			log.Printf("register stderr: %s", string(stderrData))
+		b, _ := io.ReadAll(stderr)
+		if len(b) > 0 {
+			stderrMu.Lock()
+			stderrBuf.Write(b)
+			stderrMu.Unlock()
+			msg := string(b)
+			if len(msg) > 2000 {
+				msg = msg[:2000] + "…"
+			}
+			log.Printf("register stderr: %s", msg)
 		}
 	}()
 
-	// Wait for result or context cancellation
 	var result *Result
 	select {
 	case res := <-resultCh:
 		result = res
 	case <-ctx.Done():
-		result = &Result{Status: "error", Reason: "timeout/cancelled"}
+		killProcessTree(cmd)
+		result = &Result{Status: "error", Reason: "timeout/cancelled" + killHint()}
+	case <-waitDone:
+		// process exited before __RESULT__
 	}
 
-	// Clean up
-	_ = cmd.Wait()
+	<-waitDone
 
 	if result == nil {
-		result = &Result{Status: "error", Reason: "no result from bot"}
+		stderrMu.Lock()
+		errText := strings.TrimSpace(stderrBuf.String())
+		stderrMu.Unlock()
+		reason := "no result from bot"
+		if waitErr != nil {
+			reason = fmt.Sprintf("no result from bot (exit: %v)", waitErr)
+		}
+		if errText != "" {
+			snip := errText
+			if len(snip) > 400 {
+				snip = snip[:400] + "…"
+			}
+			snip = strings.ReplaceAll(snip, "\r\n", " ")
+			snip = strings.ReplaceAll(snip, "\n", " ")
+			reason = reason + ": " + snip
+		} else {
+			reason = reason + fmt.Sprintf(" (python=%s bot_dir=%s — check Python/DrissionPage/Chrome install)", r.PythonPath, r.BotDir)
+		}
+		result = &Result{Status: "error", Reason: reason, Step: "start"}
 	}
 	return result, nil
 }

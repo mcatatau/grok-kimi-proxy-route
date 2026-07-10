@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"sync"
 	"time"
@@ -42,6 +44,7 @@ type App struct {
 	deviceState  *deviceLoginState
 	reqCancel    context.CancelFunc
 	activeReq    *ActiveRequest
+	regCancel    context.CancelFunc
 }
 
 type deviceLoginState struct {
@@ -104,11 +107,33 @@ func (a *App) startup(ctx context.Context) {
 		runtime.LogErrorf(ctx, "mcpconfig: %v", err)
 	}
 	settings := st.Settings()
-	pyPath, botDir := resolveRegisterPaths(exeDir, settings)
+	// Prefer embedded bot extracted under AppData; still allow sibling/monorepo override.
+	var extractedBot string
+	if register.HasEmbeddedBot() {
+		if dest, err := register.ExtractEmbeddedBot(st.Root()); err != nil {
+			runtime.LogErrorf(ctx, "register: extract embedded bot: %v", err)
+		} else {
+			extractedBot = dest
+			runtime.LogInfof(ctx, "register: embedded bot extracted to %s (ver=%s)", dest, register.BotEmbedVersion())
+		}
+	}
+	pyPath, botDir := resolveRegisterPaths(exeDir, settings, extractedBot)
 	a.register = register.New(pyPath, botDir)
 	a.register.CredsDir = st.Root()
 	applyRegisterSettings(a.register, settings)
 	runtime.LogInfof(ctx, "register: python=%s bot_dir=%s auto=%v", pyPath, botDir, settings.AutoRegisterEnabled)
+	// Warm bot deps in background (venv + pip) so first register is faster.
+	go func() {
+		py, err := register.EnsureBotDeps(context.Background(), st.Root(), pyPath, botDir, nil)
+		if err != nil {
+			runtime.LogErrorf(ctx, "register: ensure deps: %v", err)
+			return
+		}
+		if a.register != nil && py != "" {
+			a.register.PythonPath = py
+			runtime.LogInfof(ctx, "register: venv python=%s", py)
+		}
+	}()
 
 	// Auto-watch APPDATA/sso-watch/ for SSO token files (E2E, zero config)
 	ssoDir := filepath.Join(st.Root(), "sso-watch")
@@ -153,6 +178,9 @@ func (a *App) shutdown(ctx context.Context) {
 	}
 	if a.reqCancel != nil {
 		a.reqCancel()
+	}
+	if a.regCancel != nil {
+		a.regCancel()
 	}
 	a.mu.Unlock()
 }
@@ -282,7 +310,13 @@ func (a *App) UpdateSettings(patch map[string]any) (store.Settings, error) {
 	s := a.store.Settings()
 	if a.register != nil {
 		exe, _ := os.Executable()
-		py, bot := resolveRegisterPaths(filepath.Dir(exe), s)
+		var extracted string
+		if register.HasEmbeddedBot() && a.store != nil {
+			if dest, err := register.ExtractEmbeddedBot(a.store.Root()); err == nil {
+				extracted = dest
+			}
+		}
+		py, bot := resolveRegisterPaths(filepath.Dir(exe), s, extracted)
 		a.register.PythonPath = py
 		a.register.BotDir = bot
 		applyRegisterSettings(a.register, s)
@@ -434,6 +468,17 @@ func (a *App) CancelDeviceLogin() {
 		a.deviceCancel = nil
 	}
 	a.deviceState = nil
+}
+
+// CancelRegisterBatch aborts CreateAccounts / CreateAccountFromDevice (bot + poll).
+func (a *App) CancelRegisterBatch() {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.regCancel != nil {
+		a.regCancel()
+		a.regCancel = nil
+	}
+	log.Printf("CancelRegisterBatch: cancelled")
 }
 
 // ImportSSO imports an SSO token from grok-register as a new account.
@@ -1257,6 +1302,7 @@ func (a *App) autoRegisterLoop() {
 		runtime.LogInfof(a.ctx, "auto-register: creating %d account(s)...", need)
 		for i := 0; i < need; i++ {
 			result, err := a.CreateAccountFromDevice()
+
 			if err != nil || result == nil || result.Status != "success" {
 				reason := "unknown"
 				if err != nil {
@@ -1275,13 +1321,33 @@ func (a *App) autoRegisterLoop() {
 // CreateAccountFromDevice starts a device login, runs the bot, and polls for the token.
 // Wails binding (single account) — emits auth:success.
 func (a *App) CreateAccountFromDevice() (*register.Result, error) {
-	return a.createAccountFromDevice(false)
+	ctx, cancel := context.WithCancel(a.ctx)
+	a.mu.Lock()
+	if a.regCancel != nil {
+		a.regCancel()
+	}
+	a.regCancel = cancel
+	a.mu.Unlock()
+	defer func() {
+		cancel()
+		a.mu.Lock()
+		if a.regCancel != nil {
+			// only clear if still ours
+			a.regCancel = nil
+		}
+		a.mu.Unlock()
+	}()
+	return a.createAccountFromDevice(ctx, false)
 }
 
 // createAccountFromDevice is the full flow. silent=true skips auth:success so batch UI is not torn down mid-loop.
-func (a *App) createAccountFromDevice(silent bool) (*register.Result, error) {
+// parent is the batch/account cancel context (must already carry deadline or cancel).
+func (a *App) createAccountFromDevice(parent context.Context, silent bool) (*register.Result, error) {
 	if a.register == nil {
 		return nil, fmt.Errorf("register runner not ready")
+	}
+	if parent == nil {
+		parent = a.ctx
 	}
 	emitProgress := func(step, msg string) {
 		if a.ctx != nil {
@@ -1290,13 +1356,20 @@ func (a *App) createAccountFromDevice(silent bool) (*register.Result, error) {
 		}
 	}
 
-	// Shared budget for device grant (~5 min)
-	ctx, cancel := context.WithTimeout(a.ctx, 300*time.Second)
+	// Per-account budget for device grant (~5 min), nested under parent cancel
+	ctx, cancel := context.WithTimeout(parent, 300*time.Second)
 	defer cancel()
+
+	if err := parent.Err(); err != nil {
+		return &register.Result{Status: "error", Reason: "cancelled"}, nil
+	}
 
 	emitProgress("device", "starting device login")
 	start, err := a.oauth.StartDevice(ctx)
 	if err != nil {
+		if parent.Err() != nil {
+			return &register.Result{Status: "error", Reason: "cancelled"}, nil
+		}
 		return nil, fmt.Errorf("device start: %w", err)
 	}
 	url := start.VerificationURIComplete
@@ -1308,12 +1381,18 @@ func (a *App) createAccountFromDevice(silent bool) (*register.Result, error) {
 		emitProgress(p.Step, p.Message)
 	})
 	if err != nil {
-		cancel()
+		if parent.Err() != nil || ctx.Err() != nil {
+			return &register.Result{Status: "error", Reason: "cancelled"}, nil
+		}
 		return nil, fmt.Errorf("bot: %w", err)
 	}
 	if result == nil || result.Status != "success" {
 		if result == nil {
 			return &register.Result{Status: "error", Reason: "no result from bot"}, nil
+		}
+		if result.Reason == "timeout/cancelled" || parent.Err() != nil {
+			result.Status = "error"
+			result.Reason = "cancelled"
 		}
 		return result, nil
 	}
@@ -1326,6 +1405,13 @@ func (a *App) createAccountFromDevice(silent bool) (*register.Result, error) {
 	token, err := a.oauth.PollDevice(pollCtx, start.DeviceCode, start.Interval)
 	if err != nil {
 		log.Printf("CreateAccountFromDevice: PollDevice error: %v", err)
+		if parent.Err() != nil {
+			return &register.Result{
+				Status: "error",
+				Reason: "cancelled",
+				Creds:  result.Creds,
+			}, nil
+		}
 		if pollCtx.Err() != nil {
 			return &register.Result{
 				Status: "error",
@@ -1412,6 +1498,20 @@ func (a *App) CreateAccounts(n int) []map[string]any {
 		requested = maxBatch
 	}
 
+	batchCtx, batchCancel := context.WithCancel(a.ctx)
+	a.mu.Lock()
+	if a.regCancel != nil {
+		a.regCancel()
+	}
+	a.regCancel = batchCancel
+	a.mu.Unlock()
+	defer func() {
+		batchCancel()
+		a.mu.Lock()
+		a.regCancel = nil
+		a.mu.Unlock()
+	}()
+
 	runtime.LogInfof(a.ctx, "CreateAccounts: batch size=%d (no pool cap; active now=%d)", requested, a.activeAccountCount())
 	results := make([]map[string]any, 0, requested)
 	runtime.EventsEmit(a.ctx, "register:batch", map[string]any{
@@ -1419,6 +1519,13 @@ func (a *App) CreateAccounts(n int) []map[string]any {
 	})
 
 	for i := 0; i < requested; i++ {
+		if batchCtx.Err() != nil {
+			results = append(results, map[string]any{
+				"attempt": i + 1, "status": "error", "reason": "cancelled",
+			})
+			runtime.LogInfof(a.ctx, "CreateAccounts: cancelled before %d/%d", i+1, requested)
+			break
+		}
 		runtime.LogInfof(a.ctx, "CreateAccounts: starting %d/%d", i+1, requested)
 		runtime.EventsEmit(a.ctx, "register:progress", map[string]any{
 			"step":    "batch",
@@ -1427,7 +1534,7 @@ func (a *App) CreateAccounts(n int) []map[string]any {
 			"total":   requested,
 		})
 
-		result, err := a.createAccountFromDevice(true)
+		result, err := a.createAccountFromDevice(batchCtx, true)
 		entry := map[string]any{"attempt": i + 1}
 		if err != nil {
 			entry["status"] = "error"
@@ -1451,8 +1558,16 @@ func (a *App) CreateAccounts(n int) []map[string]any {
 		runtime.LogInfof(a.ctx, "CreateAccounts: finished %d/%d status=%v reason=%v",
 			i+1, requested, entry["status"], entry["reason"])
 
+		if batchCtx.Err() != nil || (result != nil && result.Reason == "cancelled") {
+			runtime.LogInfof(a.ctx, "CreateAccounts: stopping batch after cancel")
+			break
+		}
+
 		if i+1 < requested {
-			time.Sleep(3 * time.Second)
+			select {
+			case <-batchCtx.Done():
+			case <-time.After(3 * time.Second):
+			}
 		}
 	}
 
@@ -1486,31 +1601,107 @@ func strMap(m map[string]any, k string) string {
 	return ""
 }
 
-func resolveRegisterPaths(exeDir string, s store.Settings) (pythonPath, botDir string) {
+func resolveRegisterPaths(exeDir string, s store.Settings, extractedBot string) (pythonPath, botDir string) {
+	// Prefer absolute paths so double-click / shortcut CWD never breaks bot discovery.
+	if abs, err := filepath.Abs(exeDir); err == nil {
+		exeDir = abs
+	}
+	if eval, err := filepath.EvalSymlinks(exeDir); err == nil && eval != "" {
+		exeDir = eval
+	}
+
 	pythonPath = strings.TrimSpace(s.PythonPath)
 	botDir = strings.TrimSpace(s.BotDir)
-	if pythonPath == "" {
-		// monorepo / wails dev layout
-		cand := filepath.Join(exeDir, "..", "..", ".venv", "bin", "python3")
-		if st, err := os.Stat(cand); err == nil && !st.IsDir() {
-			pythonPath = cand
-		} else {
-			pythonPath = "python3"
-		}
+
+	// Relative settings → relative to the executable directory (not CWD).
+	if pythonPath != "" && !filepath.IsAbs(pythonPath) {
+		pythonPath = filepath.Join(exeDir, pythonPath)
 	}
-	if botDir == "" {
-		cand := filepath.Join(exeDir, "..", "..", "grok-signup-bot")
-		if st, err := os.Stat(cand); err == nil && st.IsDir() {
-			botDir = cand
+	if botDir != "" && !filepath.IsAbs(botDir) {
+		botDir = filepath.Join(exeDir, botDir)
+	}
+
+	if pythonPath == "" {
+		var pyCands []string
+		if goruntime.GOOS == "windows" {
+			pyCands = []string{
+				filepath.Join(exeDir, ".venv", "Scripts", "python.exe"),
+				filepath.Join(exeDir, "python", "python.exe"),
+				filepath.Join(exeDir, "..", "..", ".venv", "Scripts", "python.exe"),
+				filepath.Join(exeDir, "..", ".venv", "Scripts", "python.exe"),
+			}
 		} else {
-			// next to executable
-			cand2 := filepath.Join(exeDir, "grok-signup-bot")
-			if st, err := os.Stat(cand2); err == nil && st.IsDir() {
-				botDir = cand2
-			} else {
-				botDir = "grok-signup-bot"
+			pyCands = []string{
+				filepath.Join(exeDir, ".venv", "bin", "python3"),
+				filepath.Join(exeDir, "..", "..", ".venv", "bin", "python3"),
+				filepath.Join(exeDir, "..", ".venv", "bin", "python3"),
 			}
 		}
+		for _, cand := range pyCands {
+			cand = filepath.Clean(cand)
+			if st, err := os.Stat(cand); err == nil && !st.IsDir() {
+				pythonPath = cand
+				break
+			}
+		}
+		if pythonPath == "" {
+			if goruntime.GOOS == "windows" {
+				if p, err := exec.LookPath("python"); err == nil {
+					pythonPath = p
+				} else if p, err := exec.LookPath("python3"); err == nil {
+					pythonPath = p
+				} else if p, err := exec.LookPath("py"); err == nil {
+					pythonPath = p
+				} else {
+					pythonPath = "python"
+				}
+			} else {
+				if p, err := exec.LookPath("python3"); err == nil {
+					pythonPath = p
+				} else {
+					pythonPath = "python3"
+				}
+			}
+		}
+	}
+
+	if botDir == "" {
+		// Prefer embedded extract (always available with bare .exe), then portable/monorepo trees.
+		cwd, _ := os.Getwd()
+		cands := []string{}
+		if extractedBot != "" {
+			cands = append(cands, extractedBot)
+		}
+		cands = append(cands,
+			filepath.Join(exeDir, "grok-signup-bot"),
+			filepath.Join(exeDir, "..", "grok-signup-bot"),
+			filepath.Join(exeDir, "..", "..", "grok-signup-bot"),
+		)
+		if cwd != "" {
+			cands = append(cands,
+				filepath.Join(cwd, "grok-signup-bot"),
+				filepath.Join(cwd, "..", "grok-signup-bot"),
+			)
+		}
+		for _, cand := range cands {
+			cand = filepath.Clean(cand)
+			if st, err := os.Stat(cand); err == nil && st.IsDir() {
+				if _, err := os.Stat(filepath.Join(cand, "grok_signup.py")); err == nil {
+					botDir = cand
+					break
+				}
+			}
+		}
+		if botDir == "" && extractedBot != "" {
+			botDir = extractedBot
+		}
+		if botDir == "" {
+			// Always absolute path next to exe — never bare relative (breaks when CWD ≠ exe dir).
+			botDir = filepath.Join(exeDir, "grok-signup-bot")
+		}
+	}
+	if abs, err := filepath.Abs(botDir); err == nil {
+		botDir = abs
 	}
 	return pythonPath, botDir
 }
