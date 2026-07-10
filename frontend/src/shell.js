@@ -193,14 +193,14 @@ export function ensureShell() {
     },
   });
 
-  // Composer account switcher: click email chip → pick another account
+  // Composer account switcher: only usable accounts (hide cooldown / denied / dead SSO)
   const accountOpts = () => {
-    if (!state.accounts.length) {
-      return [{ value: "", label: "sem conta — adicione à esquerda" }];
+    const usable = state.accounts.filter(isUsableAccount);
+    if (!usable.length) {
+      return [{ value: "", label: "sem conta utilizável" }];
     }
-    return state.accounts.map((a) => ({
+    return usable.map((a) => ({
       value: a.id,
-      // show email first (what people recognize), label as fallback
       label: a.active
         ? `● ${a.email || a.label || a.id}`
         : a.email || a.label || a.id,
@@ -369,10 +369,15 @@ export function paintChrome() {
     list.appendChild(card);
   }
 
-  // refresh composer account menu
+  // refresh composer account menu (usable only)
   state.menus["c-account"]?.refresh?.();
-  const activeId = activeAccount()?.id || "";
-  if (activeId) state.menus["c-account"]?.setValue(activeId);
+  const usableList = state.accounts.filter(isUsableAccount);
+  const pickId =
+    (acc && isUsableAccount(acc) && acc.id) ||
+    usableList.find((a) => a.active)?.id ||
+    usableList[0]?.id ||
+    "";
+  if (pickId) state.menus["c-account"]?.setValue(pickId);
 
   // sync pick values from settings
   state.picks.effort = state.settings.reasoning_effort || state.picks.effort || "high";
@@ -388,7 +393,7 @@ export function paintChrome() {
   state.menus["c-effort"]?.setValue(state.picks.cEffort);
   state.menus["c-api"]?.setValue(state.picks.cApi);
   state.menus["c-model"]?.setValue(state.picks.cModel);
-  if (acc?.id) state.menus["c-account"]?.setValue(acc.id);
+  if (pickId) state.menus["c-account"]?.setValue(pickId);
 
   paintStatus();
   paintSend();

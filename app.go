@@ -1319,10 +1319,25 @@ func (a *App) createAccountFromDevice(silent bool) (*register.Result, error) {
 	}
 
 	emitProgress("poll", "waiting for OAuth token")
-	token, err := a.oauth.PollDevice(ctx, start.DeviceCode, start.Interval)
+	// Bot already finished; grant should complete quickly if Allow was clicked.
+	// Cap poll so a false bot "success" does not spin for the full 5m budget.
+	pollCtx, pollCancel := context.WithTimeout(ctx, 45*time.Second)
+	defer pollCancel()
+	token, err := a.oauth.PollDevice(pollCtx, start.DeviceCode, start.Interval)
 	if err != nil {
 		log.Printf("CreateAccountFromDevice: PollDevice error: %v", err)
-		return nil, fmt.Errorf("poll device: %w", err)
+		if pollCtx.Err() != nil {
+			return &register.Result{
+				Status: "error",
+				Reason: "OAuth still pending after bot — Allow likely not completed",
+				Creds:  result.Creds,
+			}, nil
+		}
+		return &register.Result{
+			Status: "error",
+			Reason: fmt.Sprintf("poll device: %v", err),
+			Creds:  result.Creds,
+		}, nil
 	}
 
 	// OAuth account with refresh_token (not ImportSSO)

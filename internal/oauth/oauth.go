@@ -110,6 +110,7 @@ func (c *Client) PollDevice(ctx context.Context, deviceCode string, intervalSec 
 		intervalSec = 5
 	}
 	ep := strings.TrimRight(c.Issuer, "/") + "/oauth2/token"
+	pendingLogs := 0
 	for {
 		select {
 		case <-ctx.Done():
@@ -128,20 +129,30 @@ func (c *Client) PollDevice(ctx context.Context, deviceCode string, intervalSec 
 		var tok TokenResponse
 		_ = json.Unmarshal(b, &tok)
 		if tok.Error != "" {
-			log.Printf("PollDevice: error=%s desc=%s", tok.Error, tok.ErrorDesc)
 			switch tok.Error {
 			case "authorization_pending":
+				pendingLogs++
+				// spam control: first, then every 6th (~30s at 5s interval)
+				if pendingLogs == 1 || pendingLogs%6 == 0 {
+					log.Printf("PollDevice: still pending (n=%d) %s", pendingLogs, tok.ErrorDesc)
+				}
 				continue
 			case "slow_down":
 				intervalSec += 5
+				log.Printf("PollDevice: slow_down → interval=%ds", intervalSec)
 				continue
 			default:
+				log.Printf("PollDevice: error=%s desc=%s", tok.Error, tok.ErrorDesc)
 				return nil, fmt.Errorf("%s: %s", tok.Error, tok.ErrorDesc)
 			}
 		}
 		if code >= 400 {
 			// try parse soft errors
 			if strings.Contains(string(b), "authorization_pending") {
+				pendingLogs++
+				if pendingLogs == 1 || pendingLogs%6 == 0 {
+					log.Printf("PollDevice: still pending HTTP (n=%d)", pendingLogs)
+				}
 				continue
 			}
 			return nil, fmt.Errorf("token HTTP %d: %s", code, string(b))

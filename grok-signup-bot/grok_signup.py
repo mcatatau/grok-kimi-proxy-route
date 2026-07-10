@@ -461,18 +461,44 @@ return 'ok';
         time.sleep(3)
         dom_allow = dump_dom(tab)
         log(f"allow_page: {dom_allow}")
-        for text in ("Allow", "Permitir", "Autorizar"):
+        allowed = False
+        for _round in range(8):
+            for text in ("Allow", "Permitir", "Autorizar"):
+                try:
+                    el = tab.ele(f"tag:button@@text()={text}", timeout=3)
+                    if el and el.states.is_displayed:
+                        log(f"allow_clicked: {text}")
+                        el.click()
+                        time.sleep(3)
+                        allowed = True
+                        break
+                except Exception:
+                    pass
+            if allowed:
+                break
             try:
-                el = tab.ele(f"tag:button@@text()={text}", timeout=5)
-                if el and el.states.is_displayed:
-                    log(f"allow_clicked: {text}")
-                    el.click()
+                clicked = tab.run_js("""
+const labels = ['allow', 'permitir', 'autorizar'];
+const btn = Array.from(document.querySelectorAll('button,[role=button],a')).find(b => {
+  const t = (b.textContent||'').trim().toLowerCase();
+  return labels.some(l => t === l || t.startsWith(l + ' '));
+});
+if (btn) { btn.click(); return true; }
+return false;
+""")
+                if clicked:
+                    log("allow_clicked: js")
                     time.sleep(3)
+                    allowed = True
                     break
             except Exception:
                 pass
-        time.sleep(2)
+            time.sleep(1)
 
+        if not allowed:
+            fail("allow", "Allow button not found — device grant not authorized")
+
+        time.sleep(2)
         log("__STEP__ done")
         entry = creds_store.save(email_addr, name, password, inbox.get("provider", ""))
         log(f"__CREDS__ {json.dumps(entry)}")
