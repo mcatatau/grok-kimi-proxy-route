@@ -117,6 +117,11 @@ def run_signup(
     co.set_argument("--disable-dev-shm-usage")
     co.set_argument("--disable-software-rasterizer")
     co.set_argument("--allow_root")
+    # Suppress "Save password?" bubble / password manager UI
+    co.set_argument("--disable-features=PasswordManagerOnboarding,PasswordLeakDetection")
+    co.set_pref("credentials_enable_service", False)
+    co.set_pref("profile.password_manager_enabled", False)
+    co.set_pref("profile.password_manager_leak_detection", False)
     co.add_extension(ext_path)
     co.set_timeouts(base=10)
 
