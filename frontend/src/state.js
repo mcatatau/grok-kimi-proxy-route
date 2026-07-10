@@ -1,0 +1,27 @@
+/** Shared app state (mutable singleton). */
+export const state = {
+  batchCreating: false,
+  settings: {},
+  accounts: [],
+  models: [],
+  usage: {},
+  activeRequest: null,
+  proxyBase: "",
+  dataDir: "",
+  messages: [],
+  streaming: false,
+  lastResponseId: null,
+  device: null,
+  shellBuilt: false,
+  sessionCost: 0,
+  sessionLat: null,
+  picks: {
+    effort: "high",
+    api: "chat",
+    model: "grok-4.5",
+    cEffort: "high",
+    cApi: "chat",
+    cModel: "grok-4.5",
+  },
+  menus: {},
+};

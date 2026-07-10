@@ -198,11 +198,13 @@ button {
 
 .account .meta-line {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 6px;
+  gap: 4px;
   margin-top: 2px;
   font-size: 10.5px;
   color: var(--text-3);
+  overflow: hidden;
 }
 
 .badge {
@@ -230,6 +232,11 @@ button {
 .badge-warn {
   color: rgba(251, 191, 36, 0.95);
   background: rgba(251, 191, 36, 0.1);
+}
+
+.badge-danger {
+  color: rgba(252, 165, 165, 0.98);
+  background: rgba(248, 113, 113, 0.14);
 }
 
 .account-usage {
@@ -1895,4 +1902,350 @@ select option {
   .charts {
     grid-template-columns: 1fr;
   }
+}
+
+
+/* ——— Form sheets (SSO / batch / device) ——— */
+.sheet-form {
+  width: min(440px, 100%);
+}
+
+.sheet-form .field-label {
+  display: block;
+  font-size: 11px;
+  color: var(--text-3);
+  margin: 0 0 6px;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+}
+
+.sheet-input {
+  width: 100%;
+  box-sizing: border-box;
+  border: none;
+  outline: none;
+  border-radius: 12px;
+  padding: 11px 12px;
+  font-size: 13px;
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.04);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+  margin-bottom: 12px;
+}
+
+.sheet-input:focus {
+  box-shadow: inset 0 0 0 1px rgba(125, 211, 252, 0.35);
+}
+
+.sheet-input-sm {
+  width: 100px;
+}
+
+.sheet-textarea {
+  min-height: 110px;
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.sheet-sub {
+  font-size: 12px !important;
+  color: var(--text-3) !important;
+  margin-top: -8px !important;
+}
+
+.sheet-err {
+  margin-top: 10px;
+  font-size: 12.5px;
+  color: #fecaca;
+}
+
+.sheet-progress {
+  margin-top: 12px;
+  font-size: 12.5px;
+  color: var(--text-2);
+  max-height: 220px;
+  overflow: auto;
+  line-height: 1.45;
+}
+
+.sheet-progress .muted,
+.muted {
+  color: var(--text-3);
+  font-size: 12px;
+}
+
+.sheet-actions .btn {
+  min-width: 0;
+}
+
+/* unify quiet buttons with bordered pill */
+.rail-actions .btn-quiet {
+  color: var(--text-2);
+  background: rgba(255, 255, 255, 0.04);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+}
+
+.rail-actions .btn-quiet:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.07);
+}
+
+.rail-actions .btn-solid {
+  /* same height/radius as quiet */
+}
+
+.accounts-active-only {
+  max-height: none;
+  overflow: visible;
+}
+
+.account-focus .account-actions {
+  margin-top: 10px;
+}
+
+.account-focus .account-actions button.primary {
+  flex: 1;
+  height: 30px;
+  border-radius: 999px;
+  color: rgba(125, 211, 252, 0.95);
+  background: rgba(125, 211, 252, 0.08);
+  box-shadow: inset 0 0 0 1px rgba(125, 211, 252, 0.2);
+}
+
+/* ——— Accounts manager (stats-like) ——— */
+.accounts-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(14px);
+  -webkit-backdrop-filter: blur(14px);
+  animation: fadeIn 0.18s ease;
+}
+
+.accounts-panel {
+  width: min(760px, 100%);
+}
+
+.acc-mgr-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+
+.acc-mgr-toolbar .btn {
+  height: 34px;
+}
+
+.acc-mgr-toolbar .btn-quiet {
+  color: var(--text-2);
+  background: rgba(255, 255, 255, 0.04);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
+}
+
+.acc-mgr-toolbar .btn-quiet:hover {
+  color: var(--text);
+  background: rgba(255, 255, 255, 0.07);
+}
+
+.acc-mgr-kpis {
+  margin-bottom: 14px;
+}
+
+.acc-mgr-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: min(48vh, 420px);
+  overflow: auto;
+  padding-right: 2px;
+}
+
+.acc-mgr-empty {
+  padding: 28px 16px;
+  text-align: center;
+  color: var(--text-3);
+  font-size: 13px;
+  border-radius: 14px;
+  box-shadow: inset 0 0 0 1px dashed rgba(255, 255, 255, 0.08);
+}
+
+.acc-mgr-row {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px;
+  border-radius: 14px;
+  background: rgba(255, 255, 255, 0.025);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.05);
+}
+
+.acc-mgr-row.is-active {
+  background: rgba(125, 211, 252, 0.06);
+  box-shadow: inset 0 0 0 1px rgba(125, 211, 252, 0.22);
+}
+
+.acc-mgr-main {
+  display: grid;
+  grid-template-columns: 34px 1fr;
+  gap: 10px;
+  min-width: 0;
+  flex: 1;
+}
+
+.acc-mgr-text {
+  min-width: 0;
+}
+
+.acc-mgr-text strong {
+  display: block;
+  font-size: 13px;
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.acc-mgr-usage {
+  display: flex;
+  gap: 12px;
+  margin-top: 6px;
+  font-size: 11px;
+  color: var(--text-3);
+  font-variant-numeric: tabular-nums;
+}
+
+.acc-mgr-usage b {
+  color: rgba(255, 255, 255, 0.55);
+  font-weight: 500;
+}
+
+.acc-mgr-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  justify-content: flex-end;
+  flex-shrink: 0;
+}
+
+.acc-mgr-actions .icon-btn {
+  height: 28px;
+  padding: 0 10px;
+  font-size: 11px;
+}
+
+.acc-mgr-actions .icon-btn.danger:hover {
+  color: #fecaca;
+  background: rgba(248, 113, 113, 0.12);
+}
+
+.acc-mgr-actions .icon-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.acc-mgr-list::-webkit-scrollbar {
+  width: 8px;
+}
+.acc-mgr-list::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 999px;
+}
+
+@media (max-width: 640px) {
+  .acc-mgr-row {
+    flex-direction: column;
+  }
+  .acc-mgr-actions {
+    width: 100%;
+    justify-content: stretch;
+  }
+  .acc-mgr-actions .icon-btn {
+    flex: 1;
+  }
+}
+
+.acc-mgr-cooldown {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 6px 8px;
+  border-radius: 10px;
+  font-size: 12px;
+  color: rgba(253, 224, 71, 0.95);
+  font-variant-numeric: tabular-nums;
+  background: rgba(251, 191, 36, 0.08);
+  box-shadow: inset 0 0 0 1px rgba(251, 191, 36, 0.18);
+}
+.acc-mgr-cooldown .acc-cool-val,
+.acc-mgr-cooldown strong.acc-cool-val {
+  font-size: 14px;
+  font-weight: 650;
+  letter-spacing: 0.02em;
+  color: #fde047;
+  font-variant-numeric: tabular-nums;
+}
+
+.acc-mgr-denied {
+  margin-top: 6px;
+  font-size: 11px;
+  line-height: 1.35;
+  color: rgba(252, 165, 165, 0.9);
+  max-width: 100%;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.acc-mgr-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0 0 14px;
+}
+.acc-filter {
+  height: 30px;
+  padding: 0 10px;
+  border-radius: 999px;
+  font-size: 11.5px;
+  color: var(--text-3);
+  background: rgba(255, 255, 255, 0.03);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  transition: 0.12s ease;
+}
+.acc-filter b {
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  color: rgba(255, 255, 255, 0.55);
+}
+.acc-filter:hover {
+  color: var(--text-2);
+  background: rgba(255, 255, 255, 0.06);
+}
+.acc-filter.on {
+  color: rgba(224, 242, 254, 0.95);
+  background: rgba(125, 211, 252, 0.1);
+  box-shadow: inset 0 0 0 1px rgba(125, 211, 252, 0.28);
+}
+.acc-filter.on b {
+  color: rgba(125, 211, 252, 0.95);
+}
+.accounts-count {
+  min-width: 1.5em;
+  text-align: right;
+  font-weight: 600;
+  color: rgba(125, 211, 252, 0.9);
 }

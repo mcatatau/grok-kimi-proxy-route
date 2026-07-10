@@ -37,6 +37,12 @@ type Account struct {
 	Scope        string    `json:"scope,omitempty"`
 	CreatedAt    time.Time `json:"created_at"`
 	UpdatedAt    time.Time `json:"updated_at"`
+	Exhausted    bool      `json:"exhausted,omitempty"`
+	ExhaustedAt  time.Time `json:"exhausted_at,omitempty"`
+	// ChatDenied: upstream 403 "Access to the chat endpoint is denied" / permissions
+	ChatDenied       bool      `json:"chat_denied,omitempty"`
+	ChatDeniedAt     time.Time `json:"chat_denied_at,omitempty"`
+	ChatDeniedReason string    `json:"chat_denied_reason,omitempty"`
 }
 
 func (a *Account) Expired() bool {
@@ -53,6 +59,49 @@ func (a *Account) ExpiresSoon(skew time.Duration) bool {
 	return time.Now().UTC().After(a.ExpiresAt.Add(-skew))
 }
 
+func (a *Account) IsExhausted() bool {
+	if !a.Exhausted {
+		return false
+	}
+	if a.ExhaustedAt.IsZero() {
+		return true
+	}
+	return time.Since(a.ExhaustedAt) < 24*time.Hour
+}
+
+func (a *Account) ExhaustedStatus() string {
+	if !a.Exhausted {
+		return ""
+	}
+	if a.ExhaustedAt.IsZero() {
+		return "exausta"
+	}
+	remaining := 24*time.Hour - time.Since(a.ExhaustedAt)
+	if remaining <= 0 {
+		return "recuperada"
+	}
+	return "exausta"
+}
+
+// ExhaustedRemaining returns time left in the 24h rate-limit window, or 0.
+func (a *Account) ExhaustedRemaining() time.Duration {
+	if !a.Exhausted {
+		return 0
+	}
+	if a.ExhaustedAt.IsZero() {
+		return 24 * time.Hour // unknown start → full window as upper bound
+	}
+	rem := 24*time.Hour - time.Since(a.ExhaustedAt)
+	if rem < 0 {
+		return 0
+	}
+	return rem
+}
+
+func (a *Account) IsChatDenied() bool {
+	return a != nil && a.ChatDenied
+}
+
 type Settings struct {
 	ActiveAccountID string `json:"active_account_id"`
 	DefaultModel    string `json:"default_model"`
@@ -65,6 +114,19 @@ type Settings struct {
 	ProxyAPIKey     string `json:"proxy_api_key,omitempty"`
 	StoreResponses  bool   `json:"store_responses"`
 	ThemeAccent     string `json:"theme_accent,omitempty"`
+
+	// Auto-register (device OAuth + Python bot)
+	// No pool size cap — only batch/loop concurrency.
+	AutoRegisterEnabled   bool `json:"auto_register_enabled"`
+	// Target minimum non-exhausted accounts for background loop (keep-alive).
+	AutoRegisterMinActive int `json:"auto_register_min_active,omitempty"`
+	// Max accounts to create in one batch/loop wave (simultaneous creation cap), NOT pool size.
+	AutoRegisterMaxActive int      `json:"auto_register_max_active,omitempty"`
+	PythonPath            string   `json:"python_path,omitempty"`
+	BotDir                string   `json:"bot_dir,omitempty"`
+	EmailProviders        []string `json:"email_providers,omitempty"`
+	DuckMailURL           string   `json:"duckmail_url,omitempty"`
+	DuckMailKey           string   `json:"duckmail_key,omitempty"`
 }
 
 type UsageTotals struct {
@@ -182,14 +244,17 @@ func Open(root string) (*Store, error) {
 
 func defaultSettings() Settings {
 	return Settings{
-		DefaultModel:    DefaultModel,
-		ReasoningEffort: DefaultEffort,
-		APIMode:         "responses",
-		UpstreamBase:    DefaultUpstream,
-		ClientVersion:   DefaultClientVersion,
-		ProxyListen:     "127.0.0.1:8787",
-		ProxyEnabled:    true,
-		StoreResponses:  true,
+		DefaultModel:          DefaultModel,
+		ReasoningEffort:       DefaultEffort,
+		APIMode:               "responses",
+		UpstreamBase:          DefaultUpstream,
+		ClientVersion:         DefaultClientVersion,
+		ProxyListen:           "127.0.0.1:8787",
+		ProxyEnabled:          true,
+		StoreResponses:        true,
+		AutoRegisterEnabled:   false,
+		AutoRegisterMinActive: 2,
+		AutoRegisterMaxActive: 5,
 	}
 }
 
@@ -302,6 +367,28 @@ func mergeSettings(base, over Settings) Settings {
 	}
 	if over.ThemeAccent != "" {
 		base.ThemeAccent = over.ThemeAccent
+	}
+	base.AutoRegisterEnabled = over.AutoRegisterEnabled
+	if over.AutoRegisterMinActive > 0 {
+		base.AutoRegisterMinActive = over.AutoRegisterMinActive
+	}
+	if over.AutoRegisterMaxActive > 0 {
+		base.AutoRegisterMaxActive = over.AutoRegisterMaxActive
+	}
+	if over.PythonPath != "" {
+		base.PythonPath = over.PythonPath
+	}
+	if over.BotDir != "" {
+		base.BotDir = over.BotDir
+	}
+	if len(over.EmailProviders) > 0 {
+		base.EmailProviders = append([]string{}, over.EmailProviders...)
+	}
+	if over.DuckMailURL != "" {
+		base.DuckMailURL = over.DuckMailURL
+	}
+	if over.DuckMailKey != "" {
+		base.DuckMailKey = over.DuckMailKey
 	}
 	return base
 }
@@ -464,14 +551,39 @@ func (s *Store) PublicAccounts() []map[string]any {
 	out := make([]map[string]any, 0, len(s.accounts))
 	for _, a := range s.accounts {
 		u := s.usage[a.ID]
+		tokenExpired := a.Expired()
+		hasRefresh := a.RefreshToken != ""
+		// needs_login: access dead AND cannot refresh (SSO-style / no RT)
+		needsLogin := tokenExpired && !hasRefresh
+		exh := a.IsExhausted()
+		remSec := int64(0)
+		until := ""
+		if exh {
+			rem := a.ExhaustedRemaining()
+			remSec = int64(rem.Seconds())
+			if a.ExhaustedAt.IsZero() {
+				until = time.Now().UTC().Add(24 * time.Hour).Format(time.RFC3339)
+			} else {
+				until = a.ExhaustedAt.Add(24 * time.Hour).UTC().Format(time.RFC3339)
+			}
+		}
 		out = append(out, map[string]any{
 			"id":         a.ID,
 			"label":      a.Label,
 			"email":      a.Email,
 			"team_id":    a.TeamID,
 			"expires_at": a.ExpiresAt,
-			"expired":    a.Expired(),
+			"expired":    tokenExpired, // access token clock (may still refresh)
+			"has_refresh": hasRefresh,
+			"needs_login": needsLogin,
 			"active":     a.ID == s.settings.ActiveAccountID,
+			"exhausted":  exh,
+			"exhausted_status": a.ExhaustedStatus(),
+			"exhausted_at": a.ExhaustedAt,
+			"exhausted_remaining_sec": remSec,
+			"exhausted_until": until,
+			"chat_denied": a.IsChatDenied(),
+			"chat_denied_reason": a.ChatDeniedReason,
 			"usage": map[string]any{
 				"prompt_tokens":     u.PromptTokens,
 				"completion_tokens": u.CompletionTokens,
@@ -580,6 +692,74 @@ func (s *Store) SetActiveAccount(id string) error {
 	}
 	s.settings.ActiveAccountID = id
 	return s.saveSettingsLocked()
+}
+
+func (s *Store) MarkAccountExhausted(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	a, ok := s.accounts[id]
+	if !ok {
+		return fmt.Errorf("account not found: %s", id)
+	}
+	a.Exhausted = true
+	a.ExhaustedAt = time.Now().UTC()
+	a.UpdatedAt = time.Now().UTC()
+	s.accounts[id] = a
+	return s.saveAccountLocked(a)
+}
+
+func (s *Store) MarkAccountChatDenied(id, reason string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	a, ok := s.accounts[id]
+	if !ok {
+		return fmt.Errorf("account not found: %s", id)
+	}
+	a.ChatDenied = true
+	a.ChatDeniedAt = time.Now().UTC()
+	if reason != "" {
+		if len(reason) > 400 {
+			reason = reason[:400]
+		}
+		a.ChatDeniedReason = reason
+	} else {
+		a.ChatDeniedReason = "Access to the chat endpoint is denied"
+	}
+	a.UpdatedAt = time.Now().UTC()
+	s.accounts[id] = a
+	return s.saveAccountLocked(a)
+}
+
+// ResetAccountExhausted clears rate-limit exhaustion AND chat-denied flags.
+func (s *Store) ResetAccountExhausted(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	a, ok := s.accounts[id]
+	if !ok {
+		return fmt.Errorf("account not found: %s", id)
+	}
+	a.Exhausted = false
+	a.ExhaustedAt = time.Time{}
+	a.ChatDenied = false
+	a.ChatDeniedAt = time.Time{}
+	a.ChatDeniedReason = ""
+	a.UpdatedAt = time.Now().UTC()
+	s.accounts[id] = a
+	return s.saveAccountLocked(a)
+}
+
+func (s *Store) RecoverExhaustedAccounts() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for id, a := range s.accounts {
+		if a.Exhausted && !a.IsExhausted() {
+			a.Exhausted = false
+			a.ExhaustedAt = time.Time{}
+			a.UpdatedAt = time.Now().UTC()
+			s.accounts[id] = a
+			_ = s.saveAccountLocked(a)
+		}
+	}
 }
 
 func (s *Store) RecordRequest(sample RequestSample) error {

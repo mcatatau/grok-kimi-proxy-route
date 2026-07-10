@@ -40,3 +40,10 @@ venv/
 *.log
 .DS_Store
 desktop.ini
+
+# Local tooling / planning (not shipped)
+graphify-out/
+.mimocode/
+.planning/
+docs/
+plan/

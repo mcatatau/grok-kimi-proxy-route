@@ -6,6 +6,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
@@ -24,7 +25,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "invalid api key")
 		return
 	}
-	token, _, settings, err := s.ensure(r.Context())
+	_, _, settings, err := s.ensure(r.Context())
 	if err != nil {
 		writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", err.Error())
 		return
@@ -50,7 +51,6 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	if v := asString(req["reasoning_effort"]); v != "" {
 		effort = v
 	}
-	// Anthropic thinking / effort aliases
 	if th, ok := req["thinking"].(map[string]any); ok {
 		if t := asString(th["type"]); t == "enabled" {
 			if effort == "" {
@@ -85,49 +85,103 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	raw, _ := json.Marshal(oaBody)
 
 	url := strings.TrimRight(settings.UpstreamBase, "/") + "/chat/completions"
-	upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, url, bytes.NewReader(raw))
-	if err != nil {
-		writeAnthropicError(w, 500, "api_error", err.Error())
-		return
-	}
-	upReq.Header.Set("Authorization", "Bearer "+token)
-	upReq.Header.Set("Content-Type", "application/json")
-	upReq.Header.Set("x-grok-client-version", settings.ClientVersion)
-	if stream {
-		upReq.Header.Set("Accept", "text/event-stream")
-	} else {
-		upReq.Header.Set("Accept", "application/json")
-	}
 
-	resp, err := http.DefaultClient.Do(upReq)
-	if err != nil {
-		writeAnthropicError(w, http.StatusBadGateway, "api_error", err.Error())
-		return
-	}
-	defer resp.Body.Close()
+	tried := map[string]bool{}
+	maxTries := 5
+	for attempt := 0; attempt < maxTries; attempt++ {
+		token2, acc2, _, err2 := s.ensure(r.Context())
+		if err2 != nil {
+			if attempt == maxTries-1 {
+				writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", err2.Error())
+				return
+			}
+			continue
+		}
+		if acc2 != nil && tried[acc2.ID] {
+			continue
+		}
 
-	if resp.StatusCode >= 400 {
-		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-		writeAnthropicError(w, resp.StatusCode, "api_error", string(b))
-		return
-	}
+		upReq2, err2 := http.NewRequestWithContext(r.Context(), http.MethodPost, url, bytes.NewReader(raw))
+		if err2 != nil {
+			if attempt == maxTries-1 {
+				writeAnthropicError(w, 500, "api_error", err2.Error())
+				return
+			}
+			continue
+		}
+		upReq2.Header.Set("Authorization", "Bearer "+token2)
+		upReq2.Header.Set("Content-Type", "application/json")
+		upReq2.Header.Set("x-grok-client-version", settings.ClientVersion)
+		if stream {
+			upReq2.Header.Set("Accept", "text/event-stream")
+		} else {
+			upReq2.Header.Set("Accept", "application/json")
+		}
 
-	if !stream {
-		b, _ := io.ReadAll(resp.Body)
-		out, err := openAIChatToAnthropicMessage(b, model)
-		if err != nil {
-			writeAnthropicError(w, 500, "api_error", err.Error())
+		resp, err2 := http.DefaultClient.Do(upReq2)
+		if err2 != nil {
+			if attempt == maxTries-1 {
+				writeAnthropicError(w, http.StatusBadGateway, "api_error", err2.Error())
+				return
+			}
+			continue
+		}
+
+		if resp.StatusCode >= 400 {
+			b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+			resp.Body.Close()
+			errInfo := diagnoseUpstreamError(resp.StatusCode, b, "/chat/completions", settings.ClientVersion)
+			log.Printf("proxyhttp UPSTREAM ERROR [anthropic]: status %d | classification=%s | attempt=%d/%d | account=%s",
+				resp.StatusCode, errInfo.Classification, attempt+1, maxTries, labelOr(acc2))
+
+			if errInfo.Classification == "rate_limit" && acc2 != nil {
+				log.Printf("proxyhttp account exhausted [anthropic] (switching): %s (%s)", acc2.Label, acc2.Email)
+				_ = s.store.MarkAccountExhausted(acc2.ID)
+				s.notifyAccountChange()
+				tried[acc2.ID] = true
+				continue
+			}
+			if errInfo.Classification == "chat_denied" && acc2 != nil {
+				log.Printf("proxyhttp chat denied [anthropic] (switching): %s (%s)", acc2.Label, acc2.Email)
+				_ = s.store.MarkAccountChatDenied(acc2.ID, string(b))
+				s.notifyAccountChange()
+				tried[acc2.ID] = true
+				continue
+			}
+
+			w.Header().Set("X-Account-Status", errInfo.Classification)
+			writeAnthropicError(w, resp.StatusCode, "api_error", string(b))
 			return
 		}
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(out)
+		defer resp.Body.Close()
+
+		if !stream {
+			b, _ := io.ReadAll(resp.Body)
+			out, err2 := openAIChatToAnthropicMessage(b, model)
+			if err2 != nil {
+				writeAnthropicError(w, 500, "api_error", err2.Error())
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(out)
+			if acc2 != nil {
+				usage := extractUsageFromPayload(string(b), "", "/chat/completions")
+				s.recordUsage(acc2.ID, resp.StatusCode, usage, "/chat/completions", model)
+			}
+			return
+		}
+
+		usage, err2 := streamOpenAIToAnthropic(r.Context(), w, resp.Body, model)
+		if err2 != nil {
+			_ = err2
+		}
+		if acc2 != nil && (usage.promptTokens > 0 || usage.totalTokens > 0 || usage.completionTokens > 0) {
+			s.recordUsage(acc2.ID, resp.StatusCode, usage, "/chat/completions", model)
+		}
 		return
 	}
 
-	if err := streamOpenAIToAnthropic(r.Context(), w, resp.Body, model); err != nil {
-		// client likely disconnected
-		_ = err
-	}
+	writeAnthropicError(w, http.StatusTooManyRequests, "rate_limit_error", "all accounts exhausted")
 }
 
 func (s *Server) gateAnthropic(r *http.Request) bool {
@@ -353,7 +407,8 @@ func openAIChatToAnthropicMessage(raw []byte, model string) ([]byte, error) {
 	return json.Marshal(out)
 }
 
-func streamOpenAIToAnthropic(ctx context.Context, w http.ResponseWriter, body io.Reader, model string) error {
+func streamOpenAIToAnthropic(ctx context.Context, w http.ResponseWriter, body io.Reader, model string) (sseUsageCapture, error) {
+	var usage sseUsageCapture
 	setSSEHeaders(w)
 	w.WriteHeader(http.StatusOK)
 	fw := newFlushWriter(w)
@@ -385,7 +440,7 @@ func streamOpenAIToAnthropic(ctx context.Context, w http.ResponseWriter, body io
 	for sc.Scan() {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			return usage, ctx.Err()
 		default:
 		}
 		line := sc.Text()
@@ -403,6 +458,21 @@ func streamOpenAIToAnthropic(ctx context.Context, w http.ResponseWriter, body io
 		if u, ok := chunk["usage"].(map[string]any); ok {
 			inputTok = asInt(u["prompt_tokens"], inputTok)
 			outputTok = asInt(u["completion_tokens"], outputTok)
+			if pt := asInt(u["prompt_tokens"], 0); pt > 0 {
+				usage.promptTokens = int64(pt)
+			}
+			if ct := asInt(u["completion_tokens"], 0); ct > 0 {
+				usage.completionTokens = int64(ct)
+			}
+			if tt := asInt(u["total_tokens"], 0); tt > 0 {
+				usage.totalTokens = int64(tt)
+			}
+			if rt := asInt(u["reasoning_tokens"], 0); rt > 0 {
+				usage.reasoningTokens = int64(rt)
+			}
+			if usage.totalTokens == 0 && (usage.promptTokens > 0 || usage.completionTokens > 0) {
+				usage.totalTokens = usage.promptTokens + usage.completionTokens + usage.reasoningTokens
+			}
 		}
 		choices, _ := chunk["choices"].([]any)
 		if len(choices) == 0 {
@@ -520,7 +590,16 @@ func streamOpenAIToAnthropic(ctx context.Context, w http.ResponseWriter, body io
 	_, _ = io.WriteString(fw, "\n")
 	_ = inputTok
 	_ = time.Now()
-	return sc.Err()
+	if usage.promptTokens == 0 && inputTok > 0 {
+		usage.promptTokens = int64(inputTok)
+	}
+	if usage.completionTokens == 0 && outputTok > 0 {
+		usage.completionTokens = int64(outputTok)
+	}
+	if usage.totalTokens == 0 {
+		usage.totalTokens = usage.promptTokens + usage.completionTokens + usage.reasoningTokens
+	}
+	return usage, sc.Err()
 }
 
 func asInt(v any, def int) int {

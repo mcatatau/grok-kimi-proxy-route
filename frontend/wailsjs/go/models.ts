@@ -49,6 +49,33 @@ export namespace main {
 
 }
 
+export namespace register {
+	
+	export class Result {
+	    status: string;
+	    reason?: string;
+	    step?: string;
+	    screenshot?: string;
+	    creds?: Record<string, string>;
+	    access_token?: string;
+	
+	    static createFrom(source: any = {}) {
+	        return new Result(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.status = source["status"];
+	        this.reason = source["reason"];
+	        this.step = source["step"];
+	        this.screenshot = source["screenshot"];
+	        this.creds = source["creds"];
+	        this.access_token = source["access_token"];
+	    }
+	}
+
+}
+
 export namespace skills {
 	
 	export class Skill {
@@ -90,6 +117,14 @@ export namespace store {
 	    proxy_api_key?: string;
 	    store_responses: boolean;
 	    theme_accent?: string;
+	    auto_register_enabled: boolean;
+	    auto_register_min_active?: number;
+	    auto_register_max_active?: number;
+	    python_path?: string;
+	    bot_dir?: string;
+	    email_providers?: string[];
+	    duckmail_url?: string;
+	    duckmail_key?: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new Settings(source);
@@ -108,6 +143,14 @@ export namespace store {
 	        this.proxy_api_key = source["proxy_api_key"];
 	        this.store_responses = source["store_responses"];
 	        this.theme_accent = source["theme_accent"];
+	        this.auto_register_enabled = source["auto_register_enabled"];
+	        this.auto_register_min_active = source["auto_register_min_active"];
+	        this.auto_register_max_active = source["auto_register_max_active"];
+	        this.python_path = source["python_path"];
+	        this.bot_dir = source["bot_dir"];
+	        this.email_providers = source["email_providers"];
+	        this.duckmail_url = source["duckmail_url"];
+	        this.duckmail_key = source["duckmail_key"];
 	    }
 	}
 

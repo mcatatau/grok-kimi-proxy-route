@@ -10,6 +10,18 @@ export function CancelDeviceLogin() {
   return window['go']['main']['App']['CancelDeviceLogin']();
 }
 
+export function CreateAccount(arg1, arg2) {
+  return window['go']['main']['App']['CreateAccount'](arg1, arg2);
+}
+
+export function CreateAccountFromDevice() {
+  return window['go']['main']['App']['CreateAccountFromDevice']();
+}
+
+export function CreateAccounts(arg1) {
+  return window['go']['main']['App']['CreateAccounts'](arg1);
+}
+
 export function CreateSkill(arg1, arg2, arg3) {
   return window['go']['main']['App']['CreateSkill'](arg1, arg2, arg3);
 }
@@ -50,6 +62,14 @@ export function GetUsage() {
   return window['go']['main']['App']['GetUsage']();
 }
 
+export function ImportSSO(arg1) {
+  return window['go']['main']['App']['ImportSSO'](arg1);
+}
+
+export function ImportSSOFromFile(arg1) {
+  return window['go']['main']['App']['ImportSSOFromFile'](arg1);
+}
+
 export function ListAccounts() {
   return window['go']['main']['App']['ListAccounts']();
 }
@@ -70,6 +90,10 @@ export function OpenExternal(arg1) {
   return window['go']['main']['App']['OpenExternal'](arg1);
 }
 
+export function RecoverAccounts() {
+  return window['go']['main']['App']['RecoverAccounts']();
+}
+
 export function RemoveAccount(arg1) {
   return window['go']['main']['App']['RemoveAccount'](arg1);
 }
@@ -78,12 +102,20 @@ export function RenameAccount(arg1, arg2) {
   return window['go']['main']['App']['RenameAccount'](arg1, arg2);
 }
 
+export function ResetAccount(arg1) {
+  return window['go']['main']['App']['ResetAccount'](arg1);
+}
+
 export function SendChat(arg1) {
   return window['go']['main']['App']['SendChat'](arg1);
 }
 
 export function SetActiveAccount(arg1) {
   return window['go']['main']['App']['SetActiveAccount'](arg1);
+}
+
+export function StartDevice() {
+  return window['go']['main']['App']['StartDevice']();
 }
 
 export function StartDeviceLogin() {
