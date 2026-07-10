@@ -10,6 +10,10 @@ export function CancelDeviceLogin() {
   return window['go']['main']['App']['CancelDeviceLogin']();
 }
 
+export function CancelRegisterBatch() {
+  return window['go']['main']['App']['CancelRegisterBatch']();
+}
+
 export function CreateAccount(arg1, arg2) {
   return window['go']['main']['App']['CreateAccount'](arg1, arg2);
 }

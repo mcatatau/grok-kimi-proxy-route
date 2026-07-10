@@ -10,6 +10,8 @@ export function CancelChat():Promise<void>;
 
 export function CancelDeviceLogin():Promise<void>;
 
+export function CancelRegisterBatch():Promise<void>;
+
 export function CreateAccount(arg1:string,arg2:string):Promise<register.Result>;
 
 export function CreateAccountFromDevice():Promise<register.Result>;
