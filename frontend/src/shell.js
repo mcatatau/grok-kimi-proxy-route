@@ -365,12 +365,7 @@ export function paintChrome() {
         <span><b>${fmtUSD(u.cost_usd || 0)}</b></span>
         <span><b>${fmt(u.requests || 0)}</b> req</span>
       </div>
-      <div class="account-actions">
-        <button type="button" class="primary" data-act="manage">Gerenciar contas</button>
-      </div>
     `;
-    card.querySelector("[data-act=manage]").onclick = () =>
-      openAccountsManager({ refreshBootstrap, paintChrome });
     list.appendChild(card);
   }
 
