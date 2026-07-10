@@ -101,6 +101,13 @@ def run_signup(
     co.auto_port()
 
     chrome_candidates = [
+        # Windows
+        os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
+        os.path.expandvars(r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"),
+        os.path.expandvars(r"%LocalAppData%\Google\Chrome\Application\chrome.exe"),
+        os.path.expandvars(r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe"),
+        os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe"),
+        # Linux
         "/usr/bin/google-chrome",
         "/usr/bin/google-chrome-stable",
         "/usr/bin/chromium",
@@ -108,9 +115,13 @@ def run_signup(
         "/snap/bin/chromium",
     ]
     for p in chrome_candidates:
-        if os.path.exists(p):
+        if p and os.path.exists(p):
             co.set_browser_path(p)
             break
+    else:
+        # Let DrissionPage auto-detect; fail later with a clear message if missing
+        log("chrome: no known path — relying on DrissionPage auto-detect")
+
 
     co.set_argument("--no-sandbox")
     co.set_argument("--disable-gpu")
@@ -131,17 +142,19 @@ def run_signup(
             from pyvirtualdisplay import Display
             _vd = Display(visible=0, size=(1920, 1080))
             _vd.start()
-        except ImportError:
+        except Exception:
+            # Windows has no Xvfb; use Chrome headless
             co.set_argument("--headless=new")
     else:
-        if not os.environ.get("DISPLAY"):
+        if not os.environ.get("DISPLAY") and os.name != "nt":
             log("__STEP__ xvfb")
             try:
                 from pyvirtualdisplay import Display
                 _vd = Display(visible=0, size=(1920, 1080))
                 _vd.start()
-            except ImportError:
+            except Exception:
                 pass
+
 
     log("__STEP__ launching")
     import tempfile
@@ -545,4 +558,10 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    # Ensure uncaught import/runtime errors still emit __RESULT__ for the Go runner.
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception as e:
+        fail("startup", f"{type(e).__name__}: {e}")

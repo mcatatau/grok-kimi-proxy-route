@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
+	goruntime "runtime"
 	"strings"
 	"sync"
 	"time"
@@ -1575,26 +1577,61 @@ func resolveRegisterPaths(exeDir string, s store.Settings) (pythonPath, botDir s
 	pythonPath = strings.TrimSpace(s.PythonPath)
 	botDir = strings.TrimSpace(s.BotDir)
 	if pythonPath == "" {
-		// monorepo / wails dev layout
-		cand := filepath.Join(exeDir, "..", "..", ".venv", "bin", "python3")
-		if st, err := os.Stat(cand); err == nil && !st.IsDir() {
-			pythonPath = cand
+		// monorepo / wails dev layout (Linux + Windows)
+		var pyCands []string
+		if goruntime.GOOS == "windows" {
+			pyCands = []string{
+				filepath.Join(exeDir, "..", "..", ".venv", "Scripts", "python.exe"),
+				filepath.Join(exeDir, ".venv", "Scripts", "python.exe"),
+				filepath.Join(exeDir, "python", "python.exe"),
+			}
 		} else {
-			pythonPath = "python3"
+			pyCands = []string{
+				filepath.Join(exeDir, "..", "..", ".venv", "bin", "python3"),
+				filepath.Join(exeDir, ".venv", "bin", "python3"),
+			}
+		}
+		for _, cand := range pyCands {
+			if st, err := os.Stat(cand); err == nil && !st.IsDir() {
+				pythonPath = cand
+				break
+			}
+		}
+		if pythonPath == "" {
+			if goruntime.GOOS == "windows" {
+				// Prefer python.exe on PATH; python3 is often missing on Windows
+				if p, err := exec.LookPath("python"); err == nil {
+					pythonPath = p
+				} else if p, err := exec.LookPath("python3"); err == nil {
+					pythonPath = p
+				} else if p, err := exec.LookPath("py"); err == nil {
+					pythonPath = p
+				} else {
+					pythonPath = "python"
+				}
+			} else {
+				if p, err := exec.LookPath("python3"); err == nil {
+					pythonPath = p
+				} else {
+					pythonPath = "python3"
+				}
+			}
 		}
 	}
 	if botDir == "" {
-		cand := filepath.Join(exeDir, "..", "..", "grok-signup-bot")
-		if st, err := os.Stat(cand); err == nil && st.IsDir() {
-			botDir = cand
-		} else {
-			// next to executable
-			cand2 := filepath.Join(exeDir, "grok-signup-bot")
-			if st, err := os.Stat(cand2); err == nil && st.IsDir() {
-				botDir = cand2
-			} else {
-				botDir = "grok-signup-bot"
+		cands := []string{
+			filepath.Join(exeDir, "..", "..", "grok-signup-bot"),
+			filepath.Join(exeDir, "grok-signup-bot"),
+			filepath.Join(exeDir, "..", "grok-signup-bot"),
+		}
+		for _, cand := range cands {
+			if st, err := os.Stat(cand); err == nil && st.IsDir() {
+				botDir = cand
+				break
 			}
+		}
+		if botDir == "" {
+			botDir = "grok-signup-bot"
 		}
 	}
 	return pythonPath, botDir
