@@ -1,6 +1,7 @@
 package proxyhttp
 
 import (
+	"encoding/json"
 	"strings"
 )
 
@@ -295,6 +296,22 @@ func sanitizeChatTools(raw any) []any {
 		})
 	}
 	return out
+}
+
+func asInt64(v any) int64 {
+	switch n := v.(type) {
+	case float64:
+		return int64(n)
+	case int:
+		return int64(n)
+	case int64:
+		return n
+	case json.Number:
+		i, _ := n.Int64()
+		return i
+	default:
+		return 0
+	}
 }
 
 func asString(v any) string {

@@ -226,19 +226,3 @@ func parseUsageMap(u map[string]any) (prompt, completion, reasoning, cached, tot
 	ok = prompt > 0 || completion > 0 || reasoning > 0 || total > 0
 	return
 }
-
-func asInt64(v any) int64 {
-	switch t := v.(type) {
-	case float64:
-		return int64(t)
-	case int64:
-		return t
-	case int:
-		return int64(t)
-	case json.Number:
-		i, _ := t.Int64()
-		return i
-	default:
-		return 0
-	}
-}
