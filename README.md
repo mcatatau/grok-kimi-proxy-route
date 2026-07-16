@@ -221,10 +221,43 @@ Switch **Global → Provider** in the app, then use matching models:
 | `/v1/responses` | ✓ | ✗ | Grok only |
 | `/v1/chat/completions` | ✗ | ✓ | Kimi only (OpenAI tools native) |
 | `/v1/messages` | ✓* | — | Anthropic-shaped (Grok path) |
-| `/v1/search` | ✓ | — | Native xAI search helper |
+| `/v1/search` | ✓ | — | **Native xAI search** (`web_search` + `x_search`) |
 | `POST /v1/sso` | ✓ | — | Import Grok SSO |
 
 \*Best-effort; prefer Responses for Grok clients when possible.
+
+### xAI Search route (`/v1/search`)
+
+When the **active provider is Grok (xAI)**, the proxy exposes a dedicated search endpoint that calls **native xAI search tools** (not a third-party scraper):
+
+```text
+POST http://127.0.0.1:8787/v1/search
+POST http://127.0.0.1:8787/v1/web_search
+POST http://127.0.0.1:8787/v1/x_search
+```
+
+Under the hood the proxy runs a short **Responses** turn with only:
+
+| Tool | What it searches |
+|------|------------------|
+| `web_search` | Web (xAI native) |
+| `x_search` | X / Twitter (xAI native) |
+
+Example:
+
+```bash
+curl http://127.0.0.1:8787/v1/search \
+  -H "Authorization: Bearer grok-desktop" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "query": "latest Grok 4.5 news",
+    "mode": "web"
+  }'
+```
+
+- `mode`: `web` / `web_search` · `x` / `x_search` · omit or `both` for web + X  
+- Requires an **active Grok account** (Kimi / other providers return an error for this route)  
+- In-app chat also surfaces native search events in the research panel when the model calls those tools on `/v1/responses`
 
 On Grok rate-limit (429/402 free-usage-exhausted) the proxy may mark the account exhausted, switch account, and **retry the same request**.  
 On Kimi “Too many people are chatting…” the proxy returns **503 `kimi_server_busy`** and does **not** rotate accounts.
