@@ -1,4 +1,4 @@
-﻿name: Release
+name: Release
 
 on:
   push:
@@ -41,7 +41,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: "24"
+          node-version: "20"
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
@@ -90,7 +90,7 @@ jobs:
           Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "$bundle/grok-signup-bot/.venv","$bundle/grok-signup-bot/__pycache__"
           Get-ChildItem -Recurse "$bundle/grok-signup-bot" -Filter "__pycache__" -Directory -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force
           @"
-          Grok Proxy Plus â€” Windows portable
+          Grok Proxy Plus - Windows portable
 
           Layout:
             GrokProxyPlus.exe
@@ -101,7 +101,7 @@ jobs:
             2. Install Chrome or Edge
             3. In this folder:
                  python -m pip install -r grok-signup-bot\requirements.txt
-            4. Run GrokProxyPlus.exe â€” bot_dir resolves next to the exe
+            4. Run GrokProxyPlus.exe - bot_dir resolves next to the exe
 
           Manual device login works without Python.
           Data: %LOCALAPPDATA%\GrokDesktop\
@@ -131,7 +131,7 @@ jobs:
           rm -rf "$BUNDLE/grok-signup-bot/.venv" "$BUNDLE/grok-signup-bot/__pycache__" 2>/dev/null || true
           find "$BUNDLE/grok-signup-bot" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
           cat > "$BUNDLE/README-LINUX.txt" <<'EOF'
-          Grok Proxy Plus â€” Linux portable
+          Grok Proxy Plus - Linux portable
 
           Layout:
             GrokProxyPlus
@@ -145,7 +145,6 @@ jobs:
           Data: ~/.local/share/GrokDesktop/
           EOF
           tar -C dist -czf "dist/${{ matrix.asset_name }}.tar.gz" "$(basename "$BUNDLE")"
-          # Rename inner for clearer extract
           # Also ship bare binary
           cp "$BIN" "dist/${{ matrix.asset_name }}"
           chmod +x "dist/${{ matrix.asset_name }}"
