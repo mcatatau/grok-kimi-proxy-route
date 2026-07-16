@@ -41,7 +41,7 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: "24"
           cache: npm
           cache-dependency-path: frontend/package-lock.json
 
@@ -162,6 +162,8 @@ jobs:
     name: Publish GitHub Release
     needs: build
     runs-on: ubuntu-latest
+    # GitHub API sometimes returns 503 Unicorn during release creation — retry.
+    timeout-minutes: 30
     steps:
       - name: Download Windows asset
         uses: actions/download-artifact@v4
@@ -176,14 +178,59 @@ jobs:
           path: release-assets
 
       - name: List release assets
-        run: ls -la release-assets
+        run: ls -laR release-assets
 
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
-          name: Grok Proxy Plus ${{ github.ref_name }}
-          files: release-assets/*
-          fail_on_unmatched_files: true
+      - name: Create GitHub Release (with retry)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(release-assets/*)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "no release assets found"
+            exit 1
+          fi
+          echo "assets: ${files[*]}"
+
+          # If a partial release already exists for this tag, delete it so we can recreate cleanly.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG already exists — deleting for clean republish"
+            gh release delete "$TAG" --yes || true
+          fi
+
+          notes="## Grok Proxy Plus ${TAG}
+
+          Multi-rota estável: **Grok (xAI)** + **Kimi Work**, SQLite, proxy local OpenAI-compatible.
+
+          ### Destaques
+          - Grok: multi-conta OAuth, **\`/v1/responses\`**, pesquisa nativa xAI (\`/v1/search\`)
+          - Kimi Work: login Google no navegador → \`sk-kimi\` → **\`/v1/chat/completions\`**
+          - Persistência SQLite (\`grokdesktop.db\`) com migração automática do JSON antigo
+          - Modelo da UI não força model no proxy HTTP
+
+          ### Downloads
+          - Windows: \`.exe\` ou \`.zip\` portátil
+          - Linux: binário ou \`.tar.gz\`
+          "
+
+          attempt=1
+          max=8
+          while [ "$attempt" -le "$max" ]; do
+            echo "=== release attempt $attempt/$max ==="
+            if gh release create "$TAG" \
+              --title "Grok Proxy Plus ${TAG}" \
+              --notes "$notes" \
+              --latest \
+              "${files[@]}"; then
+              echo "release published"
+              exit 0
+            fi
+            echo "gh release create failed (attempt $attempt) — waiting..."
+            sleep $((attempt * 15))
+            attempt=$((attempt + 1))
+          done
+          echo "failed to create release after $max attempts"
+          exit 1
