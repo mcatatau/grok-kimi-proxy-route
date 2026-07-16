@@ -1,125 +1,125 @@
 # Grok Proxy Plus
 
 <p align="center">
-  <strong>Multi-route desktop proxy</strong><br/>
-  <b>Grok (xAI)</b> + <b>Kimi Work</b> · multi-account · streaming · local <code>/v1</code> · SQLite
+  <strong>Proxy desktop multi-rota</strong><br/>
+  <b>Grok (xAI)</b> + <b>Kimi Work</b> · multi-conta · streaming · API local <code>/v1</code> · SQLite
 </p>
 
 <p align="center">
-  <a href="#features">Features</a> ·
-  <a href="#providers-multi-route">Providers</a> ·
-  <a href="#quick-start">Quick start</a> ·
-  <a href="#openai-compatible-proxy">OpenAI proxy</a> ·
+  <a href="#o-que-é-isso">O que é</a> ·
+  <a href="#provedores-multi-rota">Provedores</a> ·
+  <a href="#início-rápido">Início rápido</a> ·
+  <a href="#proxy-compatível-com-openai">Proxy OpenAI</a> ·
   <a href="#kimi-work">Kimi Work</a> ·
-  <a href="#multi-account--failover">Multi-account</a> ·
-  <a href="#auto-register--sso">Auto-register / SSO</a> ·
-  <a href="#docs">Docs</a> ·
-  <a href="#build-from-source">Build</a> ·
+  <a href="#pesquisa-nativa-xai-v1search">Pesquisa xAI</a> ·
+  <a href="#multi-conta--failover">Multi-conta</a> ·
+  <a href="#auto-registro--sso">Auto-registro / SSO</a> ·
+  <a href="#documentação">Docs</a> ·
+  <a href="#compilar-do-código">Build</a> ·
   <a href="#releases">Releases</a> ·
-  <a href="#disclaimer">Disclaimer</a> ·
-  <a href="#license">License</a>
+  <a href="#aviso-legal">Aviso</a> ·
+  <a href="#licença">Licença</a>
 </p>
 
 ---
 
-## What is this?
+## O que é isso?
 
-**Grok Proxy Plus** is a **desktop app** (Wails + Go) that became a **multi-route provider hub**:
+**Grok Proxy Plus** é um **app desktop** (Wails + Go) que virou um **hub multi-provedor**:
 
-1. **Grok (xAI)** — device-code OAuth, multi-account pool, **`/v1/responses`**
-2. **Kimi Work** — Google browser login (same flow as Kimi Desktop), mints `sk-kimi`, multi-account, **`/v1/chat/completions`**
-3. One local OpenAI-compatible server (`http://127.0.0.1:8787/v1`) for Cursor / OpenCode / etc.
-4. In-app chat UI (streaming, thinking, token/cost stats)
-5. Optional Grok SSO import + auto-register bot
+1. **Grok (xAI)** — login OAuth por device-code, pool multi-conta, API **`/v1/responses`**
+2. **Kimi Work** — login Google no navegador do sistema (mesmo fluxo do Kimi Desktop), gera `sk-kimi`, multi-conta, API **`/v1/chat/completions`**
+3. Um servidor local compatível com OpenAI (`http://127.0.0.1:8787/v1`) para Cursor, OpenCode, etc.
+4. Chat na própria UI (streaming, thinking, tokens/custo)
+5. Opcional: importar SSO do Grok e bot de auto-registro
 
-> **Not affiliated with xAI or Moonshot/Kimi.** Unofficial community project. Use at your own risk. See [DISCLAIMER.md](./DISCLAIMER.md) and [LICENSE](./LICENSE).
-
----
-
-## Providers (multi-route)
-
-| Provider | Auth mode | How you add accounts | HTTP API used by proxy | Models (examples) |
-|----------|-----------|----------------------|------------------------|-------------------|
-| **Grok (xAI)** | **Auth** (session pool) | Device OAuth / SSO / auto-register | **`POST /v1/responses` only** | `grok-4.5` |
-| **Kimi Work** | **Auth** (session pool) | **Login with Google** (system browser) → mint `sk-kimi` | **`POST /v1/chat/completions` only** | `kimi-for-coding`, `k3-agent`, `k3-agent-swarm`, `k2d6-agent` |
-
-**Important routing rules (v1.3+):**
-
-- The **model selected in the desktop UI** only affects the **in-app chat**. It does **not** rewrite models for HTTP clients (OpenCode/Cursor/SDK).
-- HTTP clients send whatever `model` they want; the proxy honors it (aliases like `default` map to the provider default).
-- **Grok** rejects `/v1/chat/completions` with a clear error → use **Responses**.
-- **Kimi** rejects `/v1/responses` → use **chat/completions** (agent-gw has no native Responses).
-- Active **provider** in Global settings decides which account pool + upstream is used.
+> **Não é afiliado à xAI nem à Moonshot/Kimi.** Projeto comunitário não oficial. Use por sua conta e risco. Veja [DISCLAIMER.md](./DISCLAIMER.md) e [LICENSE](./LICENSE).
 
 ---
 
-## Features
+## Provedores (multi-rota)
 
-| Feature | Description |
-|--------|-------------|
-| **Multi-route providers** | Grok + Kimi Work in one app / one local port |
-| **No Grok CLI** | Own OAuth device login + token refresh |
-| **Kimi Work coding API** | Browser Google login → `CreateAPIKey(WORK)` → `sk-kimi` → `agent-gw.kimi.com/coding/v1` |
-| **Multi-account (Auth)** | Separate pools per provider; sidebar + “Ver contas” modal |
-| **SQLite persistence** | Accounts, settings, usage, history in `grokdesktop.db` (JSON migrated once) |
-| **Rate-limit failover** | Marks free-tier exhaustion, skips exhausted, same-request retry (Grok) |
-| **Kimi capacity errors** | “Too many people chatting…” → fail fast, **no** account rotate |
-| **Streaming + thinking** | Real-time reasoning and answer stream |
-| **Native search UI** | Grok `web_search` / `x_search` (research panel) |
-| **Token & cost stats** | Usage charts; Grok 4.5 + Kimi K3/K2.6 list prices |
-| **Local API proxy** | OpenAI chat/completions + responses (by provider) · models · Anthropic messages · SSO |
-| **SSO import** | Paste token, file, `AppData/sso-watch/*.txt`, `POST /v1/sso` |
-| **Auto-register** | Device OAuth + DrissionPage bot + temp email (Grok) |
-| **Cross-platform build** | Windows + Linux via GitHub Actions |
+| Provedor | Modo de auth | Como adicionar contas | API HTTP do proxy | Modelos (exemplos) |
+|----------|--------------|------------------------|-------------------|--------------------|
+| **Grok (xAI)** | **Auth** (pool de sessão) | OAuth device / SSO / auto-registro | **Só `POST /v1/responses`** | `grok-4.5` |
+| **Kimi Work** | **Auth** (pool de sessão) | **Login com Google** (navegador do sistema) → mint `sk-kimi` | **Só `POST /v1/chat/completions`** | `kimi-for-coding`, `k3-agent`, `k3-agent-swarm`, `k2d6-agent` |
+
+### Regras de roteamento (v1.3+)
+
+- O **modelo escolhido na UI do app** vale **somente no chat interno**. **Não** reescreve o `model` das requests HTTP (OpenCode/Cursor/SDK).
+- Clientes HTTP mandam o `model` que quiserem; o proxy respeita (aliases como `default` viram o default do provedor ativo).
+- **Grok** recusa `/v1/chat/completions` com erro claro → use **Responses**.
+- **Kimi** recusa `/v1/responses` → use **chat/completions** (o agent-gw não tem Responses nativo).
+- O **provedor ativo** em Global define qual pool de contas e qual upstream entram em jogo.
 
 ---
 
-## Quick start
+## Funcionalidades
 
-### Option A — download a release
+| Recurso | Descrição |
+|---------|-----------|
+| **Multi-rota** | Grok + Kimi Work no mesmo app / mesma porta local |
+| **Sem Grok CLI** | OAuth device próprio + refresh de token |
+| **Kimi Work (coding)** | Login Google → `CreateAPIKey(WORK)` → `sk-kimi` → `agent-gw.kimi.com/coding/v1` |
+| **Multi-conta (Auth)** | Pool separado por provedor; sidebar + modal **Ver contas** |
+| **Persistência SQLite** | Contas, settings, usage e history em `grokdesktop.db` (JSON antigo migra 1x) |
+| **Failover de cota** | Marca conta esgotada, pula e tenta de novo na mesma request (Grok) |
+| **Erro de capacidade Kimi** | “Too many people chatting…” → falha rápida, **sem** rotacionar conta |
+| **Streaming + thinking** | Raciocínio e resposta em tempo real |
+| **Pesquisa nativa xAI** | `web_search` / `x_search` (painel de pesquisa no chat) |
+| **Estatísticas** | Tokens, latência e custo estimado (Grok 4.5 + Kimi K3/K2.6) |
+| **Proxy local** | OpenAI chat/completions + responses (conforme provedor) · models · Anthropic messages · SSO |
+| **Importar SSO** | Colar token, arquivo, pasta `sso-watch`, `POST /v1/sso` |
+| **Auto-registro** | OAuth device + bot DrissionPage + e-mail temporário (Grok) |
+| **Build multiplataforma** | Windows + Linux via GitHub Actions |
 
-1. Open [Releases](../../releases)
-2. Download:
-   - **Windows:** `GrokProxyPlus-windows-amd64.exe` (bot scripts **embedded** — extract to AppData) **or** `…exe.zip` (portable: exe + `grok-signup-bot/`)
-   - **Linux:** `GrokProxyPlus-linux-amd64` (embedded bot) **or** `…tar.gz` (binary + bot)
-3. Run the app → **+ Adicionar conta** → authorize in the browser
-4. Point your client at the local proxy (see below)
+---
 
-**WebView2 (Windows):** the desktop UI needs [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/) (preinstalled on most Win10/11).
+## Início rápido
 
-**Auto-register on a release build:**
+### Opção A — baixar release
+
+1. Abra [Releases](../../releases)
+2. Baixe:
+   - **Windows:** `GrokProxyPlus-windows-amd64.exe` (bot embutido) **ou** o `.zip` portátil (exe + `grok-signup-bot/`)
+   - **Linux:** `GrokProxyPlus-linux-amd64` **ou** `.tar.gz`
+3. Abra o app → **+ Adicionar conta** (Grok) ou **+ Conta Kimi** (Google)
+4. Aponte o cliente para o proxy local (abaixo)
+
+**WebView2 (Windows):** a UI precisa do [Microsoft Edge WebView2 Runtime](https://developer.microsoft.com/microsoft-edge/webview2/) (já vem na maioria do Win10/11).
+
+**Auto-registro na release:**
 
 | | Windows | Linux |
 |--|---------|--------|
-| Unpack | bare `.exe` OK (bot embedded) or zip with sibling `grok-signup-bot\` | bare binary OK or tar.gz |
-| Python | Python 3 from python.org, **Add to PATH** (`python -c "import sys; print(sys.executable)"`) | `python3` + venv |
-| Deps | **auto** `python -m venv` + pip under AppData on first register | same |
-| Browser | Chrome or Edge | Chrome/Chromium |
-| Paths | settings → **embedded extract** under AppData → sibling `grok-signup-bot` | same |
+| Pacote | `.exe` solto (bot embutido) ou zip com `grok-signup-bot\` | binário solto ou tar.gz |
+| Python | Python 3 do python.org, **Add to PATH** | `python3` + venv |
+| Dependências | **auto** `venv` + pip no AppData no primeiro registro | idem |
+| Navegador | Chrome ou Edge | Chrome/Chromium |
 
-Without Python, **device login + SSO import** still work. SmartScreen may warn on unsigned builds — “More info → Run anyway”.
+Sem Python, **login device + import SSO** do Grok continuam funcionando. SmartScreen pode avisar em builds não assinados — “Mais info → Executar mesmo assim”.
 
-### Option B — run from source
+### Opção B — rodar do código
 
-**Requirements:** Go 1.23+, Node 20+, [Wails v2](https://wails.io/), (Linux: GTK/WebKit dev packages)
+**Requisitos:** Go 1.24+ (preferível 1.25), Node 20+, [Wails v2](https://wails.io/), (Linux: pacotes GTK/WebKit)
 
 ```bash
 git clone https://github.com/Maicon501a/grok-proxy-plus.git
 cd grok-proxy-plus
 
-# install Wails once
+# instalar Wails uma vez
 go install github.com/wailsapp/wails/v2/cmd/wails@v2.12.0
 
-# dev
+# desenvolvimento
 wails dev
 
-# production build
+# build de produção
 wails build
 ```
 
-Binary output: `build/bin/` (e.g. `GrokDesktop.exe` on Windows).
+Saída: `build/bin/` (ex.: `GrokDesktop.exe` no Windows).
 
-**Optional auto-register (dev tree):**
+**Auto-registro opcional (árvore de dev):**
 
 ```bash
 # Linux / macOS
@@ -131,32 +131,30 @@ python -m venv .venv
 .\.venv\Scripts\pip install -r grok-signup-bot\requirements.txt
 ```
 
-Path resolution (bot): settings `bot_dir` → **embedded** extract under `%LOCALAPPDATA%\GrokDesktop\signup-bot\<ver>\` → monorepo / next to exe. Python: settings `python_path` → monorepo `.venv` → `python`/`python3` on PATH.
-
 ---
 
-## OpenAI-compatible proxy
+## Proxy compatível com OpenAI
 
-After the app starts (with an active account for the **selected provider**), a local server listens on:
+Com o app aberto e uma conta ativa no **provedor selecionado**, o servidor local escuta em:
 
 ```text
 http://127.0.0.1:8787/v1
 ```
 
-(If `8787` is busy, the app tries **`8788`**.)
+(Se `8787` estiver ocupada, tenta **`8788`**.)
 
-| Setting | Value |
-|---------|--------|
+| Configuração | Valor |
+|--------------|--------|
 | **Base URL** | `http://127.0.0.1:8787/v1` |
-| **API key** | any string (or the optional key set in the app) |
-| **Active provider** | Global → Provider (`xai` or `kimi_work`) |
+| **API key** | qualquer string (ou a key opcional definida no app) |
+| **Provedor ativo** | Global → Provedor (`xai` ou `kimi_work`) |
 
-### Grok (provider = xAI)
+### Grok (provedor = xAI)
 
-| Setting | Value |
-|---------|--------|
-| Endpoint | **`POST /v1/responses`** (chat/completions returns 400) |
-| Model | `grok-4.5` |
+| Item | Valor |
+|------|--------|
+| Endpoint | **`POST /v1/responses`** (`/chat/completions` retorna 400) |
+| Modelo | `grok-4.5` |
 
 ```bash
 curl http://127.0.0.1:8787/v1/responses \
@@ -165,17 +163,17 @@ curl http://127.0.0.1:8787/v1/responses \
   -d '{
     "model": "grok-4.5",
     "stream": true,
-    "input": "Hello"
+    "input": "Olá"
   }'
 ```
 
-### Kimi Work (provider = kimi_work)
+### Kimi Work (provedor = kimi_work)
 
-| Setting | Value |
-|---------|--------|
-| Endpoint | **`POST /v1/chat/completions`** (responses returns 400) |
-| Models | `kimi-for-coding` (wire id), aliases `k3-agent`, `k3-agent-swarm`, `k2d6-agent` |
-| Tools | Native OpenAI `tools` / `tool_calls` |
+| Item | Valor |
+|------|--------|
+| Endpoint | **`POST /v1/chat/completions`** (`/responses` retorna 400) |
+| Modelos | `kimi-for-coding` (id de fio), aliases `k3-agent`, `k3-agent-swarm`, `k2d6-agent` |
+| Tools | OpenAI nativo: `tools` / `tool_calls` |
 
 ```bash
 curl http://127.0.0.1:8787/v1/chat/completions \
@@ -184,13 +182,13 @@ curl http://127.0.0.1:8787/v1/chat/completions \
   -d '{
     "model": "kimi-for-coding",
     "stream": false,
-    "messages": [{"role":"user","content":"Hello"}]
+    "messages": [{"role":"user","content":"Olá"}]
   }'
 ```
 
-### Example — Open Code (both providers, same baseURL)
+### Exemplo — OpenCode (mesma baseURL)
 
-Switch **Global → Provider** in the app, then use matching models:
+Troque **Global → Provedor** no app e use os models correspondentes:
 
 ```json
 {
@@ -213,22 +211,27 @@ Switch **Global → Provider** in the app, then use matching models:
 }
 ```
 
-### API surface
+### Superfície da API
 
-| Endpoint | Grok | Kimi Work | Notes |
+| Endpoint | Grok | Kimi Work | Notas |
 |----------|------|-----------|--------|
-| `/v1/models` | ✓ | ✓ | Catalog for **active** provider |
-| `/v1/responses` | ✓ | ✗ | Grok only |
-| `/v1/chat/completions` | ✗ | ✓ | Kimi only (OpenAI tools native) |
-| `/v1/messages` | ✓* | — | Anthropic-shaped (Grok path) |
-| `/v1/search` | ✓ | — | **Native xAI search** (`web_search` + `x_search`) |
-| `POST /v1/sso` | ✓ | — | Import Grok SSO |
+| `/v1/models` | ✓ | ✓ | Catálogo do **provedor ativo** |
+| `/v1/responses` | ✓ | ✗ | Só Grok |
+| `/v1/chat/completions` | ✗ | ✓ | Só Kimi (tools OpenAI nativos) |
+| `/v1/messages` | ✓* | — | Formato Anthropic (caminho Grok) |
+| `/v1/search` | ✓ | — | **Pesquisa nativa xAI** (`web_search` + `x_search`) |
+| `POST /v1/sso` | ✓ | — | Importar SSO Grok |
 
-\*Best-effort; prefer Responses for Grok clients when possible.
+\*Melhor esforço; para Grok prefira Responses quando o cliente permitir.
 
-### xAI Search route (`/v1/search`)
+Em rate-limit do Grok (429/402 free-usage-exhausted) o proxy pode marcar a conta como esgotada, trocar de conta e **repetir a mesma request**.  
+No Kimi, “Too many people are chatting…” vira **503 `kimi_server_busy`** e **não** rotaciona conta.
 
-When the **active provider is Grok (xAI)**, the proxy exposes a dedicated search endpoint that calls **native xAI search tools** (not a third-party scraper):
+---
+
+## Pesquisa nativa xAI (`/v1/search`)
+
+Com o **provedor ativo = Grok (xAI)**, o proxy expõe uma rota de pesquisa que usa as **tools nativas da xAI** (não é scraper de terceiros):
 
 ```text
 POST http://127.0.0.1:8787/v1/search
@@ -236,100 +239,97 @@ POST http://127.0.0.1:8787/v1/web_search
 POST http://127.0.0.1:8787/v1/x_search
 ```
 
-Under the hood the proxy runs a short **Responses** turn with only:
+Por baixo dos panos roda um turno curto de **Responses** só com:
 
-| Tool | What it searches |
-|------|------------------|
-| `web_search` | Web (xAI native) |
-| `x_search` | X / Twitter (xAI native) |
+| Tool | O que pesquisa |
+|------|----------------|
+| `web_search` | Web (nativo xAI) |
+| `x_search` | X / Twitter (nativo xAI) |
 
-Example:
+Exemplo:
 
 ```bash
 curl http://127.0.0.1:8787/v1/search \
   -H "Authorization: Bearer grok-desktop" \
   -H "Content-Type: application/json" \
   -d '{
-    "query": "latest Grok 4.5 news",
+    "query": "últimas notícias do Grok 4.5",
     "mode": "web"
   }'
 ```
 
-- `mode`: `web` / `web_search` · `x` / `x_search` · omit or `both` for web + X  
-- Requires an **active Grok account** (Kimi / other providers return an error for this route)  
-- In-app chat also surfaces native search events in the research panel when the model calls those tools on `/v1/responses`
-
-On Grok rate-limit (429/402 free-usage-exhausted) the proxy may mark the account exhausted, switch account, and **retry the same request**.  
-On Kimi “Too many people are chatting…” the proxy returns **503 `kimi_server_busy`** and does **not** rotate accounts.
+- `mode`: `web` / `web_search` · `x` / `x_search` · omitir ou `both` = web + X  
+- Exige **conta Grok ativa** (Kimi e outros provedores retornam erro nessa rota)  
+- No chat do app, eventos de pesquisa nativa também aparecem no painel de pesquisa quando o modelo chama essas tools em `/v1/responses`
 
 ---
 
 ## Kimi Work
 
-Kimi Work is Moonshot’s **coding/agent** product (Desktop “Work” mode), not the consumer web chat JWT path.
+Kimi Work é o produto de **coding/agent** da Moonshot (modo Work do Desktop), **não** o chat web consumer com JWT solto.
 
-### Auth flow (same idea as official Desktop)
+### Fluxo de auth (mesma ideia do app oficial)
 
 ```text
-System browser → Google OAuth (loopback 127.0.0.1:61120+)
+Navegador do sistema → Google OAuth (loopback 127.0.0.1:61120+)
   → POST https://www.kimi.com/api/auth/login/google  { code: <google id_token> }
   → access_token + refresh_token
   → Connect CreateAPIKey(scope=WORK) → sk-kimi-…
   → Upstream: https://agent-gw.kimi.com/coding/v1
 ```
 
-In the app: **Provider → Kimi Work · Auth** → **+ Conta Kimi** → **Login com Google**.
+No app: **Provedor → Kimi Work · Auth** → **+ Conta Kimi** → **Login com Google**.
 
-- Multi-account = multiple Kimi users (each Google login → one `sk-kimi` pool entry).
-- Does **not** require the Kimi Desktop app installed.
-- Wire model id from agent-gw is usually **`kimi-for-coding`** (K3-class coding SKU). Desktop labels `k3-agent` / swarm are aliases.
+- Multi-conta = vários usuários Kimi (cada login Google → uma entrada `sk-kimi` no pool).
+- **Não** precisa do Kimi Desktop instalado.
+- O id de fio no agent-gw costuma ser **`kimi-for-coding`** (SKU coding da família K3). Labels `k3-agent` / swarm são aliases.
 
-### Pricing (estimate, platform list)
+### Preço estimado (lista da platform)
 
-Used by in-app stats (USD / 1M tokens):
+Usado nas estatísticas do app (USD / 1M tokens):
 
-| Model family | Cache hit | Input (miss) | Output |
-|--------------|----------:|-------------:|-------:|
+| Família | Cache hit | Input (miss) | Output |
+|---------|----------:|-------------:|-------:|
 | Kimi K3 / `kimi-for-coding` | $0.30 | $3.00 | $15.00 |
 | Kimi K2.6 / `k2d6-agent` | $0.16 | $0.95 | $4.00 |
 
-Source: [platform.kimi.ai pricing](https://platform.kimi.ai/docs/pricing/chat-k3). Membership/subscription billing on consumer accounts may differ.
+Fonte: [pricing Kimi K3](https://platform.kimi.ai/docs/pricing/chat-k3). Conta consumer/assinatura pode diferir da tabela da API platform.
 
 ---
 
-## Multi-account & failover
+## Multi-conta & failover
 
 ### Grok (xAI)
 
-- **+ Conta Grok** → device-code login / SSO / auto-register
-- Exhausted accounts: badge + skip + optional auto-register
-- Failover plan: [plan/executed/account-exhaustion-plan.md](./plan/executed/account-exhaustion-plan.md)
+- **+ Conta Grok** → login device / SSO / auto-registro
+- Contas esgotadas: badge + skip + auto-registro opcional
+- Plano de failover: [plan/executed/account-exhaustion-plan.md](./plan/executed/account-exhaustion-plan.md)
 
 ### Kimi Work
 
-- **+ Conta Kimi** → Google browser login only (primary path)
-- Pool is per-user `sk-kimi`; capacity errors are server-side (no rotate)
+- **+ Conta Kimi** → login Google no navegador (caminho principal)
+- Pool por usuário (`sk-kimi`); erro de capacidade é do servidor (sem rotacionar)
 
-### Shared UX
+### UX compartilhada
 
-- Switch **provider** in Global settings
-- **Ver contas** modal lists only the **active provider** pool
-- Active account is used for UI chat **and** the local proxy for that provider
+- Troque o **provedor** em Global
+- **Ver contas** lista só o pool do **provedor ativo**
+- A conta ativa alimenta o chat da UI **e** o proxy local daquele provedor
 
-Data directory (never committed to git):
+### Onde ficam os dados (não vai pro git)
 
-| OS | Path |
-|----|------|
+| SO | Caminho |
+|----|---------|
 | Windows | `%LOCALAPPDATA%\GrokDesktop\` |
 | macOS | `~/Library/Application Support/GrokDesktop/` |
 | Linux | `~/.local/share/GrokDesktop/` |
 
 ```text
 GrokDesktop/
-├── grokdesktop.db        # SQLite: accounts, settings, usage, history
-├── settings.json         # legacy dual-write
+├── grokdesktop.db        # SQLite: contas, settings, usage, history
+├── settings.json         # dual-write legado
 ├── usage.json / history.json
-├── accounts/<id>.json    # legacy dual-write backup
+├── accounts/<id>.json    # backup dual-write legado
 ├── signup-bot/<ver>/
 ├── python-venv/
 ├── skills/
@@ -338,48 +338,51 @@ GrokDesktop/
 └── logs/
 ```
 
----
-
-## Auto-register & SSO
-
-### SSO
-
-| Method | How |
-|--------|-----|
-| UI paste | Importar SSO |
-| File | `email:password:SSO` or raw token lines |
-| Watch dir | `AppData/sso-watch/*.txt` every 30s |
-| HTTP | `POST /v1/sso` (gated by proxy API key if set) |
-
-### Auto-register (optional, experimental)
-
-Flow: **Device OAuth** → Python bot (`grok-signup-bot/`, **DrissionPage**) → **PollDevice** → account saved.
-
-| UI / backend | Behavior |
-|--------------|----------|
-| **+ Gerar contas** | Batch 1–5 (cap 5 active) |
-| `autoRegisterLoop` | Every 5 min if active &lt; min (**opt-in**: `auto_register_enabled` in settings, default **false**) |
-| Email | DuckMail → Mail.tm |
-| Plan | [plan/executed/auto-register-plan-v1.md](./plan/executed/auto-register-plan-v1.md) |
-
-**Risks:** ToS, bans, automation. Prefer manual device login for personal use.  
-Bare release binaries **embed** the Python bot and extract it under AppData; on first auto-register the app creates **`python-venv`** and `pip install`s deps. You still need **host Python 3** (with venv/pip) and **Chrome/Edge**.
+**Importante:** desinstalar só o `.exe` **não apaga** o AppData. Apagar a pasta `GrokDesktop` ou formatar o PC **apaga** as contas. Faça backup de `grokdesktop.db` (ou da pasta inteira).
 
 ---
 
+## Auto-registro & SSO
 
-## Docs
+### SSO (Grok)
+
+| Método | Como |
+|--------|------|
+| Colar na UI | Importar SSO |
+| Arquivo | linhas `email:senha:SSO` ou token cru |
+| Pasta watch | `AppData/sso-watch/*.txt` a cada 30s |
+| HTTP | `POST /v1/sso` (protegido pela API key do proxy, se houver) |
+
+### Auto-registro (opcional, experimental)
+
+Fluxo: **Device OAuth** → bot Python (`grok-signup-bot/`, **DrissionPage**) → **PollDevice** → conta salva.
+
+| UI / backend | Comportamento |
+|--------------|---------------|
+| **+ Gerar contas** | Lote 1–5 (teto 5 ativas) |
+| `autoRegisterLoop` | A cada 5 min se ativas &lt; mínimo (**opt-in**: `auto_register_enabled`, default **false**) |
+| E-mail | DuckMail → Mail.tm |
+| Plano | [plan/executed/auto-register-plan-v1.md](./plan/executed/auto-register-plan-v1.md) |
+
+**Riscos:** ToS, ban, automação. Para uso pessoal, prefira login device manual.  
+Binários de release **embutem** o bot e extraem no AppData; no primeiro auto-registro criam **`python-venv`** e instalam deps. Ainda precisa de **Python 3 no host** e **Chrome/Edge**.
+
+---
+
+## Documentação
 
 | Doc | Conteúdo |
-|-----|----------|
-| [plan/executed/](./plan/executed/) | Planos **concluídos** (exhaustion, auto-register, FINDINGS) |
+|------|----------|
+| [plan/executed/](./plan/executed/) | Planos **concluídos** (exhaustion, auto-registro, FINDINGS) |
 | [plan/executed/hardening-plan-v1.md](./plan/executed/hardening-plan-v1.md) | Hardening A–D (feito) |
 | [plan/executed/account-exhaustion-plan.md](./plan/executed/account-exhaustion-plan.md) | Failover + usage (feito) |
-| [plan/executed/auto-register-plan-v1.md](./plan/executed/auto-register-plan-v1.md) | Auto-register (feito) |
+| [plan/executed/auto-register-plan-v1.md](./plan/executed/auto-register-plan-v1.md) | Auto-registro (feito) |
 | [docs/grok-register-analysis.md](./docs/grok-register-analysis.md) | Guia SSO + análise grok-register |
 | [grok-signup-bot/README.md](./grok-signup-bot/README.md) | Setup do bot Python |
 
-## Build from source
+---
+
+## Compilar do código
 
 ```bash
 wails build
@@ -387,7 +390,7 @@ wails build -platform windows/amd64
 wails build -platform linux/amd64
 ```
 
-### Linux dependencies (Debian/Ubuntu)
+### Dependências Linux (Debian/Ubuntu)
 
 ```bash
 sudo apt-get install -y \
@@ -396,7 +399,7 @@ sudo apt-get install -y \
   gcc pkg-config
 ```
 
-### Self-test (no GUI)
+### Self-test (sem GUI)
 
 ```bash
 go run ./cmd/selftest
@@ -406,39 +409,39 @@ go run ./cmd/selftest
 
 ## Releases
 
-| Trigger | Workflow |
+| Gatilho | Workflow |
 |---------|----------|
-| Push / PR to `main` | [CI](./.github/workflows/ci.yml) |
-| Push tag `v*.*.*` | [Release](./.github/workflows/release.yml) |
+| Push / PR em `main` | [CI](./.github/workflows/ci.yml) |
+| Push de tag `v*.*.*` | [Release](./.github/workflows/release.yml) |
 
 ```bash
-git tag v1.0.0
-git push origin v1.0.0
+git tag v1.3.0
+git push origin v1.3.0
 ```
 
-Assets: `GrokProxyPlus-windows-amd64.exe`, `GrokProxyPlus-windows-amd64.exe.zip`, `GrokProxyPlus-linux-amd64`, `GrokProxyPlus-linux-amd64.tar.gz`
+Artefatos: `GrokProxyPlus-windows-amd64.exe`, `…exe.zip`, `GrokProxyPlus-linux-amd64`, `…tar.gz`
 
 ---
 
-## Project layout
+## Estrutura do projeto
 
 ```text
 .
 ├── main.go / app.go
 ├── internal/
-│   ├── oauth/
-│   ├── store/
-│   ├── upstream/
-│   ├── proxyhttp/
-│   ├── pricing/
-│   ├── register/
+│   ├── oauth/          # Grok OAuth
+│   ├── kimi/           # login Google + mint sk-kimi
+│   ├── store/          # SQLite + settings + accounts
+│   ├── upstream/       # clientes HTTP Grok/Kimi
+│   ├── proxyhttp/      # servidor local /v1
+│   ├── pricing/        # custos estimados
+│   ├── register/       # auto-registro embutido
 │   ├── skills/
 │   └── mcpconfig/
 ├── grok-signup-bot/
 ├── frontend/
-├── cmd/selftest/
 ├── docs/
-├── plan/executed/          # planos concluídos
+├── plan/executed/
 ├── .github/workflows/
 ├── LICENSE
 ├── DISCLAIMER.md
@@ -447,30 +450,32 @@ Assets: `GrokProxyPlus-windows-amd64.exe`, `GrokProxyPlus-windows-amd64.exe.zip`
 
 ---
 
-## UI language
+## Idioma da UI
 
-The desktop UI strings are **Portuguese (pt-BR)** by design. README and API docs stay English. Full i18n is not planned unless requested.
+Os textos da UI desktop são **português (pt-BR)** de propósito. Este README também está em português.
 
-## Security notes
+## Segurança
 
-- **Tokens never go into the git repo** — only AppData on your machine  
-- OAuth `client_id` in source is the **public** xAI CLI client (PKCE, no client secret)  
-- Do not commit `accounts/`, `*.env`, or dirty release binaries  
-- Treat the local proxy as **localhost-only**  
-- Empty proxy API key leaves `/v1/sso` open on localhost  
-- Auto-register stores plaintext passwords in `auto_creds.json`  
-
----
-
-## Disclaimer
-
-**Use at your own risk.** Authors are **not responsible** for bans, billing, data loss, ToS violations, or any damages.  
-This is **not** an official xAI product. Full text: [DISCLAIMER.md](./DISCLAIMER.md).
+- **Tokens não vão pro repositório git** — só no AppData da máquina  
+- Contas/tokens ficam em **`grokdesktop.db`** (e dual-write JSON legado)  
+- Client OAuth do Grok no código é o **client público** do CLI xAI (PKCE)  
+- Client OAuth Google do Kimi é o **client de app do Desktop** (compartilhado; não é senha da sua conta)  
+- Não commite `accounts/`, `*.db`, `*.env` nem binários “sujos”  
+- Trate o proxy como **somente localhost**  
+- API key vazia no proxy deixa `/v1/sso` aberto no localhost  
+- Auto-registro pode gravar senhas em texto em `auto_creds.json`  
 
 ---
 
-## License
+## Aviso legal
 
-**MIT (Non-Commercial)** — free for personal / non-commercial use.  
-**No commercial use** without written permission.  
-Full terms: [LICENSE](./LICENSE).
+**Use por sua conta e risco.** Os autores **não se responsabilizam** por ban, cobrança, perda de dados, violação de ToS ou qualquer dano.  
+Isto **não** é produto oficial da xAI nem da Moonshot. Texto completo: [DISCLAIMER.md](./DISCLAIMER.md).
+
+---
+
+## Licença
+
+**MIT (Non-Commercial)** — livre para uso pessoal / não comercial.  
+**Sem uso comercial** sem permissão por escrito.  
+Termos: [LICENSE](./LICENSE).
