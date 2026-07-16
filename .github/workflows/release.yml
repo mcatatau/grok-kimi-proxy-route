@@ -1,4 +1,4 @@
-name: Release
+﻿name: Release
 
 on:
   push:
@@ -32,7 +32,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.23.x"
+          go-version: "1.24.x"
 
       - name: Setup Node
         uses: actions/setup-node@v4
@@ -86,7 +86,7 @@ jobs:
           Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "$bundle/grok-signup-bot/.venv","$bundle/grok-signup-bot/__pycache__"
           Get-ChildItem -Recurse "$bundle/grok-signup-bot" -Filter "__pycache__" -Directory -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force
           @"
-          Grok Proxy Plus — Windows portable
+          Grok Proxy Plus â€” Windows portable
 
           Layout:
             GrokProxyPlus.exe
@@ -97,7 +97,7 @@ jobs:
             2. Install Chrome or Edge
             3. In this folder:
                  python -m pip install -r grok-signup-bot\requirements.txt
-            4. Run GrokProxyPlus.exe — bot_dir resolves next to the exe
+            4. Run GrokProxyPlus.exe â€” bot_dir resolves next to the exe
 
           Manual device login works without Python.
           Data: %LOCALAPPDATA%\GrokDesktop\
@@ -127,7 +127,7 @@ jobs:
           rm -rf "$BUNDLE/grok-signup-bot/.venv" "$BUNDLE/grok-signup-bot/__pycache__" 2>/dev/null || true
           find "$BUNDLE/grok-signup-bot" -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
           cat > "$BUNDLE/README-LINUX.txt" <<'EOF'
-          Grok Proxy Plus — Linux portable
+          Grok Proxy Plus â€” Linux portable
 
           Layout:
             GrokProxyPlus
