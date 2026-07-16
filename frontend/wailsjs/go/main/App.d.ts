@@ -5,6 +5,12 @@ import {main} from '../models';
 import {store} from '../models';
 import {upstream} from '../models';
 
+export function AddKimiAPIKey(arg1:string,arg2:string):Promise<Record<string, any>>;
+
+export function AddKimiFromJWT(arg1:string):Promise<Record<string, any>>;
+
+export function CancelAutoSignup():Promise<void>;
+
 export function CancelChat():Promise<void>;
 
 export function CancelDeviceLogin():Promise<void>;
@@ -16,6 +22,8 @@ export function DeleteMCPServer(arg1:string):Promise<void>;
 export function DeleteSkill(arg1:string):Promise<void>;
 
 export function GetActiveRequest():Promise<main.ActiveRequest>;
+
+export function GetAutoCreateOnExhausted():Promise<boolean>;
 
 export function GetBootstrap():Promise<Record<string, any>>;
 
@@ -29,11 +37,17 @@ export function GetStats():Promise<Record<string, any>>;
 
 export function GetUsage():Promise<Record<string, store.UsageTotals>>;
 
+export function IsSignupRunning():Promise<boolean>;
+
 export function ListAccounts():Promise<Array<Record<string, any>>>;
+
+export function ListAccountsForProvider(arg1:string):Promise<Array<Record<string, any>>>;
 
 export function ListMCPServers():Promise<Array<Record<string, any>>>;
 
 export function ListModels():Promise<Array<upstream.ModelInfo>>;
+
+export function ListProviders():Promise<Array<Record<string, any>>>;
 
 export function ListSkills():Promise<Array<skills.Skill>>;
 
@@ -47,7 +61,15 @@ export function SendChat(arg1:upstream.ChatRequest):Promise<void>;
 
 export function SetActiveAccount(arg1:string):Promise<void>;
 
+export function SetAutoCreateOnExhausted(arg1:boolean):Promise<void>;
+
+export function StartAutoSignup():Promise<void>;
+
 export function StartDeviceLogin():Promise<main.deviceLoginState>;
+
+export function StartKimiBrowserLogin():Promise<Record<string, any>>;
+
+export function SyncGrokCLI():Promise<Record<string, any>>;
 
 export function UpdateSettings(arg1:Record<string, any>):Promise<store.Settings>;
 

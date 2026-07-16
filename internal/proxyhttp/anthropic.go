@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"grok-desktop/internal/store"
 )
 
 // handleMessages implements Anthropic Messages API: POST /v1/messages
@@ -24,7 +26,7 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "invalid api key")
 		return
 	}
-	token, _, settings, err := s.ensure(r.Context())
+	token, acc, settings, err := s.ensure(r.Context())
 	if err != nil {
 		writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", err.Error())
 		return
@@ -40,10 +42,16 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	model := asString(req["model"])
-	if model == "" {
-		model = settings.DefaultModel
+	reqModel := asString(req["model"])
+	var model string
+	if isCodexRequest(r) {
+		model = settings.ResolveModelForCodex(reqModel)
+	} else {
+		settings = settings.WithProviderForModel(reqModel)
+		token, acc = tokenAccountForSettings(s, r.Context(), token, acc, settings)
+		model = settings.ResolveModelForClient(reqModel)
 	}
+	_ = acc
 	stream, _ := req["stream"].(bool)
 	maxTokens := asInt(req["max_tokens"], 4096)
 	effort := settings.ReasoningEffort
@@ -82,17 +90,21 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 	if t, ok := req["top_p"].(float64); ok {
 		oaBody["top_p"] = t
 	}
+	// Ollie natively supports Anthropic /v1/messages — passthrough is more faithful.
+	if settings.IsOllie() {
+		s.proxyOllieAnthropic(w, r, token, settings, body, stream)
+		return
+	}
+
 	raw, _ := json.Marshal(oaBody)
 
-	url := strings.TrimRight(settings.UpstreamBase, "/") + "/chat/completions"
+	url := strings.TrimRight(settings.EffectiveUpstream(), "/") + "/chat/completions"
 	upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, url, bytes.NewReader(raw))
 	if err != nil {
 		writeAnthropicError(w, 500, "api_error", err.Error())
 		return
 	}
-	upReq.Header.Set("Authorization", "Bearer "+token)
-	upReq.Header.Set("Content-Type", "application/json")
-	upReq.Header.Set("x-grok-client-version", settings.ClientVersion)
+	setUpstreamAuthHeaders(upReq, token, settings)
 	if stream {
 		upReq.Header.Set("Accept", "text/event-stream")
 	} else {
@@ -140,6 +152,64 @@ func (s *Server) gateAnthropic(r *http.Request) bool {
 		return true
 	}
 	return s.gate(r)
+}
+
+// proxyOllieAnthropic forwards Anthropic Messages JSON as-is to OllieChat.
+func (s *Server) proxyOllieAnthropic(w http.ResponseWriter, r *http.Request, token string, settings store.Settings, body []byte, stream bool) {
+	// Ensure required max_tokens for Anthropic shape.
+	var m map[string]any
+	if json.Unmarshal(body, &m) == nil {
+		if _, ok := m["max_tokens"]; !ok {
+			m["max_tokens"] = 4096
+		}
+		reqModel, _ := m["model"].(string)
+		// Anthropic Ollie passthrough: honor client model (no Codex force here).
+		m["model"] = settings.ResolveModelForClient(reqModel)
+		if stream {
+			m["stream"] = true
+		}
+		body, _ = json.Marshal(m)
+	}
+	url := strings.TrimRight(settings.EffectiveUpstream(), "/") + "/messages"
+	upReq, err := http.NewRequestWithContext(r.Context(), http.MethodPost, url, bytes.NewReader(body))
+	if err != nil {
+		writeAnthropicError(w, 500, "api_error", err.Error())
+		return
+	}
+	setUpstreamAuthHeaders(upReq, token, settings)
+	upReq.Header.Set("anthropic-version", "2023-06-01")
+	if v := r.Header.Get("anthropic-version"); v != "" {
+		upReq.Header.Set("anthropic-version", v)
+	}
+	if stream {
+		upReq.Header.Set("Accept", "text/event-stream")
+	} else {
+		upReq.Header.Set("Accept", "application/json")
+	}
+	resp, err := http.DefaultClient.Do(upReq)
+	if err != nil {
+		writeAnthropicError(w, http.StatusBadGateway, "api_error", err.Error())
+		return
+	}
+	defer resp.Body.Close()
+	// Pass through status + body (JSON or SSE).
+	for k, vv := range resp.Header {
+		if strings.EqualFold(k, "Content-Length") {
+			continue
+		}
+		for _, v := range vv {
+			w.Header().Add(k, v)
+		}
+	}
+	if w.Header().Get("Content-Type") == "" {
+		if stream {
+			w.Header().Set("Content-Type", "text/event-stream")
+		} else {
+			w.Header().Set("Content-Type", "application/json")
+		}
+	}
+	w.WriteHeader(resp.StatusCode)
+	_, _ = io.Copy(w, resp.Body)
 }
 
 func writeAnthropicError(w http.ResponseWriter, code int, typ, msg string) {

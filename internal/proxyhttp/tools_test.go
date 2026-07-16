@@ -64,3 +64,55 @@ func contains(s, sub string) bool {
 			return false
 		}())
 }
+
+func TestSanitizeResponsesInput_TextToInputText(t *testing.T) {
+	raw := []any{
+		map[string]any{
+			"type": "message",
+			"role": "user",
+			"content": []any{
+				map[string]any{"type": "text", "text": "hi"},
+			},
+		},
+	}
+	out := sanitizeResponsesInput(raw).([]any)
+	b, _ := json.Marshal(out)
+	s := string(b)
+	if contains(s, `"type":"text"`) || contains(s, `"type": "text"`) {
+		// loose check — also accept spaced JSON
+	}
+	if !contains(s, "input_text") {
+		t.Fatalf("expected input_text normalization, got %s", s)
+	}
+	if contains(s, `"type":"text"`) {
+		t.Fatalf("raw text type leaked: %s", s)
+	}
+}
+
+func TestSanitizeResponsesInput_SingleObjectWrap(t *testing.T) {
+	raw := map[string]any{"role": "user", "content": "hi"}
+	out := sanitizeResponsesInput(raw)
+	arr, ok := out.([]any)
+	if !ok || len(arr) != 1 {
+		t.Fatalf("expected array of 1, got %#v", out)
+	}
+}
+
+func TestSanitizeResponsesInput_LocalShellCallCollapsed(t *testing.T) {
+	raw := []any{
+		map[string]any{"role": "user", "content": "hi"},
+		map[string]any{
+			"type":    "local_shell_call",
+			"call_id": "c1",
+			"status":  "completed",
+			"action":  map[string]any{"type": "exec", "command": []any{"echo", "1"}},
+		},
+	}
+	out := sanitizeResponsesInput(raw).([]any)
+	for _, item := range out {
+		m := item.(map[string]any)
+		if asString(m["type"]) == "local_shell_call" {
+			t.Fatalf("local_shell_call not collapsed: %#v", m)
+		}
+	}
+}

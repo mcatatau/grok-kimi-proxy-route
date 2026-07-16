@@ -4,6 +4,7 @@ build/windows/*.syso
 *.exe
 *.test
 *.dll
+*.syso
 
 # Frontend
 frontend/dist/
@@ -17,26 +18,61 @@ frontend/package.json.md5
 *.swp
 .DS_Store
 Thumbs.db
+desktop.ini
 
 # Secrets / local runtime (never commit)
 *.env
 .env.*
-state.json
+**/.env
+**/*secret*
+**/*credential*
+**/*credentials*
+**/service-account*.json
+**/application_default_credentials.json
+**/*-sa.json
+**/*adc*.json
+**/gcloud/**
+**/.config/gcloud/**
 auth.json
+state.json
 usage.json
 history.json
 settings.json
 **/accounts/**
 !**/accounts/.gitkeep
+**/kimi-code-key.json
+**/tokens_extracted.json
+**/Cookies*
+**/*token*.json
+**/*apikey*
+**/*api-key*
+**/*api_key*
+**/daimon-share/**
+**/.kimi-webbridge/**
 
-# Legacy Python proxy (removed)
+# Local probes / scratch / logs
+tmp_probe/
+scripts/
+mcp-xai-search/
+cmd/signup_probe/
+cmd/selftest/
+build_log*.txt
+*.log
+debug-requests/
+browser-data/
+**/debug-requests/**
+
+# SQLite local DB (accounts/tokens live here)
+*.db
+*.sqlite
+*.sqlite3
+grokdesktop.db
+**/*.db-wal
+**/*.db-shm
+
+# Legacy Python proxy
 grok_proxy/
 __pycache__/
 *.pyc
 .venv/
 venv/
-
-# OS junk / local notes
-*.log
-.DS_Store
-desktop.ini

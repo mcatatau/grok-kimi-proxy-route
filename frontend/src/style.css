@@ -232,6 +232,11 @@ button {
   background: rgba(251, 191, 36, 0.1);
 }
 
+.badge-danger {
+  color: rgba(248, 113, 113, 0.95);
+  background: rgba(248, 113, 113, 0.12);
+}
+
 .account-usage {
   margin-top: 8px;
   padding-top: 8px;
@@ -364,12 +369,20 @@ button {
   gap: 6px;
   margin-bottom: 10px;
   padding: 0 4px;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .field > span,
 .field > .field-label {
   font-size: 11px;
   color: var(--text-3);
+}
+
+.field .dd,
+.field .dd-trigger {
+  max-width: 100%;
+  min-width: 0;
 }
 
 /* Custom dropdown (never native white OS list) */
@@ -482,6 +495,14 @@ button {
   color: rgba(255, 255, 255, 0.78);
   background: transparent;
   transition: background 0.1s ease, color 0.1s ease;
+  min-width: 0;
+}
+
+.dd-item > span:first-child {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
 }
 
 .dd-item:hover {
@@ -522,18 +543,35 @@ button {
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.06);
   font-size: 11.5px;
   color: rgba(255, 255, 255, 0.55);
-  max-width: 200px;
+  max-width: 148px;
+  min-width: 0;
 }
 
 .seg.dd-chip .dd-trigger .dd-value {
   color: rgba(255, 255, 255, 0.82);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 1;
 }
 
 .seg.dd-chip .dd-menu {
-  min-width: 220px;
-  max-width: 280px;
+  min-width: 200px;
+  max-width: min(360px, 80vw);
+  width: max-content;
   right: auto;
   left: 0;
+}
+
+/* Model chip: long Ollie ids (accounts/.../claude-fable-5) stay compact in the dock */
+#c-model.dd-chip .dd-trigger {
+  max-width: 132px;
+}
+
+#c-effort.dd-chip .dd-trigger,
+#c-api.dd-chip .dd-trigger {
+  max-width: 110px;
 }
 
 .seg.dd-chip .dd-label {
@@ -544,7 +582,7 @@ button {
 
 /* account chip: looks like the “email” control people click to switch */
 #c-account.dd-chip .dd-trigger {
-  max-width: 240px;
+  max-width: 150px;
   background: rgba(125, 211, 252, 0.08);
   box-shadow: inset 0 0 0 1px rgba(125, 211, 252, 0.22);
   color: rgba(186, 230, 253, 0.95);
@@ -1003,6 +1041,8 @@ button {
     inset 0 0 0 1px rgba(255, 255, 255, 0.08),
     0 18px 50px rgba(0, 0, 0, 0.35);
   padding: 4px 4px 8px;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .composer textarea {
@@ -1027,16 +1067,30 @@ button {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
+  gap: 8px;
   padding: 2px 8px 4px 10px;
-  flex-wrap: wrap;
+  /* Never wrap send below the tools row (long Ollie model names). */
+  flex-wrap: nowrap;
+  min-width: 0;
 }
 
 .tools {
   display: flex;
   align-items: center;
   gap: 6px;
-  flex-wrap: wrap;
+  flex: 1 1 auto;
+  min-width: 0;
+  /* Horizontal scroll instead of wrapping the send button down. */
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+}
+
+.tools::-webkit-scrollbar {
+  display: none;
+  height: 0;
 }
 
 .seg {
@@ -1073,6 +1127,11 @@ select option {
   color: rgba(255, 255, 255, 0.28);
   padding: 0 6px;
   letter-spacing: 0.02em;
+  flex-shrink: 0;
+  white-space: nowrap;
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* ——— Manus-inspired research / web search panel ——— */
@@ -1541,7 +1600,11 @@ select option {
   font-size: 15px;
   font-weight: 600;
   transition: 0.15s ease;
+  flex: 0 0 34px;
   flex-shrink: 0;
+  align-self: center;
+  /* Stay pinned on the right of the composer row */
+  margin-left: 2px;
 }
 
 .send:hover {
@@ -1896,3 +1959,88 @@ select option {
     grid-template-columns: 1fr;
   }
 }
+
+
+/* Transparent glass modal for add-account chooser */
+.overlay-glass {
+  background: rgba(4, 6, 12, 0.42);
+  backdrop-filter: blur(10px) saturate(1.1);
+  -webkit-backdrop-filter: blur(10px) saturate(1.1);
+}
+.overlay-glass .sheet {
+  background: rgba(18, 20, 28, 0.72);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.45);
+}
+.sheet-choose { max-width: 440px; }
+.choose-grid { display: grid; gap: 10px; margin: 16px 0 12px; }
+.choose-card {
+  text-align: left; border-radius: 14px; padding: 14px 16px;
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  background: rgba(255, 255, 255, 0.03); color: inherit; cursor: pointer;
+  transition: border-color 0.15s, background 0.15s, transform 0.12s;
+}
+.choose-card:hover {
+  border-color: rgba(125, 211, 252, 0.35);
+  background: rgba(125, 211, 252, 0.06);
+  transform: translateY(-1px);
+}
+.choose-card strong { display: block; font-size: 14px; margin-bottom: 4px; }
+.choose-card span { display: block; font-size: 12px; line-height: 1.4; color: rgba(255,255,255,0.5); }
+.auto-toggle {
+  display: flex; gap: 10px; align-items: flex-start; font-size: 12px;
+  color: rgba(255,255,255,0.55); margin: 8px 0 4px; cursor: pointer;
+}
+.auto-toggle input { margin-top: 2px; }
+.signup-log {
+  margin-top: 12px; padding: 10px 12px; border-radius: 10px;
+  background: rgba(0,0,0,0.28);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11.5px; color: rgba(186,230,253,0.9); line-height: 1.45;
+  max-height: 140px; overflow: auto; white-space: pre-wrap;
+}
+.hint-email { font-size: 12.5px !important; color: rgba(255,255,255,0.65) !important; }
+.hint-email code {
+  font-size: 11px; padding: 1px 6px; border-radius: 6px; background: rgba(255,255,255,0.06);
+}
+
+/* multi-provider auth / accounts modal */
+.provider-mode { margin: 6px 0 10px; }
+.mode-pill {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-size: 11px; font-weight: 600; letter-spacing: .02em;
+  padding: 3px 9px; border-radius: 999px;
+}
+.mode-auth {
+  color: #7dd3fc;
+  background: rgba(125, 211, 252, 0.10);
+  border: 1px solid rgba(125, 211, 252, 0.22);
+}
+.mode-key {
+  color: #fbbf24;
+  background: rgba(251, 191, 36, 0.10);
+  border: 1px solid rgba(251, 191, 36, 0.22);
+}
+.sheet-kimi { max-width: 480px; }
+.sheet-accounts { max-width: 520px; }
+.sheet-head {
+  display: flex; align-items: flex-start; justify-content: space-between; gap: 12px;
+}
+.sheet-head h3 { margin: 0 0 4px; }
+.sheet-head p { margin: 0; font-size: 12.5px; color: rgba(255,255,255,.55); }
+.acc-list { display: grid; gap: 8px; margin-top: 14px; max-height: 360px; overflow: auto; }
+.acc-row {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 12px 14px; border-radius: 14px;
+  border: 1px solid rgba(255,255,255,.08);
+  background: rgba(255,255,255,.03);
+}
+.acc-row.active {
+  border-color: rgba(125, 211, 252, 0.35);
+  background: rgba(125, 211, 252, 0.07);
+}
+.acc-main { min-width: 0; flex: 1; }
+.acc-main strong { display: block; font-size: 13.5px; margin-bottom: 4px; }
+.acc-actions { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.btn-xs { padding: 5px 10px !important; font-size: 12px !important; border-radius: 9px !important; }
+.btn-xs.danger { color: #fca5a5 !important; }

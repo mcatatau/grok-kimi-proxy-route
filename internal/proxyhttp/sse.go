@@ -20,9 +20,14 @@ func newFlushWriter(w http.ResponseWriter) *flushWriter {
 }
 
 func (f *flushWriter) Write(p []byte) (int, error) {
+	// Client disconnect mid-stream is normal (Codex cancel / app focus). Never panic.
+	defer func() { _ = recover() }()
 	n, err := f.w.Write(p)
-	if f.f != nil {
-		f.f.Flush()
+	if err == nil && f.f != nil {
+		func() {
+			defer func() { _ = recover() }()
+			f.f.Flush()
+		}()
 	}
 	return n, err
 }
@@ -62,12 +67,15 @@ func writeSSEJSON(w io.Writer, event string, payload any, marshal func(any) ([]b
 }
 
 // pipeSSE copies an upstream SSE body to client, flushing each event.
+// Uses a large scanner limit so fat Grok tool/reasoning frames do not abort the stream.
 func pipeSSE(dst http.ResponseWriter, src io.Reader) error {
 	setSSEHeaders(dst)
 	dst.WriteHeader(http.StatusOK)
 	fw := newFlushWriter(dst)
+	// 16MiB max token — Grok/Codex can emit very large single SSE data lines.
+	const maxLine = 16 << 20
 	sc := bufio.NewScanner(src)
-	sc.Buffer(make([]byte, 0, 64*1024), 2<<20)
+	sc.Buffer(make([]byte, 0, 256*1024), maxLine)
 	var block strings.Builder
 	flushBlock := func() error {
 		if block.Len() == 0 {
@@ -86,12 +94,14 @@ func pipeSSE(dst http.ResponseWriter, src io.Reader) error {
 		block.WriteByte('\n')
 		if line == "" {
 			if err := flushBlock(); err != nil {
-				return err
+				// Client gone — stop quietly; do not surface as process death.
+				return nil
 			}
 		}
 	}
 	_ = flushBlock()
 	if err := sc.Err(); err != nil {
+		// Token too long / network blip: log-friendly error, no panic.
 		return fmt.Errorf("sse scan: %w", err)
 	}
 	return nil

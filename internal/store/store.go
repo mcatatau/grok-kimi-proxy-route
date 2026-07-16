@@ -1,6 +1,8 @@
 package store
 
 import (
+	"database/sql"
+	b64 "encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -15,28 +17,69 @@ import (
 const (
 	AppName              = "GrokDesktop"
 	DefaultUpstream      = "https://cli-chat-proxy.grok.com/v1"
-	DefaultClientVersion = "0.2.93"
+	DefaultClientVersion = "0.2.101"
 	DefaultModel         = "grok-4.5"
 	DefaultEffort        = "high"
 	DefaultClientID      = "b1a00492-073a-47ea-816f-4c329264a828"
 	DefaultIssuer        = "https://auth.x.ai"
 	DefaultScopes        = "openid profile email offline_access api:access grok-cli:access conversations:read conversations:write"
+
+	// Upstream providers (local proxy can fan-out to any of these).
+	ProviderXAI      = "xai"
+	ProviderKimiWork = "kimi_work"
+	ProviderOllie    = "ollie"
+	ProviderGemini   = "gemini"
+
+	// AuthMode: how credentials are obtained for a provider.
+	AuthModeSession = "auth"    // multi-account session flow (xAI OAuth, Kimi Work mint)
+	AuthModeAPIKey  = "api_key" // direct API key / ADC (Ollie, Gemini, …)
+
+	// OllieChat — free keyless OpenAI/Anthropic-compatible API (WeirdMM).
+	OllieUpstream     = "https://olliechat.vercel.app/v1"
+	OllieAPIKey       = "ollie" // any non-empty string is accepted; ignored by server
+	OllieDefaultModel = "claude-sonnet-5"
+
+	// Gemini via Vertex AI Agent Platform (ADC — no API keys).
+	GeminiDefaultModel    = "gemini-3.1-pro-preview"
+	GeminiDefaultLocation = "global"
+	// Placeholder "token" for local ensureCreds; real access token loaded from ADC at request time.
+	GeminiCredMarker = "adc:google"
+
+	// Kimi Work / Kimi Code (Desktop) — coding gateway with sk-kimi keys.
+	KimiWorkUpstream     = "https://agent-gw.kimi.com/coding/v1"
+	KimiWorkDefaultModel = "kimi-for-coding"
+	KimiWorkUserAgent    = "Desktop Kimi Work"
 )
 
 type Account struct {
-	ID           string    `json:"id"`
-	Label        string    `json:"label"`
-	Email        string    `json:"email,omitempty"`
-	TeamID       string    `json:"team_id,omitempty"`
-	UserID       string    `json:"user_id,omitempty"`
+	ID       string `json:"id"`
+	// Provider: xai | kimi_work | … Empty means xai (legacy accounts).
+	Provider string `json:"provider,omitempty"`
+	Label    string `json:"label"`
+	Email    string `json:"email,omitempty"`
+	TeamID   string `json:"team_id,omitempty"`
+	UserID   string `json:"user_id,omitempty"`
+	// xAI OAuth (and generic bearer sessions)
 	AccessToken  string    `json:"access_token"`
 	RefreshToken string    `json:"refresh_token,omitempty"`
 	ExpiresAt    time.Time `json:"expires_at"`
-	ClientID     string    `json:"client_id"`
-	Issuer       string    `json:"issuer"`
-	Scope        string    `json:"scope,omitempty"`
-	CreatedAt    time.Time `json:"created_at"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	// Kimi Work coding key (sk-kimi-…). Also used if a provider stores a static API key on the account.
+	APIKey   string `json:"api_key,omitempty"`
+	DeviceID string `json:"device_id,omitempty"`
+	Source   string `json:"source,omitempty"` // oauth | desktop_mint | paste_key | paste_jwt | …
+	// ExhaustedAt marks when usage quota (402 / balance exhausted) was observed.
+	// Zero means the account is still usable for quota purposes.
+	ExhaustedAt   time.Time `json:"exhausted_at,omitempty"`
+	ExhaustReason string    `json:"exhaust_reason,omitempty"`
+	// AuthDeniedAt marks permanent-ish auth failures (403 permission-denied, invalid grant).
+	// Distinct from quota so UI/logs can tell them apart; both make Usable() false.
+	AuthDeniedAt     time.Time `json:"auth_denied_at,omitempty"`
+	AuthDeniedReason string    `json:"auth_denied_reason,omitempty"`
+	ClientID         string    `json:"client_id"`
+	Issuer           string    `json:"issuer"`
+	Scope            string    `json:"scope,omitempty"`
+	CreatedAt        time.Time `json:"created_at"`
+	UpdatedAt        time.Time `json:"updated_at"`
 }
 
 func (a *Account) Expired() bool {
@@ -48,13 +91,125 @@ func (a *Account) Expired() bool {
 
 func (a *Account) ExpiresSoon(skew time.Duration) bool {
 	if a.ExpiresAt.IsZero() {
-		return false
+		// Unknown lifetime: treat as needing refresh if we have a refresh token.
+		return a != nil && a.RefreshToken != ""
 	}
 	return time.Now().UTC().After(a.ExpiresAt.Add(-skew))
 }
 
+// Exhausted reports whether this account hit usage quota and should be rotated away.
+func (a *Account) Exhausted() bool {
+	return a != nil && !a.ExhaustedAt.IsZero()
+}
+
+// AuthDenied reports whether chat auth was rejected for this account.
+func (a *Account) AuthDenied() bool {
+	return a != nil && !a.AuthDeniedAt.IsZero()
+}
+
+// NormalizedProvider returns the provider id for this account (legacy empty → xai).
+func (a *Account) NormalizedProvider() string {
+	if a == nil {
+		return ProviderXAI
+	}
+	p := strings.ToLower(strings.TrimSpace(a.Provider))
+	switch p {
+	case ProviderKimiWork, "kimi", "kimi-work", "kimiwork", "moonshot-work":
+		return ProviderKimiWork
+	case ProviderOllie, "olliechat":
+		return ProviderOllie
+	case ProviderGemini, "google", "vertex":
+		return ProviderGemini
+	case "", ProviderXAI, "grok", "x.ai":
+		return ProviderXAI
+	default:
+		return p
+	}
+}
+
+// BearerToken returns the credential string used as Authorization bearer for this account.
+func (a *Account) BearerToken() string {
+	if a == nil {
+		return ""
+	}
+	if a.NormalizedProvider() == ProviderKimiWork {
+		if k := strings.TrimSpace(a.APIKey); k != "" {
+			return k
+		}
+	}
+	if t := strings.TrimSpace(a.AccessToken); t != "" {
+		return t
+	}
+	return strings.TrimSpace(a.APIKey)
+}
+
+// Usable is true when the account still has credentials and is not marked
+// quota-exhausted or auth-denied. For xAI, bot-flagged JWTs are rejected.
+// Token expiry alone does not make it unusable if a refresh token exists
+// (ensureCreds will refresh).
+func (a *Account) Usable() bool {
+	if a == nil || a.Exhausted() || a.AuthDenied() {
+		return false
+	}
+	switch a.NormalizedProvider() {
+	case ProviderKimiWork:
+		return strings.TrimSpace(a.APIKey) != "" || strings.HasPrefix(strings.TrimSpace(a.AccessToken), "sk-kimi-")
+	default:
+		if a.AccessToken == "" {
+			return false
+		}
+		// cli-chat-proxy returns 403 permission-denied for bot-flagged JWTs on chat.
+		if TokenBotFlagged(a.AccessToken) {
+			return false
+		}
+		return true
+	}
+}
+
+// TokenBotFlagged reports bot_flag_source != 0 in the access-token JWT payload.
+// Signature is not verified; the token is only used as an opaque bearer upstream.
+func TokenBotFlagged(access string) bool {
+	parts := strings.Split(access, ".")
+	if len(parts) < 2 {
+		return false
+	}
+	payload := parts[1]
+	if m := len(payload) % 4; m != 0 {
+		payload += strings.Repeat("=", 4-m)
+	}
+	raw, err := decodeB64URL(payload)
+	if err != nil {
+		return false
+	}
+	var claims map[string]any
+	if json.Unmarshal(raw, &claims) != nil {
+		return false
+	}
+	switch n := claims["bot_flag_source"].(type) {
+	case float64:
+		return n != 0
+	case int:
+		return n != 0
+	case json.Number:
+		i, _ := n.Int64()
+		return i != 0
+	default:
+		return false
+	}
+}
+
+func decodeB64URL(s string) ([]byte, error) {
+	// std encoding with padding first, then raw.
+	if b, err := b64.URLEncoding.DecodeString(s); err == nil {
+		return b, nil
+	}
+	return b64.RawURLEncoding.DecodeString(s)
+}
+
 type Settings struct {
 	ActiveAccountID string `json:"active_account_id"`
+	// Provider: xai | ollie | gemini
+	Provider        string `json:"provider,omitempty"`
 	DefaultModel    string `json:"default_model"`
 	ReasoningEffort string `json:"reasoning_effort"`
 	APIMode         string `json:"api_mode"`
@@ -64,7 +219,486 @@ type Settings struct {
 	ProxyEnabled    bool   `json:"proxy_enabled"`
 	ProxyAPIKey     string `json:"proxy_api_key,omitempty"`
 	StoreResponses  bool   `json:"store_responses"`
-	ThemeAccent     string `json:"theme_accent,omitempty"`
+	// ForceDefaultModel when true (default) always routes client requests to DefaultModel.
+	ForceDefaultModel *bool `json:"force_default_model,omitempty"`
+	// Gemini / Vertex AI (Application Default Credentials).
+	GeminiProject  string `json:"gemini_project,omitempty"`
+	GeminiLocation string `json:"gemini_location,omitempty"`
+	ThemeAccent    string `json:"theme_accent,omitempty"`
+}
+
+// ForceModel reports whether the proxy should ignore the client's model field.
+// Default is FALSE — HTTP clients keep the model they send.
+// Desktop chat UI selects model independently (not via this force flag).
+func (s Settings) ForceModel() bool {
+	if s.ForceDefaultModel == nil {
+		return false
+	}
+	return *s.ForceDefaultModel
+}
+
+// ResolveModel picks the upstream model id for a client request.
+// Aliases: "", "default", "proxy", "auto", "grok-desktop" → DefaultModel.
+// When ForceModel() is true, unknown / cross-provider ids still map to DefaultModel,
+// but explicit provider-native ids are honored (desktop / legacy callers).
+// Prefer ResolveModelForClient / ResolveModelForCodex on the HTTP proxy.
+func (s Settings) ResolveModel(requested string) string {
+	return s.resolveModel(requested, s.ForceModel())
+}
+
+// ResolveModelForClient honors the model id chosen by Kilo / OpenCode / SDKs.
+// Only aliases (default/proxy/…) map to the global DefaultModel — force_default is ignored.
+func (s Settings) ResolveModelForClient(requested string) string {
+	return s.resolveModel(requested, false)
+}
+
+// ResolveModelForCodex honors client model (same as ResolveModelForClient).
+// Force only applies when ForceDefaultModel is explicitly true in settings.
+func (s Settings) ResolveModelForCodex(requested string) string {
+	return s.resolveModel(requested, s.ForceModel())
+}
+
+func (s Settings) resolveModel(requested string, force bool) string {
+	req := strings.TrimSpace(requested)
+	low := strings.ToLower(req)
+	alias := req == "" ||
+		low == "default" || low == "proxy" || low == "auto" ||
+		low == "grok-desktop" || low == "global" || low == "current"
+	def := strings.TrimSpace(s.DefaultModel)
+	if def == "" {
+		def = s.ProviderDefaultModel()
+	}
+	if alias {
+		req = def
+	} else if force {
+		// Force rewrites junk / wrong-provider models to the global default,
+		// but does not swallow an explicit model that belongs to the active provider.
+		if !s.isNativeModelForProvider(req) {
+			req = def
+		}
+	}
+	// strip publisher prefix if present
+	if i := strings.LastIndex(req, "/models/"); i >= 0 {
+		req = req[i+len("/models/"):]
+	}
+	// strip -responses / @responses for upstream id
+	low = strings.ToLower(req)
+	switch {
+	case strings.HasSuffix(low, "-responses"):
+		req = req[:len(req)-len("-responses")]
+	case strings.HasSuffix(low, "@responses"):
+		req = req[:len(req)-len("@responses")]
+	case strings.HasSuffix(low, "/responses"):
+		req = req[:len(req)-len("/responses")]
+	}
+	// Friendly Ollie aliases
+	if s.IsOllie() {
+		req = normalizeOllieModelAlias(req)
+	}
+	// Kimi Work: Desktop aliases → gateway wire id
+	if s.IsKimiWork() {
+		req = resolveKimiWorkModel(req)
+	}
+	return req
+}
+
+func resolveKimiWorkModel(requested string) string {
+	m := strings.ToLower(strings.TrimSpace(requested))
+	switch m {
+	case "", "default", "proxy", "auto", "kimi-work", "kimi-code", "kimi-for-coding",
+		"k3-agent", "k3-max", "k3", "k3-agent-swarm", "k3-agent-ultra", "k3-swarm",
+		"k2d6-agent", "k2p6", "k2p6-agent", "kimi-for-coding-chat":
+		return KimiWorkDefaultModel
+	default:
+		if looksLikeKimiWorkModel(m) {
+			return KimiWorkDefaultModel
+		}
+		return strings.TrimSpace(requested)
+	}
+}
+
+// WithProviderForModel returns a copy of settings with Provider/Upstream switched
+// to match the requested model id (so client-selected models route correctly).
+// Unrecognized ids leave settings unchanged.
+func (s Settings) WithProviderForModel(requested string) Settings {
+	req := strings.TrimSpace(requested)
+	if req == "" {
+		return s
+	}
+	// aliases stay on active provider
+	low := strings.ToLower(req)
+	if low == "default" || low == "proxy" || low == "auto" || low == "global" || low == "current" || low == "grok-desktop" {
+		return s
+	}
+	id := req
+	if i := strings.LastIndex(id, "/models/"); i >= 0 {
+		id = id[i+len("/models/"):]
+	}
+	id = normalizeOllieModelAlias(id)
+	out := s
+	switch {
+	case looksLikeKimiWorkModel(id):
+		out.Provider = ProviderKimiWork
+		out.UpstreamBase = KimiWorkUpstream
+		out.APIMode = "responses"
+	case looksLikeGeminiModel(id):
+		out.Provider = ProviderGemini
+		if strings.TrimSpace(out.GeminiLocation) == "" {
+			out.GeminiLocation = GeminiDefaultLocation
+		}
+	case looksLikeOllieModel(id):
+		out.Provider = ProviderOllie
+		out.UpstreamBase = OllieUpstream
+	case looksLikeXAIModel(id):
+		out.Provider = ProviderXAI
+		if out.UpstreamBase == "" || strings.Contains(strings.ToLower(out.UpstreamBase), "ollie") ||
+			strings.Contains(strings.ToLower(out.UpstreamBase), "aiplatform") ||
+			strings.Contains(strings.ToLower(out.UpstreamBase), "agent-gw") {
+			out.UpstreamBase = DefaultUpstream
+		}
+	}
+	return out
+}
+
+// isNativeModelForProvider reports whether requested looks like it belongs
+// to the active provider (so force_default should not rewrite it).
+func (s Settings) isNativeModelForProvider(requested string) bool {
+	req := strings.TrimSpace(requested)
+	if req == "" {
+		return false
+	}
+	// Strip path/suffix for classification only.
+	id := req
+	if i := strings.LastIndex(id, "/models/"); i >= 0 {
+		id = id[i+len("/models/"):]
+	}
+	low := strings.ToLower(id)
+	switch {
+	case strings.HasSuffix(low, "-responses"):
+		id = id[:len(id)-len("-responses")]
+	case strings.HasSuffix(low, "@responses"):
+		id = id[:len(id)-len("@responses")]
+	}
+	switch s.NormalizedProvider() {
+	case ProviderOllie:
+		return looksLikeOllieModel(id) || looksLikeOllieModel(normalizeOllieModelAlias(id))
+	case ProviderGemini:
+		return looksLikeGeminiModel(id)
+	case ProviderKimiWork:
+		return looksLikeKimiWorkModel(id)
+	default:
+		return looksLikeXAIModel(id)
+	}
+}
+
+// normalizeOllieModelAlias maps common short names to catalog ids.
+func normalizeOllieModelAlias(id string) string {
+	switch strings.ToLower(strings.TrimSpace(id)) {
+	case "fable", "fable-5", "fable5", "fable 5", "claude-fable", "claude fable 5":
+		return "claude-fable-5"
+	case "sonnet", "sonnet-5", "claude-sonnet", "claude sonnet 5":
+		return "claude-sonnet-5"
+	case "opus", "opus-4", "opus-4-8", "claude-opus", "claude opus":
+		return "claude-opus-4-8"
+	default:
+		return strings.TrimSpace(id)
+	}
+}
+
+func (s Settings) ProviderDefaultModel() string {
+	switch s.NormalizedProvider() {
+	case ProviderOllie:
+		return OllieDefaultModel
+	case ProviderGemini:
+		return GeminiDefaultModel
+	case ProviderKimiWork:
+		return KimiWorkDefaultModel
+	default:
+		return DefaultModel
+	}
+}
+
+// ProviderAuthMode returns "auth" (session/account pool) or "api_key" (direct key/ADC).
+func (s Settings) ProviderAuthMode() string {
+	switch s.NormalizedProvider() {
+	case ProviderXAI, ProviderKimiWork:
+		return AuthModeSession
+	default:
+		return AuthModeAPIKey
+	}
+}
+
+// NormalizedProvider returns xai|kimi_work|ollie|gemini.
+func (s Settings) NormalizedProvider() string {
+	p := strings.ToLower(strings.TrimSpace(s.Provider))
+	switch p {
+	case ProviderOllie, "olliechat", "ollie-chat":
+		return ProviderOllie
+	case ProviderGemini, "google", "vertex", "vertexai", "adc":
+		return ProviderGemini
+	case ProviderKimiWork, "kimi", "kimi-work", "kimiwork", "moonshot-work", "kimi-code":
+		return ProviderKimiWork
+	case "", ProviderXAI, "grok", "x.ai", "cli":
+		return ProviderXAI
+	default:
+		if strings.Contains(strings.ToLower(s.UpstreamBase), "olliechat") {
+			return ProviderOllie
+		}
+		if strings.Contains(strings.ToLower(s.UpstreamBase), "agent-gw.kimi.com") ||
+			strings.Contains(strings.ToLower(s.UpstreamBase), "kimi.com/coding") {
+			return ProviderKimiWork
+		}
+		if strings.Contains(strings.ToLower(s.UpstreamBase), "aiplatform") ||
+			strings.Contains(strings.ToLower(s.UpstreamBase), "generativelanguage") {
+			return ProviderGemini
+		}
+		return ProviderXAI
+	}
+}
+
+func (s Settings) IsOllie() bool     { return s.NormalizedProvider() == ProviderOllie }
+func (s Settings) IsXAI() bool       { return s.NormalizedProvider() == ProviderXAI }
+func (s Settings) IsGemini() bool    { return s.NormalizedProvider() == ProviderGemini }
+func (s Settings) IsKimiWork() bool  { return s.NormalizedProvider() == ProviderKimiWork }
+func (s Settings) IsSessionAuth() bool { return s.ProviderAuthMode() == AuthModeSession }
+
+// EffectiveUpstream returns the base URL including /v1 used for OpenAI-style paths.
+// Gemini does not use this HTTP reverse-proxy base (it uses Vertex REST + ADC).
+func (s Settings) EffectiveUpstream() string {
+	switch s.NormalizedProvider() {
+	case ProviderOllie:
+		b := strings.TrimRight(strings.TrimSpace(s.UpstreamBase), "/")
+		if b == "" || strings.Contains(strings.ToLower(b), "cli-chat-proxy") || strings.Contains(strings.ToLower(b), "grok.com") {
+			return OllieUpstream
+		}
+		if !strings.HasSuffix(b, "/v1") {
+			return b + "/v1"
+		}
+		return b
+	case ProviderKimiWork:
+		b := strings.TrimRight(strings.TrimSpace(s.UpstreamBase), "/")
+		if b == "" || strings.Contains(strings.ToLower(b), "cli-chat-proxy") ||
+			strings.Contains(strings.ToLower(b), "olliechat") ||
+			strings.Contains(strings.ToLower(b), "aiplatform") {
+			return KimiWorkUpstream
+		}
+		if !strings.HasSuffix(b, "/v1") {
+			return b + "/v1"
+		}
+		return b
+	case ProviderGemini:
+		// Informational only — actual calls go through internal/gemini.
+		loc := s.EffectiveGeminiLocation()
+		proj := s.EffectiveGeminiProject()
+		return fmt.Sprintf("https://aiplatform.googleapis.com/v1beta1/projects/%s/locations/%s", proj, loc)
+	default:
+		b := strings.TrimRight(strings.TrimSpace(s.UpstreamBase), "/")
+		if b == "" || strings.Contains(strings.ToLower(b), "olliechat") ||
+			strings.Contains(strings.ToLower(b), "aiplatform") ||
+			strings.Contains(strings.ToLower(b), "agent-gw") {
+			return DefaultUpstream
+		}
+		return b
+	}
+}
+
+func (s Settings) EffectiveGeminiProject() string {
+	if p := strings.TrimSpace(s.GeminiProject); p != "" {
+		return p
+	}
+	if p := strings.TrimSpace(os.Getenv("GOOGLE_CLOUD_PROJECT")); p != "" {
+		return p
+	}
+	if p := strings.TrimSpace(os.Getenv("GCLOUD_PROJECT")); p != "" {
+		return p
+	}
+	// Last-known project from the user's working ADC setup.
+	return "project-84a077f4-4a06-4d1b-ab1"
+}
+
+func (s Settings) EffectiveGeminiLocation() string {
+	if l := strings.TrimSpace(s.GeminiLocation); l != "" {
+		return l
+	}
+	if l := strings.TrimSpace(os.Getenv("GOOGLE_CLOUD_LOCATION")); l != "" {
+		return l
+	}
+	return GeminiDefaultLocation
+}
+
+// ApplyProviderDefaults mutates settings when switching provider (model + upstream).
+// Always resets DefaultModel to a catalog id valid for that provider.
+func (s *Settings) ApplyProviderDefaults(provider string) {
+	s.Provider = strings.ToLower(strings.TrimSpace(provider))
+	if s.Provider == "" {
+		s.Provider = ProviderXAI
+	}
+	switch s.NormalizedProvider() {
+	case ProviderOllie:
+		s.Provider = ProviderOllie
+		s.UpstreamBase = OllieUpstream
+		s.APIMode = "chat"
+		s.DefaultModel = OllieDefaultModel
+		switch strings.ToLower(strings.TrimSpace(s.ReasoningEffort)) {
+		case "xhigh", "high", "":
+			s.ReasoningEffort = "low"
+		}
+	case ProviderGemini:
+		s.Provider = ProviderGemini
+		s.APIMode = "chat"
+		s.DefaultModel = GeminiDefaultModel
+		if strings.TrimSpace(s.GeminiLocation) == "" {
+			s.GeminiLocation = GeminiDefaultLocation
+		}
+		if strings.TrimSpace(s.GeminiProject) == "" {
+			s.GeminiProject = s.EffectiveGeminiProject()
+		}
+		// Informational upstream for UI/health.
+		s.UpstreamBase = s.EffectiveUpstream()
+	case ProviderKimiWork:
+		s.Provider = ProviderKimiWork
+		s.UpstreamBase = KimiWorkUpstream
+		// agent-gw has no /responses — chat/completions only.
+		s.APIMode = "chat"
+		s.DefaultModel = KimiWorkDefaultModel
+	default:
+		s.Provider = ProviderXAI
+		s.UpstreamBase = DefaultUpstream
+		s.DefaultModel = DefaultModel
+		s.APIMode = "responses"
+	}
+}
+
+func looksLikeOllieModel(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	if m == "" {
+		return false
+	}
+	// Kimi Work models are not Ollie even if they contain "kimi".
+	if looksLikeKimiWorkModel(m) {
+		return false
+	}
+	if m == OllieDefaultModel {
+		return true
+	}
+	if strings.Contains(m, "euromodels") || strings.Contains(m, "accounts/") {
+		return true
+	}
+	ollieHints := []string{
+		"claude-", "claude_", "gpt-5", "deepseek-", "qwen-", "minimax-",
+		"glm-", "mimo-", "agnes-", "nemotron-", "north-mini", "big-pickle",
+		"fable", "sonnet-5", "opus-4", "flash-free",
+	}
+	for _, h := range ollieHints {
+		if strings.Contains(m, h) {
+			return true
+		}
+	}
+	// legacy ollie catalog may expose kimi-k2.6 etc. without agent suffix
+	if strings.Contains(m, "kimi-k2") || strings.Contains(m, "kimi-k3") {
+		return true
+	}
+	return false
+}
+
+func looksLikeKimiWorkModel(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	if m == "" {
+		return false
+	}
+	switch m {
+	case "kimi-for-coding", "kimi-code", "k3-agent", "k3-agent-swarm", "k3-agent-ultra",
+		"k3-max", "k3-swarm", "k2d6-agent", "k2p6", "k2p6-agent", "kimi-work":
+		return true
+	}
+	if strings.Contains(m, "kimi-for-coding") {
+		return true
+	}
+	if strings.HasSuffix(m, "-agent") && (strings.HasPrefix(m, "k3") || strings.HasPrefix(m, "k2") || strings.Contains(m, "kimi")) {
+		return true
+	}
+	if strings.Contains(m, "agent-swarm") {
+		return true
+	}
+	return false
+}
+
+func looksLikeXAIModel(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	return strings.HasPrefix(m, "grok-") || strings.Contains(m, "grok-")
+}
+
+func looksLikeGeminiModel(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	if m == "" {
+		return false
+	}
+	return strings.Contains(m, "gemini") || strings.HasPrefix(m, "publishers/google/models/")
+}
+
+// SanitizeModelForProvider ensures DefaultModel matches the active provider.
+func (s *Settings) SanitizeModelForProvider() {
+	switch s.NormalizedProvider() {
+	case ProviderOllie:
+		if s.DefaultModel == "" || looksLikeXAIModel(s.DefaultModel) || looksLikeGeminiModel(s.DefaultModel) || looksLikeKimiWorkModel(s.DefaultModel) {
+			s.DefaultModel = OllieDefaultModel
+		}
+	case ProviderGemini:
+		if s.DefaultModel == "" || looksLikeXAIModel(s.DefaultModel) || looksLikeOllieModel(s.DefaultModel) || looksLikeKimiWorkModel(s.DefaultModel) {
+			s.DefaultModel = GeminiDefaultModel
+		}
+		if strings.TrimSpace(s.GeminiLocation) == "" {
+			s.GeminiLocation = GeminiDefaultLocation
+		}
+		if strings.TrimSpace(s.GeminiProject) == "" {
+			s.GeminiProject = s.EffectiveGeminiProject()
+		}
+	case ProviderKimiWork:
+		if s.DefaultModel == "" || looksLikeXAIModel(s.DefaultModel) || looksLikeOllieModel(s.DefaultModel) || looksLikeGeminiModel(s.DefaultModel) {
+			s.DefaultModel = KimiWorkDefaultModel
+		}
+		if s.UpstreamBase == "" || strings.Contains(strings.ToLower(s.UpstreamBase), "cli-chat-proxy") ||
+			strings.Contains(strings.ToLower(s.UpstreamBase), "olliechat") {
+			s.UpstreamBase = KimiWorkUpstream
+		}
+		// Always force chat/completions for Kimi Work.
+		s.APIMode = "chat"
+	default:
+		if s.DefaultModel == "" || looksLikeOllieModel(s.DefaultModel) || looksLikeGeminiModel(s.DefaultModel) || looksLikeKimiWorkModel(s.DefaultModel) {
+			s.DefaultModel = DefaultModel
+		}
+		if strings.Contains(strings.ToLower(s.UpstreamBase), "olliechat") ||
+			strings.Contains(strings.ToLower(s.UpstreamBase), "aiplatform") ||
+			strings.Contains(strings.ToLower(s.UpstreamBase), "agent-gw") {
+			s.UpstreamBase = DefaultUpstream
+		}
+	}
+}
+
+// ProviderCatalog is the static UI/backend catalog for multi-route providers.
+func ProviderCatalog() []map[string]any {
+	return []map[string]any{
+		{
+			"id": ProviderXAI, "name": "Grok (xAI)", "auth_mode": AuthModeSession,
+			"description": "OAuth device login · multi-conta",
+			"default_model": DefaultModel, "default_api": "responses",
+		},
+		{
+			"id": ProviderKimiWork, "name": "Kimi Work", "auth_mode": AuthModeSession,
+			"description": "Google browser login → sk-kimi · multi-conta · chat/completions",
+			"default_model": KimiWorkDefaultModel, "default_api": "chat",
+		},
+		{
+			"id": ProviderOllie, "name": "OllieChat", "auth_mode": AuthModeAPIKey,
+			"description": "API keyless · sem pool de contas",
+			"default_model": OllieDefaultModel, "default_api": "chat",
+		},
+		{
+			"id": ProviderGemini, "name": "Gemini (ADC)", "auth_mode": AuthModeAPIKey,
+			"description": "Google ADC / projeto · sem pool de contas",
+			"default_model": GeminiDefaultModel, "default_api": "chat",
+		},
+	}
 }
 
 type UsageTotals struct {
@@ -101,17 +735,19 @@ type RequestSample struct {
 // Layout under AppData:
 //
 //	%LOCALAPPDATA%/GrokDesktop/
-//	  settings.json
-//	  usage.json
-//	  accounts/
-//	    <account-id>.json
-//	  logs/   (reserved)
+//	  grokdesktop.db   (SQLite — accounts, settings, usage, history)
+//	  accounts/        (legacy JSON, imported once then kept as backup)
+//	  settings.json    (legacy)
+//	  usage.json       (legacy)
+//	  history.json     (legacy)
+//	  logs/
 type Store struct {
 	mu       sync.RWMutex
 	root     string
+	db       *sql.DB
 	settings Settings
 	usage    map[string]UsageTotals
-	// accounts loaded from accounts/*.json
+	// accounts loaded from SQLite (JSON migrated on first open)
 	accounts map[string]Account
 	// recent request samples (persisted, capped)
 	history []RequestSample
@@ -172,24 +808,90 @@ func Open(root string) (*Store, error) {
 		usage:    map[string]UsageTotals{},
 		settings: defaultSettings(),
 	}
-	if err := s.loadAll(); err != nil {
-		return nil, err
+	if err := s.initDB(); err != nil {
+		return nil, fmt.Errorf("sqlite open: %w", err)
 	}
-	// One-time migrations
+	// Import legacy JSON once into SQLite (idempotent).
+	if _, err := s.migrateJSONToSQLite(); err != nil {
+		// non-fatal: continue with empty/partial
+	}
+	if err := s.loadFromSQLite(); err != nil {
+		return nil, fmt.Errorf("sqlite load: %w", err)
+	}
+	// One-time migrations from older app formats
 	_ = s.migrateFromLegacy()
+	// Bump stale client version baked into older installs.
+	if s.settings.ClientVersion == "" || s.settings.ClientVersion == "0.2.93" {
+		s.settings.ClientVersion = DefaultClientVersion
+		_ = s.saveSettingsLocked()
+	}
+	// Fix cross-provider leftover models (e.g. claude-* stuck after switching back to xAI).
+	beforeModel := s.settings.DefaultModel
+	beforeEffort := s.settings.ReasoningEffort
+	s.settings.SanitizeModelForProvider()
+	if s.settings.IsOllie() {
+		switch strings.ToLower(strings.TrimSpace(s.settings.ReasoningEffort)) {
+		case "xhigh", "high":
+			s.settings.ReasoningEffort = "low"
+		}
+	}
+	if s.settings.DefaultModel != beforeModel || s.settings.ReasoningEffort != beforeEffort {
+		_ = s.saveSettingsLocked()
+	}
+	// ensure active account belongs to current provider when possible
+	if s.settings.ActiveAccountID != "" {
+		if a, ok := s.accounts[s.settings.ActiveAccountID]; !ok {
+			s.settings.ActiveAccountID = ""
+		} else if a.NormalizedProvider() != s.settings.NormalizedProvider() && s.settings.IsSessionAuth() {
+			// keep id but PreferHealthyActive will pick a usable one for active provider
+		}
+	}
+	if s.settings.ActiveAccountID == "" {
+		want := s.settings.NormalizedProvider()
+		for id, a := range s.accounts {
+			if a.NormalizedProvider() == want {
+				s.settings.ActiveAccountID = id
+				break
+			}
+		}
+		if s.settings.ActiveAccountID != "" {
+			_ = s.saveSettingsLocked()
+		}
+	}
+	// Pull fresher tokens from official Grok CLI if present.
+	if n, err := s.SyncFromGrokCLI(); err == nil && n > 0 {
+		_ = s.PreferHealthyActive()
+	} else {
+		_ = s.PreferHealthyActive()
+	}
 	return s, nil
 }
 
+// Close releases the SQLite handle.
+func (s *Store) Close() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.db != nil {
+		err := s.db.Close()
+		s.db = nil
+		return err
+	}
+	return nil
+}
+
 func defaultSettings() Settings {
+	force := false
 	return Settings{
-		DefaultModel:    DefaultModel,
-		ReasoningEffort: DefaultEffort,
-		APIMode:         "responses",
-		UpstreamBase:    DefaultUpstream,
-		ClientVersion:   DefaultClientVersion,
-		ProxyListen:     "127.0.0.1:8787",
-		ProxyEnabled:    true,
-		StoreResponses:  true,
+		Provider:          ProviderXAI,
+		DefaultModel:      DefaultModel,
+		ReasoningEffort:   DefaultEffort,
+		APIMode:           "responses",
+		UpstreamBase:      DefaultUpstream,
+		ClientVersion:     DefaultClientVersion,
+		ProxyListen:       "127.0.0.1:8787",
+		ProxyEnabled:      true,
+		StoreResponses:    true,
+		ForceDefaultModel: &force,
 	}
 }
 
@@ -210,8 +912,9 @@ func (s *Store) accountPath(id string) string {
 func (s *Store) loadAll() error {
 	// settings
 	if b, err := os.ReadFile(s.settingsPath()); err == nil {
+		b = stripUTF8BOM(b)
 		var st Settings
-		if json.Unmarshal(b, &st) == nil {
+		if err := json.Unmarshal(b, &st); err == nil {
 			s.settings = mergeSettings(defaultSettings(), st)
 		}
 	} else if !os.IsNotExist(err) {
@@ -252,8 +955,21 @@ func (s *Store) loadAll() error {
 			continue
 		}
 		var a Account
-		if json.Unmarshal(b, &a) != nil || a.ID == "" || a.AccessToken == "" {
+		if json.Unmarshal(b, &a) != nil || a.ID == "" {
 			continue
+		}
+		// Legacy xAI accounts have no provider field.
+		if strings.TrimSpace(a.Provider) == "" {
+			a.Provider = ProviderXAI
+		}
+		a.Provider = a.NormalizedProvider()
+		// Accept OAuth bearer or provider API keys (Kimi sk-kimi).
+		if a.AccessToken == "" && a.APIKey == "" {
+			continue
+		}
+		// Kimi keys sometimes stored only in AccessToken by mistake.
+		if a.NormalizedProvider() == ProviderKimiWork && a.APIKey == "" && strings.HasPrefix(a.AccessToken, "sk-kimi-") {
+			a.APIKey = a.AccessToken
 		}
 		s.accounts[a.ID] = a
 	}
@@ -274,6 +990,9 @@ func (s *Store) loadAll() error {
 }
 
 func mergeSettings(base, over Settings) Settings {
+	if over.Provider != "" {
+		base.Provider = over.Provider
+	}
 	if over.DefaultModel != "" {
 		base.DefaultModel = over.DefaultModel
 	}
@@ -297,6 +1016,15 @@ func mergeSettings(base, over Settings) Settings {
 		base.ProxyAPIKey = over.ProxyAPIKey
 	}
 	base.StoreResponses = over.StoreResponses
+	if over.ForceDefaultModel != nil {
+		base.ForceDefaultModel = over.ForceDefaultModel
+	}
+	if over.GeminiProject != "" {
+		base.GeminiProject = over.GeminiProject
+	}
+	if over.GeminiLocation != "" {
+		base.GeminiLocation = over.GeminiLocation
+	}
 	if over.ActiveAccountID != "" {
 		base.ActiveAccountID = over.ActiveAccountID
 	}
@@ -304,6 +1032,13 @@ func mergeSettings(base, over Settings) Settings {
 		base.ThemeAccent = over.ThemeAccent
 	}
 	return base
+}
+
+func stripUTF8BOM(b []byte) []byte {
+	if len(b) >= 3 && b[0] == 0xEF && b[1] == 0xBB && b[2] == 0xBF {
+		return b[3:]
+	}
+	return b
 }
 
 func writeJSON(path string, v any) error {
@@ -319,19 +1054,42 @@ func writeJSON(path string, v any) error {
 }
 
 func (s *Store) saveSettingsLocked() error {
-	return writeJSON(s.settingsPath(), s.settings)
+	if s.db != nil {
+		if err := s.saveSettingsDB(s.settings); err != nil {
+			return err
+		}
+	}
+	// dual-write legacy JSON for safety during transition
+	_ = writeJSON(s.settingsPath(), s.settings)
+	return nil
 }
 
 func (s *Store) saveUsageLocked() error {
-	return writeJSON(s.usagePath(), s.usage)
+	if s.db != nil {
+		if err := s.saveUsageDB(s.usage); err != nil {
+			return err
+		}
+	}
+	_ = writeJSON(s.usagePath(), s.usage)
+	return nil
 }
 
 func (s *Store) saveHistoryLocked() error {
-	return writeJSON(s.historyPath(), s.history)
+	// history rows are inserted one-by-one via insertHistoryDB in RecordRequest
+	_ = writeJSON(s.historyPath(), s.history)
+	return nil
 }
 
 func (s *Store) saveAccountLocked(a Account) error {
-	return writeJSON(s.accountPath(a.ID), a)
+	a.DeviceID = cleanDeviceID(a.DeviceID)
+	if s.db != nil {
+		if err := s.saveAccountDB(a); err != nil {
+			return err
+		}
+	}
+	// dual-write JSON backup
+	_ = writeJSON(s.accountPath(a.ID), a)
+	return nil
 }
 
 func (s *Store) Path() string { return s.root }
@@ -458,20 +1216,83 @@ func (s *Store) ListAccounts() []Account {
 	return out
 }
 
-func (s *Store) PublicAccounts() []map[string]any {
+// ListAccountsForProvider returns accounts belonging to provider (empty provider → active settings provider).
+func (s *Store) ListAccountsForProvider(provider string) []Account {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	want := strings.ToLower(strings.TrimSpace(provider))
+	if want == "" {
+		want = s.settings.NormalizedProvider()
+	}
+	switch want {
+	case "kimi", "kimi-work", "kimiwork":
+		want = ProviderKimiWork
+	case "grok", "x.ai":
+		want = ProviderXAI
+	}
+	out := make([]Account, 0)
+	for _, a := range s.accounts {
+		if a.NormalizedProvider() == want {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+func (s *Store) PublicAccounts() []map[string]any {
+	return s.PublicAccountsForProvider("")
+}
+
+// PublicAccountsForProvider filters the account list for the UI rail / modal.
+func (s *Store) PublicAccountsForProvider(provider string) []map[string]any {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	want := strings.ToLower(strings.TrimSpace(provider))
+	if want == "" {
+		want = s.settings.NormalizedProvider()
+	}
+	switch want {
+	case "kimi", "kimi-work", "kimiwork":
+		want = ProviderKimiWork
+	case "grok", "x.ai":
+		want = ProviderXAI
+	}
+	// API-key providers have no session account pool.
+	if want == ProviderOllie || want == ProviderGemini {
+		return []map[string]any{}
+	}
 	out := make([]map[string]any, 0, len(s.accounts))
 	for _, a := range s.accounts {
+		if a.NormalizedProvider() != want {
+			continue
+		}
 		u := s.usage[a.ID]
+		keyHint := ""
+		if k := a.APIKey; k != "" {
+			if len(k) > 14 {
+				keyHint = k[:10] + "…" + k[len(k)-4:]
+			} else {
+				keyHint = k
+			}
+		}
 		out = append(out, map[string]any{
-			"id":         a.ID,
-			"label":      a.Label,
-			"email":      a.Email,
-			"team_id":    a.TeamID,
-			"expires_at": a.ExpiresAt,
-			"expired":    a.Expired(),
-			"active":     a.ID == s.settings.ActiveAccountID,
+			"id":                 a.ID,
+			"provider":           a.NormalizedProvider(),
+			"label":              a.Label,
+			"email":              a.Email,
+			"user_id":            a.UserID,
+			"team_id":            a.TeamID,
+			"source":             a.Source,
+			"api_key_hint":       keyHint,
+			"expires_at":         a.ExpiresAt,
+			"expired":            a.Expired(),
+			"exhausted":          a.Exhausted(),
+			"exhausted_at":       a.ExhaustedAt,
+			"exhaust_reason":     a.ExhaustReason,
+			"auth_denied":        a.AuthDenied(),
+			"auth_denied_at":     a.AuthDeniedAt,
+			"auth_denied_reason": a.AuthDeniedReason,
+			"active":             a.ID == s.settings.ActiveAccountID,
 			"usage": map[string]any{
 				"prompt_tokens":     u.PromptTokens,
 				"completion_tokens": u.CompletionTokens,
@@ -517,18 +1338,407 @@ func (s *Store) GetAccount(id string) (*Account, bool) {
 func (s *Store) ActiveAccount() (*Account, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	want := s.settings.NormalizedProvider()
 	id := s.settings.ActiveAccountID
 	if id != "" {
-		if a, ok := s.accounts[id]; ok {
+		if a, ok := s.accounts[id]; ok && a.NormalizedProvider() == want {
 			cp := a
 			return &cp, true
 		}
 	}
 	for _, a := range s.accounts {
+		if a.NormalizedProvider() != want {
+			continue
+		}
 		cp := a
 		return &cp, true
 	}
 	return nil, false
+}
+
+// PreferUsableAccount returns the active account if still usable; otherwise the first
+// non-exhausted / non-auth-denied account for the active provider.
+func (s *Store) PreferUsableAccount() (*Account, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	want := s.settings.NormalizedProvider()
+	try := func(id string) (*Account, bool) {
+		if id == "" {
+			return nil, false
+		}
+		a, ok := s.accounts[id]
+		if !ok || !a.Usable() || a.NormalizedProvider() != want {
+			return nil, false
+		}
+		cp := a
+		return &cp, true
+	}
+	if acc, ok := try(s.settings.ActiveAccountID); ok {
+		return acc, true
+	}
+	var fallback *Account
+	for _, a := range s.accounts {
+		if a.NormalizedProvider() != want || !a.Usable() {
+			continue
+		}
+		cp := a
+		// Prefer non-expired tokens when several remain.
+		if !cp.Expired() {
+			return &cp, true
+		}
+		if fallback == nil {
+			fallback = &cp
+		}
+	}
+	if fallback != nil {
+		return fallback, true
+	}
+	return nil, false
+}
+
+// NextUsableAccountID picks another usable account excluding exceptID (same provider as active settings).
+func (s *Store) NextUsableAccountID(exceptID string) string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	want := s.settings.NormalizedProvider()
+	if exceptID != "" {
+		if a, ok := s.accounts[exceptID]; ok {
+			want = a.NormalizedProvider()
+		}
+	}
+	var fallback string
+	for _, a := range s.accounts {
+		if a.ID == exceptID || !a.Usable() || a.NormalizedProvider() != want {
+			continue
+		}
+		if !a.Expired() {
+			return a.ID
+		}
+		if fallback == "" {
+			fallback = a.ID
+		}
+	}
+	return fallback
+}
+
+// PreferHealthyActive switches active to a usable non-expired account when current is dead.
+func (s *Store) PreferHealthyActive() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	want := s.settings.NormalizedProvider()
+	curID := s.settings.ActiveAccountID
+	if curID != "" {
+		if a, ok := s.accounts[curID]; ok && a.NormalizedProvider() == want && a.Usable() && !a.Expired() {
+			return false
+		}
+	}
+	var bestID string
+	var bestExp time.Time
+	for _, a := range s.accounts {
+		if a.NormalizedProvider() != want || !a.Usable() || a.Expired() {
+			continue
+		}
+		if bestID == "" || a.ExpiresAt.After(bestExp) {
+			bestID = a.ID
+			bestExp = a.ExpiresAt
+		}
+	}
+	if bestID == "" || bestID == curID {
+		return false
+	}
+	s.settings.ActiveAccountID = bestID
+	_ = s.saveSettingsLocked()
+	return true
+}
+
+// MarkExhausted stamps quota exhaustion on an account.
+func (s *Store) MarkExhausted(id, reason string) (*Account, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	a, ok := s.accounts[id]
+	if !ok {
+		return nil, fmt.Errorf("account not found: %s", id)
+	}
+	now := time.Now().UTC()
+	a.ExhaustedAt = now
+	a.ExhaustReason = reason
+	a.UpdatedAt = now
+	// Keep label informative without relying only on string matching.
+	low := strings.ToLower(a.Label)
+	if !strings.Contains(low, "esgotada") {
+		if a.Email != "" {
+			a.Label = "esgotada · " + a.Email
+		} else if len(a.ID) >= 8 {
+			a.Label = "esgotada · " + a.ID[:8]
+		} else {
+			a.Label = "esgotada"
+		}
+	}
+	s.accounts[id] = a
+	if err := s.saveAccountLocked(a); err != nil {
+		return nil, err
+	}
+	cp := a
+	return &cp, nil
+}
+
+// ClearExhausted removes quota exhaustion (e.g. after re-auth / new credits).
+func (s *Store) ClearExhausted(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	a, ok := s.accounts[id]
+	if !ok {
+		return fmt.Errorf("account not found: %s", id)
+	}
+	if a.ExhaustedAt.IsZero() && a.ExhaustReason == "" {
+		return nil
+	}
+	a.ExhaustedAt = time.Time{}
+	a.ExhaustReason = ""
+	a.UpdatedAt = time.Now().UTC()
+	// Strip esgotada prefix from label if we set it.
+	if strings.HasPrefix(strings.ToLower(a.Label), "esgotada") {
+		if a.Email != "" {
+			a.Label = a.Email
+		} else if len(a.ID) >= 8 {
+			a.Label = "Conta " + a.ID[:8]
+		}
+	}
+	s.accounts[id] = a
+	return s.saveAccountLocked(a)
+}
+
+// MarkAuthDenied stamps chat/auth rejection so the account is skipped by PreferUsable.
+func (s *Store) MarkAuthDenied(id, reason string) (*Account, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	a, ok := s.accounts[id]
+	if !ok {
+		return nil, fmt.Errorf("account not found: %s", id)
+	}
+	now := time.Now().UTC()
+	a.AuthDeniedAt = now
+	a.AuthDeniedReason = reason
+	a.UpdatedAt = now
+	low := strings.ToLower(a.Label)
+	if !strings.Contains(low, "auth-denied") && !strings.Contains(low, "bloqueada") {
+		if a.Email != "" {
+			a.Label = "auth-denied · " + a.Email
+		} else if len(a.ID) >= 8 {
+			a.Label = "auth-denied · " + a.ID[:8]
+		} else {
+			a.Label = "auth-denied"
+		}
+	}
+	s.accounts[id] = a
+	if err := s.saveAccountLocked(a); err != nil {
+		return nil, err
+	}
+	cp := a
+	return &cp, nil
+}
+
+// ClearAuthDenied clears a previous chat/auth rejection (e.g. after fresh tokens).
+func (s *Store) ClearAuthDenied(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	a, ok := s.accounts[id]
+	if !ok {
+		return fmt.Errorf("account not found: %s", id)
+	}
+	if a.AuthDeniedAt.IsZero() && a.AuthDeniedReason == "" {
+		return nil
+	}
+	a.AuthDeniedAt = time.Time{}
+	a.AuthDeniedReason = ""
+	a.UpdatedAt = time.Now().UTC()
+	if strings.HasPrefix(strings.ToLower(a.Label), "auth-denied") {
+		if a.Email != "" {
+			a.Label = a.Email
+		} else if len(a.ID) >= 8 {
+			a.Label = "Conta " + a.ID[:8]
+		}
+	}
+	s.accounts[id] = a
+	return s.saveAccountLocked(a)
+}
+
+// ClearAuthState clears both quota and auth-denied marks after a successful re-auth.
+func (s *Store) ClearAuthState(id string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	a, ok := s.accounts[id]
+	if !ok {
+		return fmt.Errorf("account not found: %s", id)
+	}
+	a.ExhaustedAt = time.Time{}
+	a.ExhaustReason = ""
+	a.AuthDeniedAt = time.Time{}
+	a.AuthDeniedReason = ""
+	a.UpdatedAt = time.Now().UTC()
+	low := strings.ToLower(a.Label)
+	if strings.HasPrefix(low, "esgotada") || strings.HasPrefix(low, "auth-denied") {
+		if a.Email != "" {
+			a.Label = a.Email
+		} else if len(a.ID) >= 8 {
+			a.Label = "Conta " + a.ID[:8]
+		}
+	}
+	s.accounts[id] = a
+	return s.saveAccountLocked(a)
+}
+
+// grokCLIAuthPath is ~/.grok/auth.json (official Grok CLI OIDC store).
+func grokCLIAuthPath() (string, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return "", err
+	}
+	return filepath.Join(home, ".grok", "auth.json"), nil
+}
+
+// SyncFromGrokCLI imports fresher OAuth tokens from the official Grok CLI auth.json.
+// Returns how many accounts were updated or inserted.
+func (s *Store) SyncFromGrokCLI() (int, error) {
+	path, err := grokCLIAuthPath()
+	if err != nil {
+		return 0, err
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, err
+	}
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(b, &root); err != nil {
+		return 0, err
+	}
+	updated := 0
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, raw := range root {
+		var entry map[string]any
+		if json.Unmarshal(raw, &entry) != nil {
+			continue
+		}
+		access := str(entry["key"])
+		if access == "" {
+			access = str(entry["access_token"])
+		}
+		if access == "" {
+			continue
+		}
+		refresh := str(entry["refresh_token"])
+		email := str(entry["email"])
+		userID := str(entry["user_id"])
+		if userID == "" {
+			userID = str(entry["principal_id"])
+		}
+		teamID := str(entry["team_id"])
+		clientID := str(entry["oidc_client_id"])
+		if clientID == "" {
+			clientID = DefaultClientID
+		}
+		issuer := str(entry["oidc_issuer"])
+		if issuer == "" {
+			issuer = DefaultIssuer
+		}
+		var exp time.Time
+		if es := str(entry["expires_at"]); es != "" {
+			if t, e := time.Parse(time.RFC3339Nano, es); e == nil {
+				exp = t.UTC()
+			} else if t, e := time.Parse(time.RFC3339, es); e == nil {
+				exp = t.UTC()
+			}
+		}
+		id := userID
+		if id == "" {
+			if email == "" {
+				continue
+			}
+			id = email
+		}
+		if old, ok := s.accounts[id]; ok {
+			sameToken := old.AccessToken == access
+			cliFresher := !exp.IsZero() && (old.ExpiresAt.IsZero() || exp.After(old.ExpiresAt.Add(30*time.Second)))
+			oldDead := old.Expired() || old.AuthDenied() || old.Exhausted() || old.AccessToken == ""
+			if sameToken && !oldDead {
+				continue
+			}
+			if !cliFresher && !oldDead && old.AccessToken != "" {
+				if !old.ExpiresAt.IsZero() && (exp.IsZero() || !exp.After(old.ExpiresAt)) {
+					continue
+				}
+			}
+			a := old
+			a.AccessToken = access
+			if refresh != "" {
+				a.RefreshToken = refresh
+			}
+			if !exp.IsZero() {
+				a.ExpiresAt = exp
+			}
+			if email != "" {
+				a.Email = email
+			}
+			if teamID != "" {
+				a.TeamID = teamID
+			}
+			if userID != "" {
+				a.UserID = userID
+			}
+			a.ClientID = clientID
+			a.Issuer = issuer
+			a.ExhaustedAt = time.Time{}
+			a.ExhaustReason = ""
+			a.AuthDeniedAt = time.Time{}
+			a.AuthDeniedReason = ""
+			a.UpdatedAt = time.Now().UTC()
+			low := strings.ToLower(a.Label)
+			if strings.HasPrefix(low, "esgotada") || strings.HasPrefix(low, "auth-denied") {
+				if a.Email != "" {
+					a.Label = a.Email
+				}
+			}
+			if a.Label == "" || a.Label == "Grok account" {
+				if a.Email != "" {
+					a.Label = a.Email
+				}
+			}
+			s.accounts[id] = a
+			_ = s.saveAccountLocked(a)
+			updated++
+			continue
+		}
+		now := time.Now().UTC()
+		a := Account{
+			ID:           id,
+			Label:        email,
+			Email:        email,
+			TeamID:       teamID,
+			UserID:       userID,
+			AccessToken:  access,
+			RefreshToken: refresh,
+			ExpiresAt:    exp,
+			ClientID:     clientID,
+			Issuer:       issuer,
+			CreatedAt:    now,
+			UpdatedAt:    now,
+		}
+		if a.Label == "" {
+			a.Label = "Grok CLI"
+		}
+		s.accounts[id] = a
+		_ = s.saveAccountLocked(a)
+		if s.settings.ActiveAccountID == "" {
+			s.settings.ActiveAccountID = id
+			_ = s.saveSettingsLocked()
+		}
+		updated++
+	}
+	return updated, nil
 }
 
 func (s *Store) UpsertAccount(a Account) error {
@@ -538,6 +1748,10 @@ func (s *Store) UpsertAccount(a Account) error {
 	if a.ID == "" {
 		return errors.New("account id required")
 	}
+	if strings.TrimSpace(a.Provider) == "" {
+		a.Provider = ProviderXAI
+	}
+	a.Provider = a.NormalizedProvider()
 	if a.CreatedAt.IsZero() {
 		if old, ok := s.accounts[a.ID]; ok {
 			a.CreatedAt = old.CreatedAt
@@ -547,7 +1761,16 @@ func (s *Store) UpsertAccount(a Account) error {
 	}
 	a.UpdatedAt = now
 	s.accounts[a.ID] = a
-	if s.settings.ActiveAccountID == "" {
+	// Activate if empty or active belongs to another provider.
+	activate := s.settings.ActiveAccountID == ""
+	if !activate {
+		if cur, ok := s.accounts[s.settings.ActiveAccountID]; !ok || cur.NormalizedProvider() != a.NormalizedProvider() {
+			if s.settings.NormalizedProvider() == a.NormalizedProvider() {
+				activate = true
+			}
+		}
+	}
+	if activate && s.settings.NormalizedProvider() == a.NormalizedProvider() {
 		s.settings.ActiveAccountID = a.ID
 		_ = s.saveSettingsLocked()
 	}
@@ -557,13 +1780,23 @@ func (s *Store) UpsertAccount(a Account) error {
 func (s *Store) RemoveAccount(id string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	old, had := s.accounts[id]
 	delete(s.accounts, id)
+	if s.db != nil {
+		_ = s.deleteAccountDB(id)
+	}
 	_ = os.Remove(s.accountPath(id))
 	if s.settings.ActiveAccountID == id {
 		s.settings.ActiveAccountID = ""
-		for k := range s.accounts {
-			s.settings.ActiveAccountID = k
-			break
+		want := s.settings.NormalizedProvider()
+		if had {
+			want = old.NormalizedProvider()
+		}
+		for k, a := range s.accounts {
+			if a.NormalizedProvider() == want {
+				s.settings.ActiveAccountID = k
+				break
+			}
 		}
 		_ = s.saveSettingsLocked()
 	}
@@ -617,6 +1850,9 @@ func (s *Store) RecordRequest(sample RequestSample) error {
 	const maxHist = 200
 	if len(s.history) > maxHist {
 		s.history = s.history[:maxHist]
+	}
+	if s.db != nil {
+		_ = s.insertHistoryDB(sample)
 	}
 	if err := s.saveUsageLocked(); err != nil {
 		return err

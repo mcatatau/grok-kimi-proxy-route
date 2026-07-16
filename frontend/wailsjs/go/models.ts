@@ -80,6 +80,7 @@ export namespace store {
 	
 	export class Settings {
 	    active_account_id: string;
+	    provider?: string;
 	    default_model: string;
 	    reasoning_effort: string;
 	    api_mode: string;
@@ -89,6 +90,9 @@ export namespace store {
 	    proxy_enabled: boolean;
 	    proxy_api_key?: string;
 	    store_responses: boolean;
+	    force_default_model?: boolean;
+	    gemini_project?: string;
+	    gemini_location?: string;
 	    theme_accent?: string;
 	
 	    static createFrom(source: any = {}) {
@@ -98,6 +102,7 @@ export namespace store {
 	    constructor(source: any = {}) {
 	        if ('string' === typeof source) source = JSON.parse(source);
 	        this.active_account_id = source["active_account_id"];
+	        this.provider = source["provider"];
 	        this.default_model = source["default_model"];
 	        this.reasoning_effort = source["reasoning_effort"];
 	        this.api_mode = source["api_mode"];
@@ -107,6 +112,9 @@ export namespace store {
 	        this.proxy_enabled = source["proxy_enabled"];
 	        this.proxy_api_key = source["proxy_api_key"];
 	        this.store_responses = source["store_responses"];
+	        this.force_default_model = source["force_default_model"];
+	        this.gemini_project = source["gemini_project"];
+	        this.gemini_location = source["gemini_location"];
 	        this.theme_accent = source["theme_accent"];
 	    }
 	}

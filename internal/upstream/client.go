@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	"grok-desktop/internal/gemini"
+	"grok-desktop/internal/httperr"
 	"grok-desktop/internal/store"
 )
 
@@ -84,42 +86,74 @@ type ModelInfo struct {
 }
 
 func (c *Client) baseURL(s store.Settings) string {
-	b := strings.TrimRight(s.UpstreamBase, "/")
-	if b == "" {
-		b = store.DefaultUpstream
-	}
-	return b
+	return s.EffectiveUpstream()
 }
 
-func (c *Client) authHeaders(token, version string) http.Header {
+func (c *Client) authHeaders(token, version string, settings store.Settings) http.Header {
 	h := make(http.Header)
+	if token == "" && settings.IsOllie() {
+		token = store.OllieAPIKey
+	}
 	h.Set("Authorization", "Bearer "+token)
 	h.Set("Content-Type", "application/json")
 	h.Set("Accept", "text/event-stream, application/json")
 	if version == "" {
 		version = store.DefaultClientVersion
 	}
-	h.Set("x-grok-client-version", version)
-	h.Set("User-Agent", "grok-desktop/"+version)
+	switch {
+	case settings.IsOllie():
+		h.Set("User-Agent", "grok-desktop-ollie/"+version)
+	case settings.IsKimiWork():
+		h.Set("User-Agent", store.KimiWorkUserAgent)
+		h.Set("X-Msh-Platform", "kimi-code-cli")
+		h.Set("X-Msh-Version", "0.23.5")
+	default:
+		// Match official Grok CLI headers so cli-chat-proxy accepts the session.
+		h.Set("x-grok-client-version", version)
+		h.Set("x-grok-client-surface", "grok-cli")
+		h.Set("User-Agent", "grok/"+version)
+	}
 	return h
 }
 
 func (c *Client) ListModels(ctx context.Context, token string, settings store.Settings) ([]ModelInfo, error) {
+	if settings.IsGemini() {
+		ids := gemini.ListModels(ctx, settings)
+		out := make([]ModelInfo, 0, len(ids))
+		for _, id := range ids {
+			out = append(out, ModelInfo{
+				ID: id, Name: id, Description: "Vertex AI · ADC", APIMode: "chat",
+			})
+		}
+		return out, nil
+	}
+	if settings.IsKimiWork() {
+		// UI may show "responses" preference, but upstream is chat/completions only.
+		return []ModelInfo{
+			{ID: "kimi-for-coding", Name: "Kimi For Coding (K3 wire)", Description: "agent-gw · chat/completions · K3 rates", APIMode: "chat"},
+			{ID: "k3-agent", Name: "K3 Max (Work)", Description: "Desktop K3 · Max · chat/completions", APIMode: "chat"},
+			{ID: "k3-agent-swarm", Name: "K3 Swarm Max (Work)", Description: "Desktop K3 Swarm · chat/completions", APIMode: "chat"},
+			{ID: "k2d6-agent", Name: "K2.6 Agent (Work)", Description: "Desktop K2.6 · chat/completions", APIMode: "chat"},
+		}, nil
+	}
+	if settings.IsOllie() {
+		return c.listOllieModels(ctx, token, settings)
+	}
 	url := c.baseURL(settings) + "/models"
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
-	req.Header = c.authHeaders(token, settings.ClientVersion)
+	req.Header = c.authHeaders(token, settings.ClientVersion, settings)
 	req.Header.Set("Accept", "application/json")
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	b, _ := io.ReadAll(resp.Body)
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("models HTTP %d: %s", resp.StatusCode, string(b))
+		return nil, fmt.Errorf("%s", httperr.Format("models", resp.StatusCode, resp.Header.Get("Content-Type"), b))
 	}
 	var parsed struct {
 		Data []struct {
@@ -143,6 +177,86 @@ func (c *Client) ListModels(ctx context.Context, token string, settings store.Se
 		})
 	}
 	return out, nil
+}
+
+// listOllieModels fetches /v1/models and also surfaces short public-config aliases.
+func (c *Client) listOllieModels(ctx context.Context, token string, settings store.Settings) ([]ModelInfo, error) {
+	url := c.baseURL(settings) + "/models"
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header = c.authHeaders(token, settings.ClientVersion, settings)
+	req.Header.Set("Accept", "application/json")
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		return ollieFallbackModels(), fmt.Errorf("models HTTP %d: %s", resp.StatusCode, string(b))
+	}
+	var parsed struct {
+		Data []struct {
+			ID   string `json:"id"`
+			Name string `json:"name"`
+		} `json:"data"`
+	}
+	_ = json.Unmarshal(b, &parsed)
+	seen := map[string]bool{}
+	out := make([]ModelInfo, 0, len(parsed.Data)+16)
+	for _, m := range parsed.Data {
+		if m.ID == "" || seen[m.ID] {
+			continue
+		}
+		seen[m.ID] = true
+		name := m.Name
+		if name == "" {
+			name = shortModelName(m.ID)
+		}
+		out = append(out, ModelInfo{
+			ID: m.ID, Name: name, Description: "OllieChat · free keyless", APIMode: "chat",
+		})
+		// Also expose short id when full path is long.
+		if short := shortModelName(m.ID); short != m.ID && !seen[short] {
+			seen[short] = true
+			out = append(out, ModelInfo{
+				ID: short, Name: short, Description: "OllieChat alias → " + m.ID, APIMode: "chat", Root: m.ID,
+			})
+		}
+	}
+	if len(out) == 0 {
+		return ollieFallbackModels(), nil
+	}
+	return out, nil
+}
+
+func shortModelName(id string) string {
+	// accounts/euromodels/models/claude-sonnet-5 → claude-sonnet-5
+	if i := strings.LastIndex(id, "/"); i >= 0 && i+1 < len(id) {
+		return id[i+1:]
+	}
+	return id
+}
+
+func ollieFallbackModels() []ModelInfo {
+	ids := []string{
+		"claude-sonnet-5", "claude-opus-4-8", "claude-fable-5",
+		"gpt-5.5", "gpt-5.6-luna",
+		"deepseek-v4-pro", "deepseek-v4-flash-free",
+		"qwen-3.7-plus", "kimi-k2.7-code", "minimax-m3",
+		"glm-5.2", "glm-5.2-fast", "mimo-v2.5-free",
+		"agnes-2.0-flash", "agnes-1.5-flash",
+		"nemotron-3-ultra-free", "north-mini-code-free", "big-pickle",
+	}
+	out := make([]ModelInfo, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, ModelInfo{
+			ID: id, Name: id, Description: "OllieChat · free keyless", APIMode: "chat",
+		})
+	}
+	return out
 }
 
 func stripResponsesSuffix(model string) (string, bool) {
@@ -181,16 +295,11 @@ func (c *Client) StreamChat(
 	req ChatRequest,
 	emit func(StreamEvent),
 ) error {
-	model, _ := stripResponsesSuffix(req.Model)
-	if model == "" {
-		model = settings.DefaultModel
-	}
+	model := settings.ResolveModel(req.Model)
 	effort := req.ReasoningEffort
 	if effort == "" {
 		effort = settings.ReasoningEffort
 	}
-	// Native web_search / x_search only work on Responses — always use it for desktop chat.
-
 	emit(StreamEvent{
 		Type:    "meta",
 		Account: accountLabel,
@@ -203,7 +312,105 @@ func (c *Client) StreamChat(
 		req.Messages = ensureTemporalContext(append([]ChatMessage{}, req.Messages...))
 	}
 
+	// Gemini: Vertex generateContent via ADC (never hit xAI /responses).
+	if settings.IsGemini() {
+		return c.streamGemini(ctx, settings, model, req, emit)
+	}
+
+	// OllieChat (and explicit chat mode): OpenAI chat/completions.
+	// Kimi Work coding gateway only exposes /chat/completions (no /responses).
+	// Ollie is chat-only. xAI defaults to Responses + native search.
+	if settings.IsKimiWork() || settings.IsOllie() || strings.EqualFold(req.APIMode, "chat") {
+		if settings.IsKimiWork() {
+			model = resolveKimiUpstreamModel(model)
+		}
+		return c.streamChatCompletions(ctx, token, settings, model, effort, req, emit)
+	}
 	return c.streamResponses(ctx, token, settings, model, effort, req, emit)
+}
+
+func resolveKimiUpstreamModel(model string) string {
+	m := strings.ToLower(strings.TrimSpace(model))
+	m = strings.TrimSuffix(m, "-responses")
+	m = strings.TrimSuffix(m, "-chat")
+	switch m {
+	case "", "default", "proxy", "auto", "kimi-work", "kimi-code", "kimi-for-coding",
+		"k3-agent", "k3-max", "k3", "k3-agent-swarm", "k3-agent-ultra", "k3-swarm",
+		"k2d6-agent", "k2p6", "k2p6-agent":
+		return "kimi-for-coding"
+	default:
+		if strings.Contains(m, "kimi") || strings.HasPrefix(m, "k3") || strings.HasPrefix(m, "k2") {
+			return "kimi-for-coding"
+		}
+		if m == "" {
+			return "kimi-for-coding"
+		}
+		return model
+	}
+}
+
+// streamGemini talks to Vertex AI with ADC — used by desktop SendChat.
+func (c *Client) streamGemini(
+	ctx context.Context,
+	settings store.Settings,
+	model string,
+	req ChatRequest,
+	emit func(StreamEvent),
+) error {
+	msgs := make([]map[string]any, 0, len(req.Messages))
+	for _, m := range req.Messages {
+		entry := map[string]any{"role": m.Role, "content": m.Content}
+		if m.Name != "" {
+			entry["name"] = m.Name
+		}
+		msgs = append(msgs, entry)
+	}
+	gc := gemini.New()
+	if c.HTTP != nil {
+		gc.HTTP = c.HTTP
+	}
+	effort := req.ReasoningEffort
+	if effort == "" {
+		effort = settings.ReasoningEffort
+	}
+	t0 := time.Now()
+	var ttftMs int64
+	var contentLen, thinkLen int
+	err := gc.StreamEvents(ctx, settings, model, msgs, func(kind, text string) {
+		if text == "" {
+			return
+		}
+		if ttftMs == 0 {
+			ttftMs = time.Since(t0).Milliseconds()
+		}
+		switch kind {
+		case "thinking":
+			thinkLen += len(text)
+			emit(StreamEvent{Type: "thinking", Text: text, Model: model})
+		default:
+			contentLen += len(text)
+			emit(StreamEvent{Type: "content", Text: text, Model: model})
+		}
+	}, effort)
+	if err != nil {
+		return err
+	}
+	lat := time.Since(t0).Milliseconds()
+	usage := &Usage{
+		PromptTokens:     estimatePromptTokens(req.Messages),
+		CompletionTokens: int64((contentLen + 3) / 4),
+		ReasoningTokens:  int64((thinkLen + 3) / 4),
+	}
+	usage.TotalTokens = usage.PromptTokens + usage.CompletionTokens + usage.ReasoningTokens
+	emit(StreamEvent{
+		Type: "usage", Usage: usage, Model: model,
+		LatencyMs: lat, TTFTMs: ttftMs, Estimated: true,
+	})
+	emit(StreamEvent{
+		Type: "done", Model: model, Usage: usage,
+		LatencyMs: lat, TTFTMs: ttftMs, Estimated: true,
+	})
+	return nil
 }
 
 func (c *Client) streamChatCompletions(
@@ -215,18 +422,51 @@ func (c *Client) streamChatCompletions(
 	emit func(StreamEvent),
 ) error {
 	body := map[string]any{
-		"model":            model,
-		"messages":         req.Messages,
-		"stream":           true,
-		"reasoning_effort": effort,
+		"model":    model,
+		"messages": req.Messages,
+		"stream":   true,
 		// Critical: without this many providers omit usage on SSE streams
 		"stream_options": map[string]any{"include_usage": true},
+	}
+	if settings.IsOllie() {
+		// Free Ollie models: high/xhigh often burns the whole budget on thinking → empty content.
+		eff := strings.ToLower(strings.TrimSpace(effort))
+		switch eff {
+		case "xhigh", "extra_high", "max":
+			body["reasoning_effort"] = "high"
+			if req.MaxTokens <= 0 {
+				body["max_tokens"] = 4096
+			}
+		case "high", "medium", "low":
+			body["reasoning_effort"] = eff
+			if req.MaxTokens <= 0 {
+				body["max_tokens"] = 2048
+			}
+		default:
+			// omit effort — most reliable for free models
+		}
+	} else if effort != "" && !settings.IsKimiWork() {
+		body["reasoning_effort"] = effort
+	} else if settings.IsKimiWork() {
+		// agent-gw accepts standard chat body; skip unknown effort enums that may 4xx
+		eff := strings.ToLower(strings.TrimSpace(effort))
+		switch eff {
+		case "low", "medium", "high":
+			body["reasoning_effort"] = eff
+		}
 	}
 	if req.Temperature > 0 {
 		body["temperature"] = req.Temperature
 	}
 	if req.MaxTokens > 0 {
 		body["max_tokens"] = req.MaxTokens
+	} else if settings.IsOllie() {
+		if _, ok := body["max_tokens"]; !ok {
+			body["max_tokens"] = 4096
+		}
+	}
+	if settings.IsKimiWork() {
+		body["model"] = resolveKimiUpstreamModel(model)
 	}
 	raw, _ := json.Marshal(body)
 	url := c.baseURL(settings) + "/chat/completions"
@@ -234,7 +474,7 @@ func (c *Client) streamChatCompletions(
 	if err != nil {
 		return err
 	}
-	httpReq.Header = c.authHeaders(token, settings.ClientVersion)
+	httpReq.Header = c.authHeaders(token, settings.ClientVersion, settings)
 
 	t0 := time.Now()
 	var ttftMs int64
@@ -244,8 +484,14 @@ func (c *Client) streamChatCompletions(
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
-		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("chat HTTP %d: %s", resp.StatusCode, string(b))
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return fmt.Errorf("%s", httperr.Format("chat", resp.StatusCode, resp.Header.Get("Content-Type"), b))
+	}
+	// Never stream HTML error pages as assistant content (Google robot 404 etc.).
+	ct := strings.ToLower(resp.Header.Get("Content-Type"))
+	if strings.Contains(ct, "text/html") {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("%s", httperr.Format("chat", resp.StatusCode, ct, b))
 	}
 
 	var usage *Usage
@@ -257,6 +503,11 @@ func (c *Client) streamChatCompletions(
 	for sc.Scan() {
 		line := sc.Text()
 		if !strings.HasPrefix(line, "data:") {
+			// Detect bare HTML bodies that slipped through without SSE framing.
+			trim := strings.TrimSpace(line)
+			if strings.HasPrefix(strings.ToLower(trim), "<!doctype") || strings.HasPrefix(strings.ToLower(trim), "<html") {
+				return fmt.Errorf("%s", httperr.Format("chat", resp.StatusCode, "text/html", []byte(trim)))
+			}
 			continue
 		}
 		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
@@ -281,12 +532,15 @@ func (c *Client) streamChatCompletions(
 		if len(choices) > 0 {
 			ch, _ := choices[0].(map[string]any)
 			delta, _ := ch["delta"].(map[string]any)
-			if rc, ok := delta["reasoning_content"].(string); ok && rc != "" {
-				if ttftMs == 0 {
-					ttftMs = time.Since(t0).Milliseconds()
+			// Ollie uses reasoning / reasoning_content; OpenAI-style uses reasoning_content.
+			for _, key := range []string{"reasoning_content", "reasoning"} {
+				if rc, ok := delta[key].(string); ok && rc != "" {
+					if ttftMs == 0 {
+						ttftMs = time.Since(t0).Milliseconds()
+					}
+					thinkLen += len(rc)
+					emit(StreamEvent{Type: "thinking", Text: rc, ID: id, Model: outModel})
 				}
-				thinkLen += len(rc)
-				emit(StreamEvent{Type: "thinking", Text: rc, ID: id, Model: outModel})
 			}
 			if ct, ok := delta["content"].(string); ok && ct != "" {
 				if ttftMs == 0 {
@@ -382,7 +636,7 @@ func (c *Client) streamResponses(
 	if err != nil {
 		return err
 	}
-	httpReq.Header = c.authHeaders(token, settings.ClientVersion)
+	httpReq.Header = c.authHeaders(token, settings.ClientVersion, settings)
 
 	t0 := time.Now()
 	var ttftMs int64
@@ -392,8 +646,13 @@ func (c *Client) streamResponses(
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
-		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("responses HTTP %d: %s", resp.StatusCode, string(b))
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return fmt.Errorf("%s", httperr.Format("responses", resp.StatusCode, resp.Header.Get("Content-Type"), b))
+	}
+	ct := strings.ToLower(resp.Header.Get("Content-Type"))
+	if strings.Contains(ct, "text/html") {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+		return fmt.Errorf("%s", httperr.Format("responses", resp.StatusCode, ct, b))
 	}
 
 	var usage *Usage

@@ -7,6 +7,8 @@ import DOMPurify from "dompurify";
 import {
   GetBootstrap,
   ListModels,
+  ListAccountsForProvider,
+  ListProviders,
   SetActiveAccount,
   RemoveAccount,
   RenameAccount,
@@ -17,6 +19,14 @@ import {
   SendChat,
   CancelChat,
   GetStats,
+  StartAutoSignup,
+  CancelAutoSignup,
+  IsSignupRunning,
+  SetAutoCreateOnExhausted,
+  GetAutoCreateOnExhausted,
+  StartKimiBrowserLogin,
+  AddKimiFromJWT,
+  AddKimiAPIKey,
 } from "../wailsjs/go/main/App";
 import { EventsOn } from "../wailsjs/runtime/runtime";
 
@@ -54,6 +64,25 @@ const state = {
   menus: {},
 };
 
+/** Short label for long model ids (Ollie full paths, aliases, etc.). */
+function shortModelLabel(name, id) {
+  let s = String(name || id || "").trim();
+  if (!s) return "—";
+  // "OllieChat alias → accounts/.../foo" → prefer the id short form
+  const arrow = s.indexOf("→");
+  if (arrow >= 0) s = s.slice(arrow + 1).trim();
+  // accounts/euromodels/models/claude-fable-5 → claude-fable-5
+  if (s.includes("/")) {
+    const parts = s.split("/").filter(Boolean);
+    s = parts[parts.length - 1] || s;
+  }
+  // drop noisy prefixes
+  s = s.replace(/^models\//i, "");
+  // keep chip readable
+  if (s.length > 28) s = s.slice(0, 26) + "…";
+  return s;
+}
+
 /** Custom dark menu — replaces native <select> (white OS list on Windows). */
 function mountMenu(root, { id, options, value, prefix, onChange, chip }) {
   root.className = "dd" + (chip ? " seg dd-chip" : "");
@@ -66,8 +95,9 @@ function mountMenu(root, { id, options, value, prefix, onChange, chip }) {
     const cur = opts.find((o) => o.value === root._value) || opts[0];
     if (cur && root._value !== cur.value) root._value = cur.value;
     const label = cur?.label || root._value || "—";
+    const title = cur?.value && cur.value !== label ? `${label} (${cur.value})` : label;
     root.innerHTML = `
-      <button type="button" class="dd-trigger" aria-haspopup="listbox">
+      <button type="button" class="dd-trigger" aria-haspopup="listbox" title="${escapeHtml(title)}">
         <span class="dd-value">${prefix ? `<span class="dd-label">${escapeHtml(prefix)}</span> ` : ""}${escapeHtml(label)}</span>
         <span class="dd-chev"></span>
       </button>
@@ -79,6 +109,8 @@ function mountMenu(root, { id, options, value, prefix, onChange, chip }) {
       item.type = "button";
       item.className = "dd-item" + (o.value === root._value ? " active" : "");
       item.role = "option";
+      const itemTitle = o.value && o.value !== o.label ? o.value : o.label;
+      item.title = itemTitle;
       item.innerHTML = `<span>${escapeHtml(o.label)}</span><span class="check">✓</span>`;
       item.onclick = (e) => {
         e.stopPropagation();
@@ -221,15 +253,41 @@ function escapeHtml(s) {
     .replaceAll('"', "&quot;");
 }
 
+/** Detect upstream HTML error pages (e.g. Google robot 404) so we never paint them. */
+function looksLikeHTML(s) {
+  const t = String(s ?? "").trim();
+  if (t.length < 12) return false;
+  const head = t.slice(0, 240).toLowerCase();
+  if (head.startsWith("<!doctype") || head.startsWith("<html") || head.startsWith("<head")) return true;
+  if (head.includes("that's an error") || head.includes("robots.txt")) return true;
+  if (t.length > 1500 && /<\/?(html|body|script|style|svg)\b/i.test(t)) return true;
+  return false;
+}
+
+function safeErrorText(err) {
+  const raw = String(err ?? "erro desconhecido");
+  if (looksLikeHTML(raw)) {
+    return "Erro: o provedor devolveu uma página HTML (não é resposta do modelo). Verifique ADC, projeto Vertex e o id do model.";
+  }
+  // Cap runaway error bodies
+  return raw.length > 800 ? raw.slice(0, 800) + "…" : raw;
+}
+
 /** Render markdown safely for chat bubbles (assistant + optional user). */
 function renderMarkdown(text) {
   const raw = String(text ?? "");
   if (!raw.trim()) return "";
+  // Never paint HTML error pages through marked + innerHTML (robot page bug).
+  if (looksLikeHTML(raw)) {
+    return `<p class="err">${escapeHtml(safeErrorText(raw))}</p>`;
+  }
   try {
     const html = marked.parse(raw, { async: false });
     return DOMPurify.sanitize(html, {
       USE_PROFILES: { html: true },
       ADD_ATTR: ["target", "rel"],
+      FORBID_TAGS: ["style", "iframe", "object", "embed", "form"],
+      FORBID_ATTR: ["style"],
     });
   } catch {
     return `<p>${escapeHtml(raw)}</p>`;
@@ -295,12 +353,14 @@ function ensureShell() {
 
         <div>
           <div class="accounts-head">
-            <div class="rail-label">Contas</div>
+            <div class="rail-label">Contas do provedor</div>
             <span class="accounts-count" id="accounts-count">0</span>
           </div>
+          <div class="provider-mode" id="provider-mode">—</div>
           <div class="accounts" id="accounts"></div>
-          <div class="rail-actions" style="margin-top:10px">
-            <button class="btn btn-solid" id="btn-add">+ Adicionar conta</button>
+          <div class="rail-actions" style="margin-top:10px; gap:8px; display:flex; flex-direction:column">
+            <button class="btn btn-solid" id="btn-add">+ Adicionar</button>
+            <button class="btn btn-quiet" id="btn-accounts">Ver contas</button>
           </div>
         </div>
 
@@ -322,6 +382,10 @@ function ensureShell() {
         <div class="rail-block">
           <div class="rail-label">Global</div>
           <div class="field">
+            <span class="field-label">Provedor</span>
+            <div id="set-provider"></div>
+          </div>
+          <div class="field">
             <span class="field-label">Raciocínio</span>
             <div id="set-effort"></div>
           </div>
@@ -336,6 +400,8 @@ function ensureShell() {
         </div>
 
         <div class="rail-foot">
+          <b>Provedor</b>
+          <span id="provider-label">—</span><br /><br />
           <b>Proxy</b>
           <span id="proxy-url">—</span><br /><br />
           <b>AppData</b>
@@ -382,7 +448,8 @@ function ensureShell() {
     </div>
   `;
 
-  $("#btn-add").onclick = startLogin;
+  $("#btn-add").onclick = showAddAccountChooser;
+  $("#btn-accounts").onclick = openAccountsModal;
   $("#btn-stats").onclick = openStatsModal;
   $("#btn-stats-top").onclick = openStatsModal;
 
@@ -390,19 +457,105 @@ function ensureShell() {
     { value: "low", label: "Low" },
     { value: "medium", label: "Medium" },
     { value: "high", label: "High" },
+    { value: "xhigh", label: "xHigh" },
+  ];
+  const providerOpts = [
+    { value: "xai", label: "Grok · Auth" },
+    { value: "kimi_work", label: "Kimi Work · Auth" },
+    { value: "ollie", label: "OllieChat · API key" },
+    { value: "gemini", label: "Gemini · API key" },
   ];
   const apiOpts = [
+    { value: "responses", label: "Responses ★" },
     { value: "chat", label: "Chat" },
-    { value: "responses", label: "Responses" },
   ];
+  const fallbackModels = (prov) => {
+    const p = (prov || state.settings?.provider || "xai").toLowerCase();
+    if (p === "ollie") {
+      return [
+        { id: "claude-sonnet-5", name: "claude-sonnet-5" },
+        { id: "claude-fable-5", name: "claude-fable-5" },
+        { id: "claude-opus-4-8", name: "claude-opus-4-8" },
+        { id: "deepseek-v4-flash-free", name: "deepseek-v4-flash-free" },
+      ];
+    }
+    if (p === "gemini" || p === "google" || p === "vertex") {
+      return [
+        { id: "gemini-3.1-pro-preview", name: "gemini-3.1-pro-preview" },
+        { id: "gemini-3-flash-preview", name: "gemini-3-flash-preview" },
+        { id: "gemini-3.5-flash", name: "gemini-3.5-flash" },
+        { id: "gemini-3.1-flash-lite", name: "gemini-3.1-flash-lite" },
+        { id: "gemini-3.1-flash-image", name: "gemini-3.1-flash-image" },
+        { id: "gemini-3-pro-image", name: "gemini-3-pro-image" },
+        { id: "gemini-2.5-pro", name: "gemini-2.5-pro" },
+        { id: "gemini-2.5-flash", name: "gemini-2.5-flash" },
+        { id: "gemini-2.5-flash-lite", name: "gemini-2.5-flash-lite" },
+        { id: "gemini-2.0-flash-001", name: "gemini-2.0-flash-001" },
+        { id: "gemini-2.0-flash-lite-001", name: "gemini-2.0-flash-lite-001" },
+        { id: "gemini-1.5-pro-002", name: "gemini-1.5-pro-002" },
+      ];
+    }
+    if (p === "kimi_work" || p === "kimi" || p === "kimi-work") {
+      return [
+        { id: "kimi-for-coding", name: "Kimi For Coding" },
+        { id: "k3-agent", name: "K3 Max (Work)" },
+        { id: "k3-agent-swarm", name: "K3 Swarm Max (Work)" },
+        { id: "k2d6-agent", name: "K2.6 Agent (Work)" },
+      ];
+    }
+    return [
+      { id: "grok-4.5", name: "Grok 4.5" },
+      { id: "grok-4.5-responses", name: "Grok 4.5 (Responses)" },
+    ];
+  };
   const modelOpts = () =>
-    (state.models.length
-      ? state.models
-      : [
-          { id: "grok-4.5", name: "Grok 4.5" },
-          { id: "grok-4.5-responses", name: "Grok 4.5 (Responses)" },
-        ]
-    ).map((m) => ({ value: m.id, label: m.name || m.id }));
+    (state.models.length ? state.models : fallbackModels()).map((m) => ({
+      value: m.id,
+      label: shortModelLabel(m.name || m.id, m.id),
+    }));
+
+  async function switchProvider(v) {
+    // One shot: backend resets model+upstream for the provider.
+    await saveGlobal({ provider: v });
+    try {
+      state.models = (await ListModels()) || [];
+    } catch {
+      state.models = fallbackModels(v);
+    }
+    const prefer =
+      state.settings.default_model ||
+      fallbackModels(v)[0]?.id ||
+      "default";
+    state.picks.model = prefer;
+    state.picks.cModel = prefer;
+    state.menus["set-model"]?.refresh?.();
+    state.menus["c-model"]?.refresh?.();
+    state.menus["set-model"]?.setValue(prefer);
+    state.menus["c-model"]?.setValue(prefer);
+    // Grok: Responses. Kimi Work: chat/completions only (no responses on agent-gw).
+    const isKimi = v === "kimi_work" || v === "kimi" || v === "kimi-work";
+    const api = v === "xai" ? "responses" : "chat";
+    if (state.settings.api_mode !== api) {
+      await saveGlobal({ api_mode: api });
+    }
+    state.menus["set-api"]?.setValue(api);
+    state.menus["c-api"]?.setValue(api);
+    state.picks.api = api;
+    state.picks.cApi = api;
+    if (isKimi) {
+      state.menus["set-api"]?.setValue("chat");
+      state.menus["c-api"]?.setValue("chat");
+    }
+    updateProviderChrome();
+    await refreshBootstrap(false);
+  }
+
+  mountMenu($("#set-provider"), {
+    id: "set-provider",
+    options: providerOpts,
+    value: state.settings?.provider || "xai",
+    onChange: (v) => switchProvider(v),
+  });
 
   mountMenu($("#set-effort"), {
     id: "set-effort",
@@ -443,13 +596,14 @@ function ensureShell() {
     if (!state.accounts.length) {
       return [{ value: "", label: "sem conta — adicione à esquerda" }];
     }
-    return state.accounts.map((a) => ({
-      value: a.id,
-      // show email first (what people recognize), label as fallback
-      label: a.active
-        ? `● ${a.email || a.label || a.id}`
-        : a.email || a.label || a.id,
-    }));
+    return state.accounts.map((a) => {
+      const base = a.email || a.label || a.id;
+      let mark = a.active ? "● " : "";
+      if (a.exhausted) mark = "⛔ ";
+      else if (a.expired) mark = "⚠ ";
+      else if (a.active) mark = "● ";
+      return { value: a.id, label: mark + base };
+    });
   };
 
   mountMenu($("#c-account"), {
@@ -544,6 +698,7 @@ function paintChrome() {
     $("#u-lat").textContent = fmtMs(u.latency_sum_ms / u.latency_samples);
   }
   $("#proxy-url").textContent = state.proxyBase || "—";
+  updateProviderChrome();
   $("#data-dir").textContent = shortPath(state.dataDir) || "—";
   $("#data-dir").title = state.dataDir || "";
 
@@ -554,8 +709,14 @@ function paintChrome() {
     countEl.textContent = n === 1 ? "1 conta" : `${n} contas`;
   }
   list.innerHTML = "";
-  if (!state.accounts.length) {
-    list.innerHTML = `<div class="account empty-hint">Nenhuma conta ainda.<br/>Clique em <b>+ Adicionar conta</b> para logar na xAI.<br/>Você pode adicionar várias e trocar qual envia a request.</div>`;
+  const pNow = (state.settings?.provider || "xai").toLowerCase();
+  if (providerAuthMode(pNow) !== "auth") {
+    list.innerHTML = `<div class="account empty-hint">Provedor <b>API key</b> — sem pool de contas de sessão.<br/>Credencial direta (Ollie keyless / Gemini ADC).</div>`;
+  } else if (!state.accounts.length) {
+    const how = pNow.startsWith("kimi")
+      ? "Clique em <b>+ Conta Kimi</b> (Desktop / JWT / sk-kimi)."
+      : "Clique em <b>+ Conta Grok</b> para OAuth xAI.";
+    list.innerHTML = `<div class="account empty-hint">Nenhuma conta neste provedor.<br/>${how}</div>`;
   } else {
     state.accounts.forEach((a) => {
       const u = a.usage || {};
@@ -568,7 +729,8 @@ function paintChrome() {
             <strong title="${escapeHtml(a.email || a.id)}">${escapeHtml(a.label || a.email || a.id)}</strong>
             <div class="meta-line">
               ${a.active ? `<span class="badge badge-live">ativa</span>` : `<span class="badge badge-ok">salva</span>`}
-              ${a.expired ? `<span class="badge badge-warn">expirada</span>` : ""}
+              ${a.exhausted ? `<span class="badge badge-danger">esgotada</span>` : ""}
+              ${a.expired ? `<span class="badge badge-warn">token exp.</span>` : ""}
               <span>${escapeHtml((a.email || "").split("@")[0] || a.id.slice(0, 8))}</span>
             </div>
           </div>
@@ -709,7 +871,10 @@ function paintMessages() {
         : "";
       const cursor = m.streaming ? `<span class="cursor" aria-hidden="true"></span>` : "";
       const meta = m.meta ? `<div class="turn-meta">${escapeHtml(m.meta)}</div>` : "";
-      const answer = renderMarkdown(m.content || "") + cursor;
+      // Errors: plain escaped text only (never markdown/HTML from upstream pages).
+      const answer = (m.isError || looksLikeHTML(m.content)
+        ? `<p class="err">${escapeHtml(safeErrorText(m.content || ""))}</p>`
+        : renderMarkdown(m.content || "")) + cursor;
       const hasAnswer = !!(m.content && m.content.trim());
       const searching =
         m.search?.status === "searching" ||
@@ -754,6 +919,339 @@ async function saveGlobal(patch) {
     state.picks.cModel = patch.default_model;
     state.menus["c-model"]?.setValue(patch.default_model);
   }
+  if (patch.provider) {
+    state.menus["set-provider"]?.setValue(state.settings.provider || patch.provider);
+    if (state.settings.api_mode) {
+      state.picks.api = state.settings.api_mode;
+      state.picks.cApi = state.settings.api_mode;
+      state.menus["set-api"]?.setValue(state.settings.api_mode);
+      state.menus["c-api"]?.setValue(state.settings.api_mode);
+    }
+    updateProviderChrome();
+  }
+}
+
+function providerAuthMode(p) {
+  p = (p || state.settings?.provider || "xai").toLowerCase();
+  if (p === "xai" || p === "grok" || p === "kimi_work" || p === "kimi" || p === "kimi-work") return "auth";
+  return "api_key";
+}
+
+function updateProviderChrome() {
+  const p = (state.settings?.provider || "xai").toLowerCase();
+  const model = state.settings?.default_model || state.picks?.model || "—";
+  const mode = providerAuthMode(p);
+  const el = $("#provider-label");
+  if (el) {
+    if (p === "ollie" || p === "olliechat") {
+      el.textContent = `Ollie · API key · ${shortModelLabel(model, model)}`;
+    } else if (p === "gemini" || p === "google" || p === "vertex") {
+      const proj = state.settings?.gemini_project || "ADC project";
+      el.textContent = `Gemini · API key · ${shortModelLabel(model, model)} · ${proj}`;
+    } else if (p === "kimi_work" || p === "kimi" || p === "kimi-work") {
+      el.textContent = `Kimi Work · Auth · ${shortModelLabel(model, model)}`;
+    } else {
+      el.textContent = `Grok · Auth · ${shortModelLabel(model, model)}`;
+    }
+  }
+  const modeEl = $("#provider-mode");
+  if (modeEl) {
+    modeEl.innerHTML =
+      mode === "auth"
+        ? `<span class="mode-pill mode-auth">Auth · multi-conta</span>`
+        : `<span class="mode-pill mode-key">API key · sem pool</span>`;
+  }
+  const addBtn = $("#btn-add");
+  const accBtn = $("#btn-accounts");
+  if (addBtn) {
+    addBtn.style.display = mode === "auth" ? "" : "none";
+    addBtn.textContent = p.startsWith("kimi") ? "+ Conta Kimi" : "+ Conta Grok";
+  }
+  if (accBtn) {
+    accBtn.style.display = mode === "auth" ? "" : "none";
+  }
+  const hint = document.querySelector(".tool-hint");
+  if (hint) {
+    if (p === "ollie" || p === "olliechat") {
+      hint.textContent = "OllieChat";
+      hint.title = "Upstream OllieChat (sem chave)";
+    } else if (p === "gemini" || p === "google" || p === "vertex") {
+      hint.textContent = "Gemini ADC";
+      hint.title = "Vertex AI via Application Default Credentials (gcloud)";
+    } else if (p === "kimi_work" || p === "kimi" || p === "kimi-work") {
+      hint.textContent = "chat/completions";
+      hint.title = "Kimi Work agent-gw · só /v1/chat/completions (sem Responses nativo)";
+    } else {
+      hint.textContent = "search: xAI";
+      hint.title = "Pesquisa nativa xAI (web + X) via Responses";
+    }
+  }
+  // Hide API mode picker for Kimi — always chat/completions.
+  const isKimi = p === "kimi_work" || p === "kimi" || p === "kimi-work";
+  const hideApi = isKimi;
+  for (const id of ["set-api", "c-api"]) {
+    const elApi = document.getElementById(id);
+    if (!elApi) continue;
+    const wrap = elApi.closest(".field") || elApi;
+    wrap.style.display = hideApi ? "none" : "";
+  }
+  if (isKimi) {
+    state.picks.api = "chat";
+    state.picks.cApi = "chat";
+    state.menus["set-api"]?.setValue("chat");
+    state.menus["c-api"]?.setValue("chat");
+  }
+}
+
+
+function closeOverlay() {
+  document.querySelector(".overlay")?.remove();
+}
+
+function showAddAccountChooser() {
+  const p = (state.settings?.provider || "xai").toLowerCase();
+  if (p === "kimi_work" || p === "kimi" || p === "kimi-work") {
+    showAddKimiChooser();
+    return;
+  }
+  if (p === "ollie" || p === "gemini" || p === "google" || p === "vertex") {
+    closeOverlay();
+    const overlay = document.createElement("div");
+    overlay.className = "overlay overlay-glass";
+    overlay.innerHTML = `
+      <div class="sheet sheet-choose">
+        <h3>Provedor API key</h3>
+        <p>Ollie e Gemini não usam pool de contas de sessão. Configure o provedor em <b>Global</b> — a credencial é direta (keyless / ADC).</p>
+        <div class="sheet-actions">
+          <button class="btn btn-quiet" id="m-cancel">Fechar</button>
+        </div>
+      </div>`;
+    document.body.appendChild(overlay);
+    $("#m-cancel", overlay).onclick = () => overlay.remove();
+    overlay.addEventListener("click", (e) => {
+      if (e.target === overlay) overlay.remove();
+    });
+    return;
+  }
+  closeOverlay();
+  const overlay = document.createElement("div");
+  overlay.className = "overlay overlay-glass";
+  overlay.innerHTML = `
+    <div class="sheet sheet-choose">
+      <h3>Adicionar conta Grok</h3>
+      <p><span class="mode-pill mode-auth">Auth</span> OAuth multi-conta xAI</p>
+      <div class="choose-grid">
+        <button type="button" class="choose-card" id="m-auto">
+          <strong>Automática</strong>
+          <span>Cria conta com darkemail + Chrome isolate, depois pede device OAuth pros tokens da API.</span>
+        </button>
+        <button type="button" class="choose-card" id="m-manual">
+          <strong>Manual</strong>
+          <span>Device login clássico — você confirma o código na xAI com uma conta que já existe.</span>
+        </button>
+      </div>
+      <label class="auto-toggle">
+        <input type="checkbox" id="m-auto-quota" />
+        Criar conta automática quando a cota acabar (402 / balance exhausted)
+      </label>
+      <div class="sheet-actions">
+        <button class="btn btn-quiet" id="m-cancel">Fechar</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  $("#m-cancel", overlay).onclick = () => overlay.remove();
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay) overlay.remove();
+  });
+  GetAutoCreateOnExhausted()
+    .then((v) => {
+      const el = $("#m-auto-quota", overlay);
+      if (el) el.checked = !!v;
+    })
+    .catch(() => {});
+  $("#m-auto-quota", overlay).onchange = (e) => {
+    SetAutoCreateOnExhausted(!!e.target.checked).catch(() => {});
+  };
+  $("#m-manual", overlay).onclick = () => {
+    overlay.remove();
+    startLogin();
+  };
+  $("#m-auto", overlay).onclick = () => {
+    overlay.remove();
+    startAutoSignupUI();
+  };
+}
+
+function showAddKimiChooser() {
+  closeOverlay();
+  const overlay = document.createElement("div");
+  overlay.className = "overlay overlay-glass";
+  overlay.innerHTML = `
+    <div class="sheet sheet-choose sheet-kimi">
+      <h3>Adicionar conta Kimi Work</h3>
+      <p><span class="mode-pill mode-auth">Auth</span> Igual o app oficial: abre o <b>navegador do sistema</b> (Google) → Kimi tokens → <code>sk-kimi</code>. Sem Playwright, sem ler o Kimi Desktop.</p>
+      <div class="choose-grid">
+        <button type="button" class="choose-card" id="m-browser">
+          <strong>Login com Google</strong>
+          <span>Abre seu Chrome/Edge normal. Escolha a conta Google. Ao voltar, a conta Kimi Work entra no pool sozinha.</span>
+        </button>
+      </div>
+      <p class="hint" style="margin-top:10px;font-size:12px;opacity:.65">Multi-conta: repita o login com outra conta Google. Refresh token fica salvo.</p>
+      <div class="sheet-actions">
+        <button class="btn btn-quiet" id="m-cancel">Fechar</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+  $("#m-cancel", overlay).onclick = () => overlay.remove();
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay) overlay.remove();
+  });
+  $("#m-browser", overlay).onclick = async () => {
+    try {
+      setStatus("Kimi: abra o navegador e escolha a conta Google…");
+      overlay.remove();
+      const rec = await StartKimiBrowserLogin();
+      await refreshBootstrap(false);
+      setStatus(`Kimi ok · ${rec.label || rec.id}${rec.has_refresh ? " · refresh salvo" : ""}`);
+    } catch (e) {
+      alert("Falha login Kimi: " + e);
+      setStatus("Falha login Kimi");
+    }
+  };
+}
+
+function showKimiPasteModal(kind) {
+  closeOverlay();
+  const isJWT = kind === "jwt";
+  const overlay = document.createElement("div");
+  overlay.className = "overlay overlay-glass";
+  overlay.innerHTML = `
+    <div class="sheet">
+      <h3>${isJWT ? "Colar access JWT" : "Colar sk-kimi"}</h3>
+      <p class="hint">${isJWT ? "Bearer JWT (typ=access) da conta Kimi web." : "Começa com sk-kimi-…"}</p>
+      <textarea id="m-paste" rows="5" style="width:100%;margin:10px 0;border-radius:10px;padding:10px;background:rgba(0,0,0,.35);border:1px solid rgba(255,255,255,.08);color:#fff;font-family:ui-monospace,monospace;font-size:12px" placeholder="${isJWT ? "eyJhbGciOi…" : "sk-kimi-…"}"></textarea>
+      ${isJWT ? "" : `<input id="m-label" placeholder="Label (opcional)" style="width:100%;margin-bottom:10px;border-radius:10px;padding:8px 10px;background:rgba(0,0,0,.35);border:1px solid rgba(255,255,255,.08);color:#fff" />`}
+      <div class="sheet-actions">
+        <button class="btn btn-solid" id="m-save">Salvar</button>
+        <button class="btn btn-quiet" id="m-cancel">Cancelar</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+  $("#m-cancel", overlay).onclick = () => overlay.remove();
+  $("#m-save", overlay).onclick = async () => {
+    const raw = ($("#m-paste", overlay).value || "").trim();
+    if (!raw) return;
+    try {
+      if (isJWT) {
+        await AddKimiFromJWT(raw);
+      } else {
+        const label = ($("#m-label", overlay)?.value || "").trim();
+        await AddKimiAPIKey(raw, label);
+      }
+      overlay.remove();
+      await refreshBootstrap(false);
+      setStatus("Conta Kimi adicionada");
+    } catch (e) {
+      alert("Falha: " + e);
+    }
+  };
+}
+
+async function openAccountsModal() {
+  closeOverlay();
+  const p = (state.settings?.provider || "xai").toLowerCase();
+  if (providerAuthMode(p) !== "auth") {
+    showAddAccountChooser();
+    return;
+  }
+  let accounts = state.accounts || [];
+  try {
+    accounts = (await ListAccountsForProvider(p)) || accounts;
+  } catch (_) {}
+  const title = p.startsWith("kimi") ? "Contas Kimi Work" : "Contas Grok";
+  const overlay = document.createElement("div");
+  overlay.className = "overlay overlay-glass";
+  const rows =
+    accounts.length === 0
+      ? `<div class="empty-hint" style="padding:16px 4px">Nenhuma conta neste provedor.</div>`
+      : accounts
+          .map((a) => {
+            const u = a.usage || {};
+            return `<div class="acc-row ${a.active ? "active" : ""}" data-id="${escapeHtml(a.id)}">
+              <div class="acc-main">
+                <strong>${escapeHtml(a.label || a.email || a.id)}</strong>
+                <div class="meta-line">
+                  ${a.active ? `<span class="badge badge-live">ativa</span>` : `<span class="badge badge-ok">salva</span>`}
+                  ${a.exhausted ? `<span class="badge badge-danger">esgotada</span>` : ""}
+                  ${a.auth_denied ? `<span class="badge badge-danger">auth</span>` : ""}
+                  ${a.api_key_hint ? `<span class="badge badge-ok">${escapeHtml(a.api_key_hint)}</span>` : ""}
+                  <span>${fmt(u.total_tokens || 0)} tok · ${fmtUSD(u.cost_usd || 0)}</span>
+                </div>
+              </div>
+              <div class="acc-actions">
+                ${a.active ? "" : `<button type="button" class="btn btn-solid btn-xs" data-act="use">Usar</button>`}
+                <button type="button" class="btn btn-quiet btn-xs" data-act="rename">Renomear</button>
+                <button type="button" class="btn btn-quiet btn-xs danger" data-act="remove">Remover</button>
+              </div>
+            </div>`;
+          })
+          .join("");
+  overlay.innerHTML = `
+    <div class="sheet sheet-accounts">
+      <div class="sheet-head">
+        <div>
+          <h3>${title}</h3>
+          <p><span class="mode-pill mode-auth">Auth</span> pool do provedor ativo · ${accounts.length} conta(s)</p>
+        </div>
+        <button class="btn btn-quiet" id="m-close">Fechar</button>
+      </div>
+      <div class="acc-list">${rows}</div>
+      <div class="sheet-actions" style="margin-top:14px">
+        <button class="btn btn-solid" id="m-add">+ Adicionar</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+  $("#m-close", overlay).onclick = () => overlay.remove();
+  $("#m-add", overlay).onclick = () => {
+    overlay.remove();
+    showAddAccountChooser();
+  };
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay) overlay.remove();
+  });
+  overlay.querySelectorAll(".acc-row").forEach((row) => {
+    const id = row.getAttribute("data-id");
+    row.querySelectorAll("[data-act]").forEach((btn) => {
+      btn.onclick = async (e) => {
+        e.stopPropagation();
+        const act = btn.getAttribute("data-act");
+        if (act === "use") {
+          await SetActiveAccount(id);
+          await refreshBootstrap(false);
+          openAccountsModal();
+        } else if (act === "rename") {
+          const next = prompt("Novo nome", accounts.find((x) => x.id === id)?.label || "");
+          if (next != null && next.trim()) {
+            await RenameAccount(id, next.trim());
+            await refreshBootstrap(false);
+            openAccountsModal();
+          }
+        } else if (act === "remove") {
+          if (confirm("Remover esta conta?")) {
+            await RemoveAccount(id);
+            await refreshBootstrap(false);
+            openAccountsModal();
+          }
+        }
+      };
+    });
+  });
+}
+
+function setStatus(text) {
+  const el = $("#status-text");
+  if (el) el.textContent = text || "Pronto";
 }
 
 async function startLogin() {
@@ -771,21 +1269,27 @@ async function startLogin() {
   }
 }
 
-function showDeviceModal(st) {
-  document.querySelector(".overlay")?.remove();
+function showDeviceModal(st, extra = {}) {
+  closeOverlay();
   const overlay = document.createElement("div");
-  overlay.className = "overlay";
+  overlay.className = "overlay overlay-glass";
+  const emailHint = extra.email
+    ? `<p class="hint-email">Use a conta <strong>${escapeHtml(extra.email)}</strong>${extra.password ? ` · senha <code id="m-pass">${escapeHtml(extra.password)}</code>` : ""}</p>`
+    : "";
   overlay.innerHTML = `
     <div class="sheet">
-      <h3>Adicionar conta</h3>
+      <h3>${extra.title || "Adicionar conta"}</h3>
       <p>Confirme o código na página da xAI. O app completa sozinho.</p>
+      ${emailHint}
       <div class="code">${escapeHtml(st.user_code)}</div>
       <div class="sheet-actions">
         <button class="btn btn-solid" id="m-open">Abrir login</button>
         <button class="btn btn-quiet" id="m-copy">Copiar código</button>
+        ${extra.password ? `<button class="btn btn-quiet" id="m-copy-pass">Copiar senha</button>` : ""}
         <button class="btn btn-quiet" id="m-cancel">Cancelar</button>
       </div>
       <div class="hint">${escapeHtml(st.verification_url || "")}</div>
+      <div class="signup-log" id="m-log" style="display:none"></div>
     </div>
   `;
   document.body.appendChild(overlay);
@@ -793,12 +1297,56 @@ function showDeviceModal(st) {
   $("#m-copy", overlay).onclick = async () => {
     await navigator.clipboard.writeText(st.user_code);
   };
+  const cp = $("#m-copy-pass", overlay);
+  if (cp) {
+    cp.onclick = async () => {
+      await navigator.clipboard.writeText(extra.password || "");
+      cp.textContent = "Senha copiada";
+      setTimeout(() => (cp.textContent = "Copiar senha"), 1200);
+    };
+  }
   $("#m-cancel", overlay).onclick = () => {
     CancelDeviceLogin();
+    CancelAutoSignup().catch(() => {});
     state.device = null;
     overlay.remove();
   };
 }
+
+async function startAutoSignupUI() {
+  closeOverlay();
+  const overlay = document.createElement("div");
+  overlay.className = "overlay overlay-glass";
+  overlay.innerHTML = `
+    <div class="sheet">
+      <h3>Criação automática</h3>
+      <p>Chrome isolate + darkemail. Pode levar 1–3 min. Não feche o app.</p>
+      <div class="signup-log" id="m-log">preparando…</div>
+      <div class="sheet-actions">
+        <button class="btn btn-quiet" id="m-cancel">Cancelar</button>
+      </div>
+    </div>
+  `;
+  document.body.appendChild(overlay);
+  const log = (msg) => {
+    const el = $("#m-log", overlay);
+    if (el) el.textContent = msg;
+    const st = $("#status-text");
+    if (st) st.innerHTML = `Signup · <strong>${escapeHtml(msg)}</strong>`;
+  };
+  $("#m-cancel", overlay).onclick = () => {
+    CancelAutoSignup().catch(() => {});
+    overlay.remove();
+  };
+  try {
+    await StartAutoSignup();
+    log("signup iniciado…");
+  } catch (e) {
+    log("erro: " + e);
+    alert("Auto signup: " + e);
+  }
+}
+
 
 async function submit() {
   const promptEl = $("#prompt");
@@ -813,8 +1361,12 @@ async function submit() {
     state.menus["c-model"]?.getValue?.() || state.picks.cModel || state.settings.default_model;
   const effort =
     state.menus["c-effort"]?.getValue?.() || state.picks.cEffort || state.settings.reasoning_effort;
-  const apiMode =
+  const pNow = (state.settings?.provider || "xai").toLowerCase();
+  const isKimi =
+    pNow === "kimi_work" || pNow === "kimi" || pNow === "kimi-work";
+  let apiMode =
     state.menus["c-api"]?.getValue?.() || state.picks.cApi || state.settings.api_mode;
+  if (isKimi) apiMode = "chat";
 
   state.messages.push({ role: "user", content: text });
   state.messages.push({
@@ -882,7 +1434,8 @@ async function submit() {
     state.streaming = false;
     const last = state.messages.at(-1);
     if (last?.role === "assistant") {
-      last.content = "Erro: " + e;
+      last.content = safeErrorText(e);
+      last.isError = true;
       last.streaming = false;
     }
     paintSend();
@@ -1282,7 +1835,9 @@ function onChatEvent(ev) {
     paintSend();
     paintStatus();
   } else if (ev.type === "error") {
-    last.content = (last.content || "") + (last.content ? "\n" : "") + ev.error;
+    const msg = safeErrorText(ev.error);
+    last.content = (last.content || "") + (last.content ? "\n" : "") + msg;
+    last.isError = true;
     last.streaming = false;
     state.streaming = false;
     paintSend();
@@ -1360,10 +1915,53 @@ function wireEvents() {
       st.innerHTML = `Conta adicionada · <strong>${escapeHtml(payload?.email || payload?.label || "")}</strong> · ${n} no total`;
     }
   });
+
   EventsOn("auth:error", (msg) => {
     alert("Auth error: " + msg);
     state.device = null;
     document.querySelector(".overlay")?.remove();
+  });
+  EventsOn("signup:progress", (p) => {
+    const msg = p?.message || String(p || "");
+    const el = document.querySelector("#m-log");
+    if (el) el.textContent = msg;
+    const st = $("#status-text");
+    if (st) st.innerHTML = `Signup · <strong>${escapeHtml(msg)}</strong>`;
+  });
+  EventsOn("signup:error", (msg) => {
+    alert("Signup: " + msg);
+    const st = $("#status-text");
+    if (st) st.textContent = "Signup falhou";
+  });
+  EventsOn("signup:web_ok", (p) => {
+    const st = $("#status-text");
+    if (st) st.innerHTML = `Conta web · <strong>${escapeHtml(p?.email || "")}</strong> criada`;
+  });
+  EventsOn("signup:device", (p) => {
+    if (p?.user_code) {
+      showDeviceModal(
+        { user_code: p.user_code, verification_url: p.verification_url },
+        { title: "Device OAuth — conta nova", email: p.email, password: p.password }
+      );
+    }
+  });
+  EventsOn("signup:done", (p) => {
+    const st = $("#status-text");
+    if (st) st.innerHTML = `Signup · fase <strong>${escapeHtml(p?.phase || "done")}</strong>`;
+  });
+  EventsOn("signup:auto_triggered", () => {
+    const st = $("#status-text");
+    if (st) st.innerHTML = `Cota esgotada — <strong>criando conta nova…</strong>`;
+  });
+  EventsOn("account:exhausted", async (p) => {
+    const st = $("#status-text");
+    if (st) st.innerHTML = `Conta esgotada · <strong>${escapeHtml(p?.email || p?.id || "")}</strong>`;
+    await refreshBootstrap(false);
+  });
+  EventsOn("account:rotated", async (p) => {
+    await refreshBootstrap(false);
+    const st = $("#status-text");
+    if (st) st.innerHTML = `Trocou pra conta <strong>${escapeHtml(p?.id || "")}</strong>`;
   });
 }
 

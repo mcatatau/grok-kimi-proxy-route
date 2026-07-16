@@ -216,10 +216,28 @@ func (c *Client) UserInfo(ctx context.Context, accessToken, issuer string) (emai
 	return email, userID
 }
 
+// AccessClaims are the JWT claims we care about for routing / abuse detection.
+type AccessClaims struct {
+	TeamID  string
+	UserID  string
+	Tier    int
+	BotFlag int
+	Exp     time.Time
+	Scope   string
+}
+
 func ClaimsFromAccess(access string) (teamID, userID string) {
+	c := ParseAccessClaims(access)
+	return c.TeamID, c.UserID
+}
+
+// ParseAccessClaims decodes the JWT payload without verifying the signature
+// (tokens are only used as opaque bearer credentials against xAI).
+func ParseAccessClaims(access string) AccessClaims {
+	var out AccessClaims
 	parts := strings.Split(access, ".")
 	if len(parts) < 2 {
-		return "", ""
+		return out
 	}
 	payload := parts[1]
 	if m := len(payload) % 4; m != 0 {
@@ -229,20 +247,66 @@ func ClaimsFromAccess(access string) (teamID, userID string) {
 	if err != nil {
 		raw, err = base64.RawURLEncoding.DecodeString(parts[1])
 		if err != nil {
-			return "", ""
+			return out
 		}
 	}
 	var m map[string]any
 	if json.Unmarshal(raw, &m) != nil {
-		return "", ""
+		return out
 	}
 	if v, ok := m["team_id"].(string); ok {
-		teamID = v
+		out.TeamID = v
 	}
 	if v, ok := m["sub"].(string); ok {
-		userID = v
+		out.UserID = v
 	}
-	return teamID, userID
+	if v, ok := m["scope"].(string); ok {
+		out.Scope = v
+	}
+	out.Tier = claimInt(m["tier"])
+	out.BotFlag = claimInt(m["bot_flag_source"])
+	if exp := claimInt64(m["exp"]); exp > 0 {
+		out.Exp = time.Unix(exp, 0).UTC()
+	}
+	return out
+}
+
+// BotFlagged reports whether the access token carries an anti-abuse bot flag.
+// Such tokens often still work on /models but get 403 on chat/responses.
+func BotFlagged(access string) bool {
+	return ParseAccessClaims(access).BotFlag != 0
+}
+
+func claimInt(v any) int {
+	switch n := v.(type) {
+	case float64:
+		return int(n)
+	case int:
+		return n
+	case int64:
+		return int(n)
+	case json.Number:
+		i, _ := n.Int64()
+		return int(i)
+	default:
+		return 0
+	}
+}
+
+func claimInt64(v any) int64 {
+	switch n := v.(type) {
+	case float64:
+		return int64(n)
+	case int:
+		return int64(n)
+	case int64:
+		return n
+	case json.Number:
+		i, _ := n.Int64()
+		return i
+	default:
+		return 0
+	}
 }
 
 func AccountFromToken(tok *TokenResponse, clientID, issuer string) store.Account {
@@ -252,21 +316,26 @@ func AccountFromToken(tok *TokenResponse, clientID, issuer string) store.Account
 	if issuer == "" {
 		issuer = store.DefaultIssuer
 	}
-	teamID, userID := ClaimsFromAccess(tok.AccessToken)
-	id := userID
+	claims := ParseAccessClaims(tok.AccessToken)
+	id := claims.UserID
 	if id == "" {
 		id = fmt.Sprintf("acc_%d", time.Now().UnixNano())
+	}
+	exp := time.Now().UTC().Add(time.Duration(tok.ExpiresIn) * time.Second)
+	if !claims.Exp.IsZero() {
+		// Prefer JWT exp when present (authoritative server-side lifetime).
+		exp = claims.Exp
 	}
 	return store.Account{
 		ID:           id,
 		Label:        "Grok account",
 		AccessToken:  tok.AccessToken,
 		RefreshToken: tok.RefreshToken,
-		ExpiresAt:    time.Now().UTC().Add(time.Duration(tok.ExpiresIn) * time.Second),
+		ExpiresAt:    exp,
 		ClientID:     clientID,
 		Issuer:       issuer,
 		Scope:        tok.Scope,
-		TeamID:       teamID,
-		UserID:       userID,
+		TeamID:       claims.TeamID,
+		UserID:       claims.UserID,
 	}
 }
