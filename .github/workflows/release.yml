@@ -164,6 +164,12 @@ jobs:
     # GitHub API sometimes returns 503 Unicorn during release creation — retry.
     timeout-minutes: 30
     steps:
+      # gh release needs a git repo context; artifacts alone are not enough.
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
       - name: Download Windows asset
         uses: actions/download-artifact@v4
         with:
@@ -183,6 +189,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ github.ref_name }}
+          REPO: ${{ github.repository }}
         shell: bash
         run: |
           set -euo pipefail
@@ -194,10 +201,24 @@ jobs:
           fi
           echo "assets: ${files[*]}"
 
+          # Only ship real downloadable binaries/archives (skip unpacked dirs).
+          upload=()
+          for f in "${files[@]}"; do
+            if [ -f "$f" ]; then
+              upload+=("$f")
+            fi
+          done
+          if [ ${#upload[@]} -eq 0 ]; then
+            echo "no release files found (only directories?)"
+            ls -laR release-assets
+            exit 1
+          fi
+          echo "upload: ${upload[*]}"
+
           # If a partial release already exists for this tag, delete it so we can recreate cleanly.
-          if gh release view "$TAG" >/dev/null 2>&1; then
+          if gh release view "$TAG" --repo "$REPO" >/dev/null 2>&1; then
             echo "release $TAG already exists — deleting for clean republish"
-            gh release delete "$TAG" --yes || true
+            gh release delete "$TAG" --repo "$REPO" --yes || true
           fi
 
           notes="## Grok Proxy Plus ${TAG}
@@ -220,10 +241,12 @@ jobs:
           while [ "$attempt" -le "$max" ]; do
             echo "=== release attempt $attempt/$max ==="
             if gh release create "$TAG" \
+              --repo "$REPO" \
               --title "Grok Proxy Plus ${TAG}" \
               --notes "$notes" \
               --latest \
-              "${files[@]}"; then
+              --verify-tag \
+              "${upload[@]}"; then
               echo "release published"
               exit 0
             fi
