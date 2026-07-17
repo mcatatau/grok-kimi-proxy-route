@@ -97,6 +97,7 @@ export namespace store {
 	    kimi_stealth_headless: boolean;
 	    google_email?: string;
 	    google_password?: string;
+	    load_balancer_strategies?: Record<string, string>;
 	
 	    static createFrom(source: any = {}) {
 	        return new Settings(source);
@@ -122,6 +123,7 @@ export namespace store {
 	        this.kimi_stealth_headless = source["kimi_stealth_headless"];
 	        this.google_email = source["google_email"];
 	        this.google_password = source["google_password"];
+	        this.load_balancer_strategies = source["load_balancer_strategies"];
 	    }
 	}
 

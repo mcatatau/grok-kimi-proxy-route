@@ -554,43 +554,19 @@ func (s *Server) gate(r *http.Request) bool {
 
 
 func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
-
 	if !s.gate(r) {
-
 		http.Error(w, `{"error":{"message":"unauthorized","type":"invalid_request_error"}}`, http.StatusUnauthorized)
-
 		return
-
 	}
-
 	// Unified catalog: same base URL lists Grok + Kimi (and optional others).
 	// Clients pick provider by model id — no "active provider" gate on listing.
 	base := s.store.Settings()
 
-	var models []upstream.ModelInfo
 	var data []map[string]any
 
-	// --- Grok / xAI ---
+	// --- Grok / xAI (static; avoid ensure side-effects that flip active account) ---
 	xaiModels := []upstream.ModelInfo{
 		{ID: "grok-4.5", Name: "Grok 4.5", Description: "xAI · /v1/responses", APIMode: "responses"},
-	}
-	// best-effort live list using any usable xAI token
-	if tok, _, _, err := s.ensure(WithRouteProvider(r.Context(), store.ProviderXAI)); err == nil && tok != "" {
-		xai := base.WithProvider(store.ProviderXAI)
-		if xm, err := s.upstream.ListModels(r.Context(), tok, xai); err == nil {
-			seen := map[string]bool{"grok-4.5": true}
-			for _, m := range xm {
-				id := strings.ToLower(m.ID)
-				if strings.Contains(id, "grok") && !seen[m.ID] {
-					m.APIMode = "responses"
-					if m.Description == "" {
-						m.Description = "xAI · /v1/responses"
-					}
-					xaiModels = append(xaiModels, m)
-					seen[m.ID] = true
-				}
-			}
-		}
 	}
 	for _, m := range xaiModels {
 		data = append(data, enrichModelMeta(m, store.ProviderXAI))
@@ -629,8 +605,6 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 			data = append(data, enrichModelMeta(upstream.ModelInfo{ID: id, Name: id, Description: "Vertex AI · ADC", APIMode: "chat"}, store.ProviderGemini))
 		}
 	}
-
-	_ = models
 
 	w.Header().Set("Content-Type", "application/json")
 	_ = json.NewEncoder(w).Encode(map[string]any{
@@ -858,6 +832,10 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
+	}
+	// Decrement in-flight counter when request completes (for least-used strategy).
+	if acc != nil {
+		defer s.store.DecAccountRequestCount(acc.ID)
 	}
 	// ensure returns store settings; re-apply route so upstream base/API match the model.
 	settings = settings.WithProvider(routeProv)

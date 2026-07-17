@@ -421,6 +421,50 @@ func (a *App) StartKimiBrowserLogin() (map[string]any, error) {
 	return a.addKimiSession(access, refresh, gl.GoogleRefreshToken, payload, "google_browser", gl.Email, gl.Name)
 }
 
+// StartKimiStealthLoginNewAccount forces a fresh browser context (isolated profile)
+// so the user can log into a *different* Google account without reusing the saved
+// persistent profile. Internal proxy still keeps all credentials for refresh/re-login.
+func (a *App) StartKimiStealthLoginNewAccount(autoClose bool) (map[string]any, error) {
+	if a.store == nil {
+		return nil, fmt.Errorf("store not ready")
+	}
+	root, err := a.kimiProjectRoot()
+	if err != nil {
+		return nil, err
+	}
+	// Isolated temp profile — forces Google to ask for credentials again.
+	profileDir := filepath.Join(root, "browser-data", fmt.Sprintf("google-profile-new-%d", time.Now().UnixNano()))
+	_ = os.MkdirAll(profileDir, 0o700)
+
+	a.safeEmit("kimi:login", map[string]any{
+		"phase":   "stealth_new",
+		"message": "Iniciando login com perfil isolado (nova conta Google)…",
+	})
+	gl, err := kimi.LoginWithGoogleStealth(root, profileDir, 5*time.Minute, autoClose, a.store.Settings().KimiStealthHeadless, a.store.Settings().GoogleEmail, a.store.Settings().GooglePassword)
+	if err != nil {
+		return nil, err
+	}
+	access := gl.AccessToken
+	refresh := gl.RefreshToken
+	if p, _ := kimi.DecodeJWT(access); p != nil && p.Exp > 0 && time.Until(time.Unix(p.Exp, 0)) < 2*time.Minute && refresh != "" {
+		if renewed, rerr := kimi.RefreshAccessToken(refresh); rerr == nil && renewed != nil {
+			access = renewed.AccessToken
+			if renewed.RefreshToken != "" {
+				refresh = renewed.RefreshToken
+			}
+		}
+	}
+	payload, _ := kimi.DecodeJWT(access)
+	rec, err := a.addKimiSession(access, refresh, gl.GoogleRefreshToken, payload, "google_stealth_new", gl.Email, gl.Name)
+	if err != nil {
+		return nil, err
+	}
+	if rec != nil {
+		rec["mode"] = "playwright_new"
+	}
+	return rec, nil
+}
+
 // StartKimiStealthLogin prefers full-HTTP Google refresh when a stored Google
 // refresh_token exists; falls back to Playwright stealth only if HTTP fails or
 // no Google refresh is available.
@@ -1327,38 +1371,39 @@ func (a *App) ensureCredsInner(ctx context.Context, preferID string, forceRefres
 		}
 		return store.GeminiCredMarker, acc, settings, nil
 	}
-	// Kimi Work: multi-account pool of sk-kimi keys (session auth mode).
-	if settings.IsKimiWork() {
-		// ActiveAccountID often still points at an xAI row — fix provider-local active.
-		_ = a.store.PreferHealthyActive()
+		// Kimi Work: multi-account pool with load balancing.
+		strategy := a.store.GetLoadBalancerStrategy(store.ProviderKimiWork)
 		var acc *store.Account
-		var ok bool
 		if preferID != "" {
-			acc, ok = a.store.GetAccount(preferID)
-			if ok && acc != nil && acc.NormalizedProvider() != store.ProviderKimiWork {
-				ok = false
-			}
-			if ok && acc != nil && (acc.Exhausted() || acc.AuthDenied()) && !forceRefresh {
-				ok = false
+			if a2, ok2 := a.store.GetAccount(preferID); ok2 && a2 != nil && a2.NormalizedProvider() == store.ProviderKimiWork && a2.Usable() {
+				acc = a2
 			}
 		}
-		if !ok || acc == nil {
-			acc, ok = a.store.PreferUsableAccountForProvider(store.ProviderKimiWork)
+		if acc == nil {
+			acc = a.store.PickAccountForProvider(store.ProviderKimiWork, strategy)
 		}
-		if !ok || acc == nil || acc.NormalizedProvider() != store.ProviderKimiWork {
-			// Se auto-create está habilitado, aguarda stealth re-login em vez de falhar imediatamente.
-			if a.GetAutoCreateOnExhausted() {
+		if acc == nil {
+			// If a Kimi re-login is already in progress, wait for it.
+			a.mu.Lock()
+			reloginRunning := a.kimiReloginRunning
+			a.mu.Unlock()
+			if reloginRunning {
+				a.waitAutoKimiStealthRelogin("ensureCreds: no kimi account, waiting for in-flight re-login")
+				acc = a.store.PickAccountForProvider(store.ProviderKimiWork, strategy)
+			}
+			if acc == nil && a.GetAutoCreateOnExhausted() {
 				a.waitAutoKimiStealthRelogin("ensureCreds: no kimi account available")
-				acc, ok = a.store.PreferUsableAccountForProvider(store.ProviderKimiWork)
+				acc = a.store.PickAccountForProvider(store.ProviderKimiWork, strategy)
 			}
-			if !ok || acc == nil || acc.NormalizedProvider() != store.ProviderKimiWork {
+			if acc == nil {
 				return "", nil, settings, fmt.Errorf("nenhuma conta Kimi Work — use Adicionar (Desktop / JWT / sk-kimi)")
 			}
 		}
-		// forceRefresh / auth retry: remint sk-kimi from web session (keys can be revoked).
+		// Track in-flight requests for least-used strategy.
+		a.store.IncAccountRequestCount(acc.ID)
+		// forceRefresh / auth retry: remint sk-kimi from web session.
 		if forceRefresh {
 			if err := a.remintKimiWorkKey(acc); err != nil {
-				// keep existing key if remint fails
 				runtime.LogErrorf(a.ctx, "kimi remint: %v", err)
 			} else if fresh, ok2 := a.store.GetAccount(acc.ID); ok2 && fresh != nil {
 				acc = fresh
@@ -1366,14 +1411,11 @@ func (a *App) ensureCredsInner(ctx context.Context, preferID string, forceRefres
 		}
 		tok := acc.BearerToken()
 		if tok == "" {
+			a.store.DecAccountRequestCount(acc.ID)
 			return "", nil, settings, fmt.Errorf("conta Kimi sem sk-kimi")
 		}
-		// Align active account for this provider so UI + proxy stay consistent.
-		if cur, _ := a.store.ActiveAccount(); cur == nil || cur.NormalizedProvider() != store.ProviderKimiWork || cur.ID != acc.ID {
-			_ = a.store.SetActiveAccount(acc.ID)
-		}
+		// ActiveAccountID is now UI-only; do not mutate it inside proxy requests.
 		return tok, acc, settings, nil
-	}
 	// Sync CLI tokens at most once per 30s — Codex fires many parallel /v1 calls.
 	a.lastCLISyncMu.Lock()
 	doSync := time.Since(a.lastCLISync) > 30*time.Second
@@ -1394,22 +1436,18 @@ func (a *App) ensureCredsInner(ctx context.Context, preferID string, forceRefres
 		settings = a.store.Settings()
 	}
 
+	// xAI: multi-account pool with load balancing.
+	strategy := a.store.GetLoadBalancerStrategy(store.ProviderXAI)
 	var acc *store.Account
-	var ok bool
 	if preferID != "" {
-		acc, ok = a.store.GetAccount(preferID)
-		if ok && acc != nil && (acc.Exhausted() || acc.AuthDenied()) && !forceRefresh {
-			ok = false
-		}
-		if ok && acc != nil && acc.NormalizedProvider() != store.ProviderXAI {
-			ok = false
+		if a2, ok2 := a.store.GetAccount(preferID); ok2 && a2 != nil && a2.NormalizedProvider() == store.ProviderXAI && a2.Usable() {
+			acc = a2
 		}
 	}
-	if !ok || acc == nil {
-		// Prefer a still-usable xAI account; if active is exhausted/auth-denied, rotate.
-		acc, ok = a.store.PreferUsableAccountForProvider(store.ProviderXAI)
+	if acc == nil {
+		acc = a.store.PickAccountForProvider(store.ProviderXAI, strategy)
 	}
-	if !ok || acc == nil {
+	if acc == nil {
 		if raw, has := a.store.ActiveAccount(); has && raw != nil && raw.NormalizedProvider() == store.ProviderXAI && (raw.Exhausted() || raw.AuthDenied()) {
 			a.maybeAutoCreate(firstNonEmpty(raw.ExhaustReason, raw.AuthDeniedReason))
 			return "", nil, settings, fmt.Errorf("todas as contas esgotadas ou bloqueadas — adicione conta ou relogue")
@@ -1417,51 +1455,39 @@ func (a *App) ensureCredsInner(ctx context.Context, preferID string, forceRefres
 		return "", nil, settings, fmt.Errorf("nenhuma conta — adicione uma conta em Contas")
 	}
 
+	// Track in-flight requests for least-used strategy.
+	a.store.IncAccountRequestCount(acc.ID)
+
 	// Skip JWT bot-flagged tokens (chat endpoint returns 403 permission-denied).
 	if oauth.BotFlagged(acc.AccessToken) {
+		a.store.DecAccountRequestCount(acc.ID)
 		_, _ = a.store.MarkAuthDenied(acc.ID, "bot_flag_source present in access token JWT")
-		if nextID := a.store.NextUsableAccountID(acc.ID); nextID != "" && nextID != acc.ID {
-			return a.ensureCredsFor(ctx, nextID)
-		}
 		return "", nil, settings, fmt.Errorf("conta bloqueada (bot flag) — relogue ou use outra conta")
-	}
-
-	// Keep settings.active in sync when we auto-skipped a dead one.
-	if settings.ActiveAccountID != acc.ID {
-		_ = a.store.SetActiveAccount(acc.ID)
-		a.safeEmit("account:rotated", map[string]any{"id": acc.ID, "reason": "skip_unusable"})
-		settings = a.store.Settings()
 	}
 
 	needRefresh := forceRefresh || acc.ExpiresSoon(5*time.Minute) || acc.Expired()
 	if needRefresh && acc.RefreshToken != "" {
 		if err := a.refreshAccountLocked(ctx, acc); err != nil {
 			if forceRefresh || acc.Expired() {
-				if nextID := a.store.NextUsableAccountID(acc.ID); nextID != "" && nextID != acc.ID {
-					return a.ensureCredsFor(ctx, nextID)
-				}
+				a.store.DecAccountRequestCount(acc.ID)
 				return "", nil, settings, fmt.Errorf("token expirado — faça login de novo: %v", err)
 			}
 			// Soft failure near expiry: keep current token only if not fully expired.
 		} else {
 			// Re-check bot flag after refresh.
 			if oauth.BotFlagged(acc.AccessToken) {
+				a.store.DecAccountRequestCount(acc.ID)
 				_, _ = a.store.MarkAuthDenied(acc.ID, "bot_flag_source present after refresh")
-				if nextID := a.store.NextUsableAccountID(acc.ID); nextID != "" && nextID != acc.ID {
-					return a.ensureCredsFor(ctx, nextID)
-				}
 				return "", nil, settings, fmt.Errorf("conta bloqueada (bot flag) — relogue ou use outra conta")
 			}
 		}
 	}
 	if acc.AccessToken == "" {
+		a.store.DecAccountRequestCount(acc.ID)
 		return "", nil, settings, fmt.Errorf("conta sem access_token")
 	}
 	if acc.Expired() && !forceRefresh {
-		// Last resort: try refresh already done; still expired → hard fail / rotate.
-		if nextID := a.store.NextUsableAccountID(acc.ID); nextID != "" && nextID != acc.ID {
-			return a.ensureCredsFor(ctx, nextID)
-		}
+		a.store.DecAccountRequestCount(acc.ID)
 		return "", nil, settings, fmt.Errorf("token expirado — faça login de novo")
 	}
 	return acc.AccessToken, acc, settings, nil

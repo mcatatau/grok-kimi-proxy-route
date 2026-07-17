@@ -81,6 +81,8 @@ export function StartKimiBrowserLogin():Promise<Record<string, any>>;
 
 export function StartKimiStealthLogin(arg1:boolean):Promise<Record<string, any>>;
 
+export function StartKimiStealthLoginNewAccount(arg1:boolean):Promise<Record<string, any>>;
+
 export function SyncGrokCLI():Promise<Record<string, any>>;
 
 export function UpdateSettings(arg1:Record<string, any>):Promise<store.Settings>;

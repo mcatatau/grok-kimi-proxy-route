@@ -30,6 +30,7 @@ import {
   SetGoogleCredentials,
   StartKimiBrowserLogin,
   StartKimiStealthLogin,
+  StartKimiStealthLoginNewAccount,
   AddKimiFromJWT,
   AddKimiAPIKey,
   LogoffKimiAccount,
@@ -59,6 +60,7 @@ const state = {
   shellBuilt: false,
   sessionCost: 0,
   sessionLat: null,
+  logs: [],
   // custom dropdowns
   picks: {
     effort: "high",
@@ -428,6 +430,7 @@ function ensureShell() {
             <span>think <b id="sess-think">0</b></span>
             <span class="cost" id="sess-cost">$0</span>
             <span id="sess-lat" style="display:none"></span>
+            <button class="icon-btn" id="btn-logs" type="button">Logs</button>
             <button class="icon-btn" id="btn-stats-top" type="button">API</button>
           </div>
         </header>
@@ -459,6 +462,7 @@ function ensureShell() {
   $("#btn-accounts").onclick = openAccountsModal;
   $("#btn-stats").onclick = openStatsModal;
   $("#btn-stats-top").onclick = openStatsModal;
+  $("#btn-logs").onclick = openLogsModal;
 
   const effortOpts = [
     { value: "low", label: "Low" },
@@ -762,6 +766,122 @@ async function confirmAndLogoffKimi(account) {
   await RemoveAccount(account.id);
   await refreshBootstrap(false);
   setStatus("Conta removida do proxy");
+}
+
+function addLog(source, message, detail = null) {
+  const entry = {
+    time: new Date().toLocaleTimeString("pt-BR"),
+    source,
+    message: String(message ?? ""),
+    detail: detail ? JSON.stringify(detail, null, 2) : null,
+  };
+  state.logs.push(entry);
+  // keep last 200
+  if (state.logs.length > 200) state.logs = state.logs.slice(-200);
+  // update badge if modal is open
+  const badge = document.getElementById("logs-badge");
+  if (badge) badge.textContent = state.logs.length;
+}
+
+function escapeLogHtml(s) {
+  return String(s ?? "")
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+}
+
+async function copyToClipboard(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (_) {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    document.execCommand("copy");
+    document.body.removeChild(ta);
+  }
+}
+
+function openLogsModal() {
+  closeOverlay();
+  const overlay = document.createElement("div");
+  overlay.className = "overlay overlay-glass";
+  overlay.id = "logs-overlay";
+
+  const rows = state.logs.length
+    ? state.logs
+        .map((log, i) => {
+          const detailBlock = log.detail
+            ? `<pre class="log-detail">${escapeLogHtml(log.detail)}</pre>`
+            : "";
+          return `
+        <div class="log-row" data-index="${i}">
+          <div class="log-head">
+            <span class="log-time">${escapeLogHtml(log.time)}</span>
+            <span class="log-source ${escapeLogHtml(log.source)}">${escapeLogHtml(log.source)}</span>
+            <span class="log-msg">${escapeLogHtml(log.message)}</span>
+            <button type="button" class="log-copy-btn" data-index="${i}" title="Copiar este log">Copiar</button>
+          </div>
+          ${detailBlock}
+        </div>`;
+        })
+        .join("")
+    : `<div class="log-empty">Nenhum log nesta sessão ainda.</div>`;
+
+  overlay.innerHTML = `
+    <div class="sheet sheet-logs">
+      <div class="sheet-head">
+        <div>
+          <h3>Logs da sessão</h3>
+          <p>${state.logs.length} evento(s) · perdido ao fechar o app</p>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;">
+          <button type="button" class="btn btn-quiet" id="logs-copy-all" ${state.logs.length ? "" : "disabled style=\"opacity:.4\""}>Copiar tudo</button>
+          <button type="button" class="btn btn-quiet" id="logs-close">Fechar</button>
+        </div>
+      </div>
+      <div class="logs-list">${rows}</div>
+    </div>`;
+
+  document.body.appendChild(overlay);
+
+  $("#logs-close", overlay).onclick = () => overlay.remove();
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay) overlay.remove();
+  });
+
+  if (state.logs.length) {
+    $("#logs-copy-all", overlay).onclick = async () => {
+      const text = state.logs
+        .map((l) => {
+          let line = `[${l.time}] [${l.source}] ${l.message}`;
+          if (l.detail) line += "\n" + l.detail;
+          return line;
+        })
+        .join("\n\n");
+      await copyToClipboard(text);
+      const btn = $("#logs-copy-all", overlay);
+      if (btn) {
+        btn.textContent = "Copiado!";
+        setTimeout(() => (btn.textContent = "Copiar tudo"), 1200);
+      }
+    };
+  }
+
+  overlay.querySelectorAll(".log-copy-btn").forEach((btn) => {
+    btn.onclick = async () => {
+      const idx = Number(btn.getAttribute("data-index"));
+      const log = state.logs[idx];
+      if (!log) return;
+      let text = `[${log.time}] [${log.source}] ${log.message}`;
+      if (log.detail) text += "\n" + log.detail;
+      await copyToClipboard(text);
+      btn.textContent = "Copiado!";
+      setTimeout(() => (btn.textContent = "Copiar"), 1200);
+    };
+  });
 }
 
 function paintChrome() {
@@ -1189,8 +1309,12 @@ function showAddKimiChooser() {
           <strong>Login Automático (Stealth)</strong>
           <span>Usa Playwright com perfil persistente. Primeira vez você loga no Google; depois o login é automático ao deletar/recarregar.</span>
         </button>
+        <button type="button" class="choose-card" id="m-stealth-new">
+          <strong>Nova conta (perfil limpo)</strong>
+          <span>Playwright com perfil ISOLADO — força login Google do zero. Use para adicionar uma conta Google diferente sem reutilizar a sessão salva.</span>
+        </button>
       </div>
-      <p class="hint" style="margin-top:10px;font-size:12px;opacity:.65">Multi-conta: repita o login com outra conta Google. Refresh token fica salvo.</p>
+      <p class="hint" style="margin-top:10px;font-size:12px;opacity:.65">Multi-conta: repita o login com outra conta Google. Refresh token fica salvo por conta.</p>
       <label style="display:flex;align-items:center;gap:8px;margin-top:10px;font-size:13px;cursor:pointer;">
         <input type="checkbox" id="m-kimi-headless" style="width:16px;height:16px;" />
         Playwright em modo <b>headless</b> (sem janela visível)
@@ -1297,6 +1421,21 @@ function showAddKimiChooser() {
       setStatus("Falha login stealth Kimi");
     }
   };
+  $("#m-stealth-new", overlay).onclick = async () => {
+    try {
+      setStatus("Kimi: iniciando login com perfil isolado (nova conta)…");
+      overlay.remove();
+      const rec = await StartKimiStealthLoginNewAccount(false);
+      await refreshBootstrap(false);
+      const bits = [];
+      if (rec.has_refresh) bits.push("kimi refresh");
+      if (rec.has_google_refresh) bits.push("google refresh");
+      setStatus(`Kimi nova conta ok · ${rec.label || rec.id}${bits.length ? " · " + bits.join(" + ") + " salvo" : ""}`);
+    } catch (e) {
+      alert("Falha login Kimi (perfil novo): " + e);
+      setStatus("Falha login Kimi nova conta");
+    }
+  };
 }
 
 function showKimiPasteModal(kind) {
@@ -1351,50 +1490,62 @@ async function openAccountsModal() {
   const title = kimiUI ? "Contas Kimi Work" : "Contas Grok";
   const overlay = document.createElement("div");
   overlay.className = "overlay overlay-glass";
+
   const rows =
     accounts.length === 0
-      ? `<div class="empty-hint" style="padding:16px 4px">Nenhuma conta neste provedor.</div>`
+      ? `<div class="empty-hint" style="padding:24px 4px;text-align:center">Nenhuma conta neste provedor.</div>`
       : accounts
           .map((a) => {
             const u = a.usage || {};
-            return `<div class="acc-row ${a.active ? "active" : ""}" data-id="${escapeHtml(a.id)}">
-              <div class="acc-main">
-                <strong>${escapeHtml(a.label || a.email || a.id)}</strong>
-                <div class="meta-line">
-                  ${a.active ? `<span class="badge badge-live">ativa</span>` : `<span class="badge badge-ok">salva</span>`}
-                  ${a.exhausted ? `<span class="badge badge-danger">esgotada</span>` : ""}
-                  ${a.auth_denied ? `<span class="badge badge-danger">auth</span>` : ""}
-                  ${kimiUI && a.has_web_session ? `<span class="badge badge-ok">web</span>` : ""}
-                  ${a.has_google_refresh ? `<span class="badge badge-ok" title="Google refresh token salvo">google refresh</span>` : ""}
-                  ${a.api_key_hint ? `<span class="badge badge-ok">${escapeHtml(a.api_key_hint)}</span>` : ""}
-                  <span>${fmt(u.total_tokens || 0)} tok · ${fmtUSD(u.cost_usd || 0)}</span>
+            const name = escapeHtml(a.label || a.email || a.id);
+            const email = escapeHtml(a.email || "");
+            const initialsStr = escapeHtml(initials(a.email || a.label || a.id));
+            const statusBadges = [];
+            if (a.active) statusBadges.push(`<span class="badge badge-live">ativa</span>`);
+            else statusBadges.push(`<span class="badge badge-ok">salva</span>`);
+            if (a.exhausted) statusBadges.push(`<span class="badge badge-danger">esgotada</span>`);
+            if (a.auth_denied) statusBadges.push(`<span class="badge badge-danger">auth negada</span>`);
+            if (kimiUI && a.has_web_session) statusBadges.push(`<span class="badge badge-ok">sessão web</span>`);
+            if (a.has_google_refresh) statusBadges.push(`<span class="badge badge-ok" title="Google refresh token salvo">google refresh</span>`);
+            if (a.api_key_hint) statusBadges.push(`<span class="badge badge-ok" title="sk-kimi salvo">${escapeHtml(a.api_key_hint)}</span>`);
+
+            return `<div class="acc-card ${a.active ? "active" : ""}" data-id="${escapeHtml(a.id)}">
+              <div class="acc-card-top">
+                <div class="acc-avatar">${initialsStr}</div>
+                <div class="acc-info">
+                  <div class="acc-name" title="${email}">${name}</div>
+                  <div class="acc-meta">${statusBadges.join("")}</div>
+                  <div class="acc-usage">
+                    <span><b>${fmt(u.total_tokens || 0)}</b> tok</span>
+                    <span><b>${fmtUSD(u.cost_usd || 0)}</b></span>
+                    <span><b>${fmt(u.requests || 0)}</b> req</span>
+                  </div>
                 </div>
               </div>
-              <div class="acc-actions">
-                ${a.active ? "" : `<button type="button" class="btn btn-solid btn-xs" data-act="use">Usar</button>`}
-                ${a.google_refresh_token ? `<button type="button" class="btn btn-quiet btn-xs" data-act="copy-google-refresh" title="Copiar Google refresh token">Copiar Google Refresh</button>` : ""}
-                <button type="button" class="btn btn-quiet btn-xs" data-act="rename">Renomear</button>
-                ${
-                  kimiUI
-                    ? `<button type="button" class="btn btn-quiet btn-xs danger" data-act="logoff">Deletar</button>`
-                    : `<button type="button" class="btn btn-quiet btn-xs danger" data-act="remove">Remover</button>`
-                }
+              <div class="acc-card-actions">
+                ${a.active ? `<button type="button" class="btn btn-xs btn-disabled" disabled>Em uso</button>` : `<button type="button" class="btn btn-xs btn-solid" data-act="use">Usar</button>`}
+                <button type="button" class="btn btn-xs btn-quiet" data-act="rename">Renomear</button>
+                ${a.google_refresh_token ? `<button type="button" class="btn btn-xs btn-quiet" data-act="copy-google-refresh" title="Copiar Google refresh token">Copiar G. Refresh</button>` : ""}
+                ${kimiUI
+                  ? `<button type="button" class="btn btn-xs btn-danger" data-act="logoff">Deletar</button>`
+                  : `<button type="button" class="btn btn-xs btn-danger" data-act="remove">Remover</button>`}
               </div>
             </div>`;
           })
           .join("");
+
   overlay.innerHTML = `
-    <div class="sheet sheet-accounts">
-      <div class="sheet-head">
+    <div class="sheet sheet-accounts" style="width:min(520px,92vw);padding:22px">
+      <div class="sheet-head" style="margin-bottom:14px">
         <div>
-          <h3>${title}</h3>
-          <p><span class="mode-pill mode-auth">Auth</span> pool do provedor ativo · ${accounts.length} conta(s)</p>
+          <h3 style="font-size:18px;margin-bottom:4px">${title}</h3>
+          <p style="font-size:12px;opacity:.7;margin:0"><span class="mode-pill mode-auth">Auth</span> pool do provedor ativo · ${accounts.length} conta(s)</p>
         </div>
-        <button class="btn btn-quiet" id="m-close">Fechar</button>
+        <button class="btn btn-quiet" id="m-close" style="height:30px">Fechar</button>
       </div>
-      <div class="acc-list">${rows}</div>
-      <div class="sheet-actions" style="margin-top:14px">
-        <button class="btn btn-solid" id="m-add">+ Adicionar</button>
+      <div class="acc-grid">${rows}</div>
+      <div class="sheet-actions" style="margin-top:16px;border-top:1px solid rgba(255,255,255,0.06);padding-top:14px">
+        <button class="btn btn-solid" id="m-add">+ Adicionar conta</button>
       </div>
     </div>`;
   document.body.appendChild(overlay);
@@ -1406,9 +1557,9 @@ async function openAccountsModal() {
   overlay.addEventListener("click", (e) => {
     if (e.target === overlay) overlay.remove();
   });
-  overlay.querySelectorAll(".acc-row").forEach((row) => {
-    const id = row.getAttribute("data-id");
-    row.querySelectorAll("[data-act]").forEach((btn) => {
+  overlay.querySelectorAll(".acc-card").forEach((card) => {
+    const id = card.getAttribute("data-id");
+    card.querySelectorAll("[data-act]").forEach((btn) => {
       btn.onclick = async (e) => {
         e.stopPropagation();
         const act = btn.getAttribute("data-act");
@@ -1446,7 +1597,7 @@ async function openAccountsModal() {
           try {
             await navigator.clipboard.writeText(token);
             btn.textContent = "Copiado!";
-            setTimeout(() => (btn.textContent = "Copiar Google Refresh"), 1500);
+            setTimeout(() => (btn.textContent = "Copiar G. Refresh"), 1500);
           } catch (_) {
             alert(token);
           }
@@ -2076,6 +2227,12 @@ async function refreshBootstrap(full = true) {
 }
 
 function wireEvents() {
+  EventsOn("kimi:login", (p) => {
+    const phase = p?.phase || "unknown";
+    const msg = p?.message || String(p || "");
+    addLog("kimi-login", msg, { phase, error: p?.error || null });
+  });
+
   EventsOn("chat:event", onChatEvent);
   EventsOn("search:start", (p) => onSearchEvent("search:start", p));
   EventsOn("search:results", (p) => onSearchEvent("search:results", p));
@@ -2112,6 +2269,7 @@ function wireEvents() {
     }
   });
   EventsOn("auth:success", async (payload) => {
+    addLog("auth", "Auth success", payload);
     state.device = null;
     document.querySelector(".overlay")?.remove();
     await refreshBootstrap(true);
@@ -2124,27 +2282,32 @@ function wireEvents() {
   });
 
   EventsOn("auth:error", (msg) => {
+    addLog("auth", "Auth error", { error: msg });
     alert("Auth error: " + msg);
     state.device = null;
     document.querySelector(".overlay")?.remove();
   });
   EventsOn("signup:progress", (p) => {
     const msg = p?.message || String(p || "");
+    addLog("signup", msg, p);
     const el = document.querySelector("#m-log");
     if (el) el.textContent = msg;
     const st = $("#status-text");
     if (st) st.innerHTML = `Signup · <strong>${escapeHtml(msg)}</strong>`;
   });
   EventsOn("signup:error", (msg) => {
+    addLog("signup", "Signup error", { error: msg });
     alert("Signup: " + msg);
     const st = $("#status-text");
     if (st) st.textContent = "Signup falhou";
   });
   EventsOn("signup:web_ok", (p) => {
+    addLog("signup", "Web OK", p);
     const st = $("#status-text");
     if (st) st.innerHTML = `Conta web · <strong>${escapeHtml(p?.email || "")}</strong> criada`;
   });
   EventsOn("signup:device", (p) => {
+    addLog("signup", "Device", p);
     if (p?.user_code) {
       showDeviceModal(
         { user_code: p.user_code, verification_url: p.verification_url },
@@ -2153,14 +2316,17 @@ function wireEvents() {
     }
   });
   EventsOn("signup:done", (p) => {
+    addLog("signup", "Done", p);
     const st = $("#status-text");
     if (st) st.innerHTML = `Signup · fase <strong>${escapeHtml(p?.phase || "done")}</strong>`;
   });
   EventsOn("signup:auto_triggered", () => {
+    addLog("signup", "Auto triggered (quota exhausted)");
     const st = $("#status-text");
     if (st) st.innerHTML = `Cota esgotada — <strong>criando conta nova…</strong>`;
   });
   EventsOn("kimi:relogin", async (p) => {
+    addLog("kimi-relogin", p?.message || "relogin", p);
     const st = $("#status-text");
     const phase = p?.phase || "";
     if (st) {
@@ -2177,6 +2343,7 @@ function wireEvents() {
     if (phase === "ok") await refreshBootstrap(false);
   });
   EventsOn("account:exhausted", async (p) => {
+    addLog("account", "Exhausted", p);
     const st = $("#status-text");
     if (st) {
       if (p?.logoff) {
@@ -2188,6 +2355,7 @@ function wireEvents() {
     await refreshBootstrap(false);
   });
   EventsOn("account:rotated", async (p) => {
+    addLog("account", "Rotated", p);
     await refreshBootstrap(false);
     const st = $("#status-text");
     if (st) st.innerHTML = `Trocou pra conta <strong>${escapeHtml(p?.id || "")}</strong>`;

@@ -154,6 +154,10 @@ export function StartKimiStealthLogin(arg1) {
   return window['go']['main']['App']['StartKimiStealthLogin'](arg1);
 }
 
+export function StartKimiStealthLoginNewAccount(arg1) {
+  return window['go']['main']['App']['StartKimiStealthLoginNewAccount'](arg1);
+}
+
 export function SyncGrokCLI() {
   return window['go']['main']['App']['SyncGrokCLI']();
 }

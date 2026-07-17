@@ -51,6 +51,28 @@ const (
 	KimiWorkUserAgent    = "Desktop Kimi Work"
 )
 
+type LoadBalancerStrategy string
+
+const (
+	StrategyActive     LoadBalancerStrategy = "active"
+	StrategyRoundRobin LoadBalancerStrategy = "round_robin"
+	StrategyLeastUsed  LoadBalancerStrategy = "least_used"
+	StrategyRandom     LoadBalancerStrategy = "random"
+)
+
+func (s LoadBalancerStrategy) IsValid() bool {
+	switch s {
+	case StrategyActive, StrategyRoundRobin, StrategyLeastUsed, StrategyRandom:
+		return true
+	}
+	return false
+}
+
+// ProviderState tracks per-provider load balancer state (round-robin index, etc).
+type ProviderState struct {
+	RRIndex int // round-robin cursor
+}
+
 type Account struct {
 	ID       string `json:"id"`
 	// Provider: xai | kimi_work | … Empty means xai (legacy accounts).
@@ -82,6 +104,9 @@ type Account struct {
 	Scope            string    `json:"scope,omitempty"`
 	CreatedAt        time.Time `json:"created_at"`
 	UpdatedAt        time.Time `json:"updated_at"`
+	// RequestCount is incremented atomically by the load balancer for least-used strategy.
+	// Not persisted; resets on app restart.
+	requestCount int64 `json:"-"`
 }
 
 func (a *Account) Expired() bool {
@@ -230,6 +255,8 @@ type Settings struct {
 	KimiStealthHeadless bool `json:"kimi_stealth_headless"`
 	GoogleEmail    string `json:"google_email,omitempty"`
 	GooglePassword string `json:"google_password,omitempty"`
+	// LoadBalancerStrategies maps provider → strategy (active | round_robin | least_used | random).
+	LoadBalancerStrategies map[string]string `json:"load_balancer_strategies,omitempty"`
 }
 
 // ForceModel reports whether the proxy should ignore the client's model field.
@@ -739,7 +766,140 @@ func (s *Settings) SanitizeModelForProvider() {
 	}
 }
 
-// ProviderCatalog is the static UI/backend catalog for multi-route providers.
+// PickAccountForProvider selects an account for the given provider using the specified strategy.
+// This replaces the global active account approach with per-provider load balancing.
+// If strategy is empty or invalid, it falls back to StrategyRoundRobin for session-auth providers.
+// Returns nil if no usable account exists for the provider.
+func (s *Store) PickAccountForProvider(provider string, strategy LoadBalancerStrategy) *Account {
+	want := s.normalizeProviderFilter(provider)
+
+	// API-key providers don't have account pools.
+	if want == ProviderOllie || want == ProviderGemini {
+		return nil
+	}
+
+	// Default strategy
+	if !strategy.IsValid() {
+		strategy = StrategyRoundRobin
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// Collect usable accounts for this provider.
+	var usable []Account
+	for _, a := range s.accounts {
+		if a.NormalizedProvider() != want || !a.Usable() {
+			continue
+		}
+		// For non-Kimi, also check expiry — but if refresh token exists, still usable.
+		if want != ProviderKimiWork && a.Expired() && a.RefreshToken == "" {
+			continue
+		}
+		usable = append(usable, a)
+	}
+	if len(usable) == 0 {
+		return nil
+	}
+
+	switch strategy {
+	case StrategyActive:
+		// Prefer the global active account if it belongs to this provider.
+		if id := s.settings.ActiveAccountID; id != "" {
+			for _, a := range usable {
+				if a.ID == id {
+					cp := a
+					return &cp
+				}
+			}
+		}
+		// Fall through to round-robin.
+		fallthrough
+	case StrategyRoundRobin:
+		state := s.providerStates[want]
+		if state == nil {
+			state = &ProviderState{}
+			s.providerStates[want] = state
+		}
+		// Sort for deterministic order.
+		for i := 0; i < len(usable); i++ {
+			for j := i + 1; j < len(usable); j++ {
+				if usable[j].ID < usable[i].ID {
+					usable[i], usable[j] = usable[j], usable[i]
+				}
+			}
+		}
+		idx := state.RRIndex % len(usable)
+		state.RRIndex++
+		cp := usable[idx]
+		return &cp
+	case StrategyLeastUsed:
+		// Pick the account with the lowest in-flight request count.
+		best := &usable[0]
+		for i := 1; i < len(usable); i++ {
+			if usable[i].requestCount < best.requestCount {
+				best = &usable[i]
+			}
+		}
+		cp := *best
+		return &cp
+	case StrategyRandom:
+		// Seed with time for simplicity; good enough for load balancing.
+		rng := time.Now().UnixNano()
+		idx := int(rng % int64(len(usable)))
+		cp := usable[idx]
+		return &cp
+	}
+
+	return nil
+}
+
+// IncAccountRequestCount atomically increments the in-flight request counter for an account.
+// Call DecAccountRequestCount when the request completes.
+func (s *Store) IncAccountRequestCount(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if a, ok := s.accounts[id]; ok {
+		a.requestCount++
+		s.accounts[id] = a
+	}
+}
+
+// DecAccountRequestCount atomically decrements the in-flight request counter.
+func (s *Store) DecAccountRequestCount(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if a, ok := s.accounts[id]; ok {
+		if a.requestCount > 0 {
+			a.requestCount--
+		}
+		s.accounts[id] = a
+	}
+}
+
+// SetLoadBalancerStrategy sets the default strategy for a provider (persisted in settings).
+func (s *Store) SetLoadBalancerStrategy(provider string, strategy LoadBalancerStrategy) error {
+	want := s.normalizeProviderFilter(provider)
+	return s.UpdateSettings(func(st *Settings) {
+		if st.LoadBalancerStrategies == nil {
+			st.LoadBalancerStrategies = map[string]string{}
+		}
+		st.LoadBalancerStrategies[want] = string(strategy)
+	})
+}
+
+// GetLoadBalancerStrategy returns the strategy for a provider.
+func (s *Store) GetLoadBalancerStrategy(provider string) LoadBalancerStrategy {
+	want := s.normalizeProviderFilter(provider)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.settings.LoadBalancerStrategies != nil {
+		if v, ok := s.settings.LoadBalancerStrategies[want]; ok {
+			return LoadBalancerStrategy(v)
+		}
+	}
+	return StrategyRoundRobin
+}
 func ProviderCatalog() []map[string]any {
 	return []map[string]any{
 		{
@@ -815,6 +975,8 @@ type Store struct {
 	accounts map[string]Account
 	// recent request samples (persisted, capped)
 	history []RequestSample
+	// providerStates tracks per-provider load balancer state (round-robin, etc).
+	providerStates map[string]*ProviderState
 }
 
 func DefaultDataDir() (string, error) {
@@ -867,10 +1029,11 @@ func Open(root string) (*Store, error) {
 		}
 	}
 	s := &Store{
-		root:     root,
-		accounts: map[string]Account{},
-		usage:    map[string]UsageTotals{},
-		settings: defaultSettings(),
+		root:           root,
+		accounts:       map[string]Account{},
+		usage:          map[string]UsageTotals{},
+		settings:       defaultSettings(),
+		providerStates: map[string]*ProviderState{},
 	}
 	if err := s.initDB(); err != nil {
 		return nil, fmt.Errorf("sqlite open: %w", err)
