@@ -16,6 +16,7 @@ import (
 
 const (
 	DefaultKimiURL = "https://www.kimi.com"
+	KimiWorkBaseURL = "https://agent-gw.kimi.com/coding/v1"
 	CreateAPIKeyRPC = "/apiv2/kimi.gateway.credentials.v1.APIKeyService/CreateAPIKey"
 	FeatureWORK     = 9
 	FeatureCODING   = 4
@@ -265,6 +266,40 @@ func truncate(s string, n int) string {
 		return s
 	}
 	return s[:n] + "…"
+}
+
+// TestAPIKey checks whether a sk-kimi WORK key is accepted by the upstream.
+func TestAPIKey(apiKey string) error {
+	apiKey = strings.TrimPrefix(strings.TrimSpace(apiKey), "Bearer ")
+	if apiKey == "" {
+		return fmt.Errorf("api key required")
+	}
+	req, err := http.NewRequest(http.MethodGet, KimiWorkBaseURL+"/models", nil)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) KimiDesktop/3.1.0 Chrome/134.0.0.0 Safari/537.36")
+	req.Header.Set("x-msh-platform", "kimi-code-cli")
+	req.Header.Set("x-msh-version", "0.23.5")
+	client := &http.Client{Timeout: 20 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode >= 400 {
+		b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<10))
+		return fmt.Errorf("HTTP %d: %s", resp.StatusCode, truncate(string(b), 240))
+	}
+	return nil
+}
+
+// TestRefreshToken checks whether a Kimi refresh token is valid.
+func TestRefreshToken(refreshToken string) error {
+	_, err := RefreshAccessToken(refreshToken)
+	return err
 }
 
 // ResolveKimiModel maps Desktop / OpenCode aliases to gateway wire id.

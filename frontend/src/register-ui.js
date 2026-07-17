@@ -78,6 +78,12 @@ function accountBadges(a) {
   if (a.has_google_refresh) {
     bits.push(`<span class="badge badge-ok" title="Google refresh token salvo — re-login sem browser possível.">google refresh</span>`);
   }
+  if (a.refresh_tested) {
+    bits.push(`<span class="badge badge-ok" title="Refresh token Kimi validado — re-autenticação funciona.">refresh ok</span>`);
+  }
+  if (a.upstream_tested) {
+    bits.push(`<span class="badge badge-ok" title="Chave sk-kimi testada no upstream — conta funcional.">upstream ok</span>`);
+  }
   return bits.join("");
 }
 
@@ -411,7 +417,7 @@ export function openAccountsManager({ refreshBootstrap, paintChrome }) {
                 : `<button type="button" class="icon-btn" data-act="use">Usar</button>`
             }
             ${a.exhausted || a.chat_denied ? `<button type="button" class="icon-btn" data-act="reset" title="Limpa cota esgotada e chat negado">Resetar</button>` : ""}
-            ${a.google_refresh_token ? `<button type="button" class="icon-btn" data-act="copy-google-refresh" title="Copiar Google refresh token">Copiar Google Refresh</button>` : ""}
+            ${a.provider === "kimi_work" ? `<button type="button" class="icon-btn" data-act="edit-creds" title="Email/senha Google para re-login automático">Credenciais Google</button>` : ""}
             <button type="button" class="icon-btn" data-act="rename">Renomear</button>
             <button type="button" class="icon-btn danger" data-act="remove">Remover</button>
           </div>
@@ -451,13 +457,16 @@ export function openAccountsManager({ refreshBootstrap, paintChrome }) {
               await refreshBootstrap?.(false);
               renderList();
               await paintChrome?.();
-            } else if (act === "copy-google-refresh") {
+            } else if (act === "edit-creds") {
               const a = state.accounts.find((x) => x.id === id);
-              const token = a?.google_refresh_token || "";
-              if (!token) { alert("Sem Google refresh token nesta conta."); return; }
-              await navigator.clipboard.writeText(token);
-              btn.textContent = "Copiado!";
-              setTimeout(() => (btn.textContent = "Copiar Google Refresh"), 1500);
+              if (!a) return;
+              const current = await GetAccountGoogleCredentials(id);
+              const email = prompt(`Email Google para re-login automático da conta "${a.label || a.email || id}" (opcional):`, current?.[0] || "");
+              if (email === null) return;
+              const password = prompt(`Senha Google (opcional - usada apenas se o refresh token falhar):`, current?.[1] || "");
+              if (password === null) return;
+              await SetAccountGoogleCredentials(id, email || "", password || "");
+              alert("Credenciais salvas para esta conta.");
             }
           } catch (e) {
             alert(String(e));

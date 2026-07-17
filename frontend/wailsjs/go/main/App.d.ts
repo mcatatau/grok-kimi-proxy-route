@@ -21,6 +21,8 @@ export function DeleteMCPServer(arg1:string):Promise<void>;
 
 export function DeleteSkill(arg1:string):Promise<void>;
 
+export function GetAccountGoogleCredentials(arg1:string):Promise<string|string>;
+
 export function GetActiveRequest():Promise<main.ActiveRequest>;
 
 export function GetAutoCreateOnExhausted():Promise<boolean>;
@@ -65,6 +67,8 @@ export function RenameAccount(arg1:string,arg2:string):Promise<void>;
 
 export function SendChat(arg1:upstream.ChatRequest):Promise<void>;
 
+export function SetAccountGoogleCredentials(arg1:string,arg2:string,arg3:string):Promise<void>;
+
 export function SetActiveAccount(arg1:string):Promise<void>;
 
 export function SetAutoCreateOnExhausted(arg1:boolean):Promise<void>;
@@ -80,6 +84,8 @@ export function StartDeviceLogin():Promise<main.deviceLoginState>;
 export function StartKimiBrowserLogin():Promise<Record<string, any>>;
 
 export function StartKimiStealthLogin(arg1:boolean):Promise<Record<string, any>>;
+
+export function StartKimiStealthLoginForAccount(arg1:string,arg2:boolean):Promise<Record<string, any>>;
 
 export function StartKimiStealthLoginNewAccount(arg1:boolean):Promise<Record<string, any>>;
 

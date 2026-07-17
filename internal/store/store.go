@@ -91,6 +91,9 @@ type Account struct {
 	Source   string `json:"source,omitempty"` // oauth | desktop_mint | paste_key | paste_jwt | …
 	// GoogleRefreshToken stores the Google OAuth refresh token (for VM re-login without browser).
 	GoogleRefreshToken string `json:"google_refresh_token,omitempty"`
+	// GoogleEmail and GooglePassword are stored per-account for Playwright stealth re-login.
+	GoogleEmail    string `json:"google_email,omitempty"`
+	GooglePassword string `json:"google_password,omitempty"`
 	// ExhaustedAt marks when usage quota (402 / balance exhausted) was observed.
 	// Zero means the account is still usable for quota purposes.
 	ExhaustedAt   time.Time `json:"exhausted_at,omitempty"`
@@ -284,10 +287,10 @@ func (s Settings) ResolveModelForClient(requested string) string {
 	return s.resolveModel(requested, false)
 }
 
-// ResolveModelForCodex honors client model (same as ResolveModelForClient).
-// Force only applies when ForceDefaultModel is explicitly true in settings.
+// ResolveModelForCodex always honors the client model (same as ResolveModelForClient).
+// Global force_default / UI provider must not rewrite what the client sent.
 func (s Settings) ResolveModelForCodex(requested string) string {
-	return s.resolveModel(requested, s.ForceModel())
+	return s.resolveModel(requested, false)
 }
 
 func (s Settings) resolveModel(requested string, force bool) string {
@@ -351,52 +354,38 @@ func resolveKimiWorkModel(requested string) string {
 }
 
 // WithProviderForModel returns a copy of settings with Provider/Upstream switched
-// to match the requested model id (so client-selected models route correctly).
-// Unrecognized ids leave settings unchanged. Does not mutate the store.
+// to match the client-requested model id. Does NOT fall back to the UI "active"
+// provider: empty/alias/unknown models route to xAI. Does not mutate the store.
 func (s Settings) WithProviderForModel(requested string) Settings {
 	req := strings.TrimSpace(requested)
-	if req == "" {
-		return s
-	}
-	// aliases stay on active provider
 	low := strings.ToLower(req)
-	if low == "default" || low == "proxy" || low == "auto" || low == "global" || low == "current" || low == "grok-desktop" {
-		return s
+	// No model or generic alias → xAI (never inherit UI global provider).
+	if req == "" || low == "default" || low == "proxy" || low == "auto" ||
+		low == "global" || low == "current" || low == "grok-desktop" {
+		return s.WithProvider(ProviderXAI)
 	}
 	id := req
 	if i := strings.LastIndex(id, "/models/"); i >= 0 {
 		id = id[i+len("/models/"):]
 	}
 	id = normalizeOllieModelAlias(id)
-	out := s
 	switch {
 	case looksLikeKimiWorkModel(id):
-		out.Provider = ProviderKimiWork
-		out.UpstreamBase = KimiWorkUpstream
-		// agent-gw has no /responses — chat/completions only.
-		out.APIMode = "chat"
+		return s.WithProvider(ProviderKimiWork)
 	case looksLikeGeminiModel(id):
-		out.Provider = ProviderGemini
-		if strings.TrimSpace(out.GeminiLocation) == "" {
-			out.GeminiLocation = GeminiDefaultLocation
-		}
+		return s.WithProvider(ProviderGemini)
 	case looksLikeOllieModel(id):
-		out.Provider = ProviderOllie
-		out.UpstreamBase = OllieUpstream
-		out.APIMode = "chat"
+		return s.WithProvider(ProviderOllie)
 	case looksLikeXAIModel(id):
-		out.Provider = ProviderXAI
-		out.APIMode = "responses"
-		if out.UpstreamBase == "" || strings.Contains(strings.ToLower(out.UpstreamBase), "ollie") ||
-			strings.Contains(strings.ToLower(out.UpstreamBase), "aiplatform") ||
-			strings.Contains(strings.ToLower(out.UpstreamBase), "agent-gw") {
-			out.UpstreamBase = DefaultUpstream
-		}
+		return s.WithProvider(ProviderXAI)
+	default:
+		// Unknown id: treat as xAI so a leftover kimi_work UI setting cannot steal the request.
+		return s.WithProvider(ProviderXAI)
 	}
-	return out
 }
 
 // WithProvider returns a copy of settings forced to provider (request-scoped routing).
+// Also aligns DefaultModel when the previous default belongs to another provider.
 func (s Settings) WithProvider(provider string) Settings {
 	out := s
 	p := strings.ToLower(strings.TrimSpace(provider))
@@ -405,19 +394,31 @@ func (s Settings) WithProvider(provider string) Settings {
 		out.Provider = ProviderKimiWork
 		out.UpstreamBase = KimiWorkUpstream
 		out.APIMode = "chat"
+		if out.DefaultModel == "" || !looksLikeKimiWorkModel(out.DefaultModel) {
+			out.DefaultModel = KimiWorkDefaultModel
+		}
 	case ProviderOllie:
 		out.Provider = ProviderOllie
 		out.UpstreamBase = OllieUpstream
 		out.APIMode = "chat"
+		if out.DefaultModel == "" || looksLikeXAIModel(out.DefaultModel) || looksLikeKimiWorkModel(out.DefaultModel) || looksLikeGeminiModel(out.DefaultModel) {
+			out.DefaultModel = OllieDefaultModel
+		}
 	case ProviderGemini:
 		out.Provider = ProviderGemini
 		if strings.TrimSpace(out.GeminiLocation) == "" {
 			out.GeminiLocation = GeminiDefaultLocation
 		}
+		if out.DefaultModel == "" || looksLikeXAIModel(out.DefaultModel) || looksLikeKimiWorkModel(out.DefaultModel) || looksLikeOllieModel(out.DefaultModel) {
+			out.DefaultModel = GeminiDefaultModel
+		}
 	case ProviderXAI, "grok", "x.ai":
 		out.Provider = ProviderXAI
 		out.UpstreamBase = DefaultUpstream
 		out.APIMode = "responses"
+		if out.DefaultModel == "" || looksLikeKimiWorkModel(out.DefaultModel) || looksLikeOllieModel(out.DefaultModel) || looksLikeGeminiModel(out.DefaultModel) {
+			out.DefaultModel = DefaultModel
+		}
 	}
 	return out
 }
@@ -909,7 +910,7 @@ func ProviderCatalog() []map[string]any {
 		},
 		{
 			"id": ProviderKimiWork, "name": "Kimi Work", "auth_mode": AuthModeSession,
-			"description": "Google browser login → sk-kimi · multi-conta · chat/completions",
+			"description": "Google login → sk-kimi · até 3 contas · rotação + re-login HTTP",
 			"default_model": KimiWorkDefaultModel, "default_api": "chat",
 		},
 		{
@@ -1517,7 +1518,8 @@ func (s *Store) PublicAccountsForProvider(provider string) []map[string]any {
 			"has_web_session":    hasWeb,
 		"has_refresh":        strings.TrimSpace(a.RefreshToken) != "",
 		"has_google_refresh": strings.TrimSpace(a.GoogleRefreshToken) != "",
-		"google_refresh_token": a.GoogleRefreshToken,
+		"google_email":         a.GoogleEmail,
+		"has_google_password":  a.GooglePassword != "",
 		"expires_at":         a.ExpiresAt,
 		"expired":            a.Expired(),
 		"exhausted":          a.Exhausted(),

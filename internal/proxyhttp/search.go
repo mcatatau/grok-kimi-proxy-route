@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"grok-desktop/internal/store"
 	"grok-desktop/internal/upstream"
 )
 
@@ -113,14 +114,17 @@ func (s *Server) runSearch(w http.ResponseWriter, r *http.Request, req SearchReq
 		http.Error(w, `{"error":{"message":"unauthorized"}}`, http.StatusUnauthorized)
 		return
 	}
-	token, acc, settings, err := s.ensure(r.Context())
+	// Search is xAI-native; never inherit UI kimi_work global provider.
+	ctx := WithRouteProvider(r.Context(), store.ProviderXAI)
+	token, acc, settings, err := s.ensure(ctx)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
 	}
+	settings = settings.WithProvider(store.ProviderXAI)
 	model := strings.TrimSpace(req.Model)
-	if model == "" {
-		model = settings.DefaultModel
+	if model == "" || !strings.Contains(strings.ToLower(model), "grok") {
+		model = store.DefaultModel
 	}
 	// strip -responses suffix if clients pass it
 	if strings.HasSuffix(strings.ToLower(model), "-responses") {
@@ -151,6 +155,39 @@ func (s *Server) runSearch(w http.ResponseWriter, r *http.Request, req SearchReq
 		// bubble upstream status-ish messages as 402/429 when quota
 		msg := err.Error()
 		low := strings.ToLower(msg)
+		// Quota FIRST: Kimi may return 403 with resource_exhausted — must not be treated as auth.
+		quota := strings.Contains(low, "http 402") || strings.Contains(low, "balance exhausted") ||
+			strings.Contains(low, "usage limit") || strings.Contains(low, "resource_exhausted") ||
+			strings.Contains(low, "access_terminated") || strings.Contains(low, "billing cycle") ||
+			strings.Contains(low, "upgrade to get more") ||
+			(strings.Contains(low, "http 429") && (strings.Contains(low, "exhausted") || strings.Contains(low, "quota") || strings.Contains(low, "balance")))
+		if quota && accountID != "" {
+			if fn := s.quotaHandler(); fn != nil {
+				if rotated := fn(accountID, msg); rotated {
+					tok2, acc2, settings2, err2 := s.ensure(r.Context())
+					if err2 == nil && tok2 != "" && (acc2 == nil || acc2.Usable()) {
+						token, acc, settings = tok2, acc2, settings2
+						if acc2 != nil {
+							accountID = acc2.ID
+						}
+						continue
+					}
+				}
+			} else {
+				_, _ = s.store.MarkExhausted(accountID, msg)
+				if next := s.store.NextUsableAccountID(accountID); next != "" {
+					_ = s.store.SetActiveAccount(next)
+					tok2, acc2, settings2, err2 := s.ensure(r.Context())
+					if err2 == nil {
+						token, acc, settings = tok2, acc2, settings2
+						if acc2 != nil {
+							accountID = acc2.ID
+						}
+						continue
+					}
+				}
+			}
+		}
 		auth := strings.Contains(low, "http 401") || strings.Contains(low, "http 403") ||
 			strings.Contains(low, "permission-denied") || strings.Contains(low, "invalid or expired credentials") ||
 			strings.Contains(low, "no auth context") || strings.Contains(low, "access to the chat endpoint is denied")
@@ -172,37 +209,6 @@ func (s *Server) runSearch(w http.ResponseWriter, r *http.Request, req SearchReq
 				if rotated := fn(accountID, msg); rotated {
 					tok2, acc2, settings2, err2 := s.ensure(r.Context())
 					if err2 == nil && (acc2 == nil || acc2.ID != accountID) {
-						token, acc, settings = tok2, acc2, settings2
-						if acc2 != nil {
-							accountID = acc2.ID
-						}
-						continue
-					}
-				}
-			}
-		}
-		quota := strings.Contains(low, "http 402") || strings.Contains(low, "balance exhausted") ||
-			strings.Contains(low, "usage limit") || strings.Contains(low, "resource_exhausted") ||
-			strings.Contains(low, "access_terminated") || strings.Contains(low, "billing cycle") ||
-			(strings.Contains(low, "http 429") && (strings.Contains(low, "exhausted") || strings.Contains(low, "quota") || strings.Contains(low, "balance")))
-		if quota && accountID != "" {
-			if fn := s.quotaHandler(); fn != nil {
-				if rotated := fn(accountID, msg); rotated {
-					tok2, acc2, settings2, err2 := s.ensure(r.Context())
-					if err2 == nil && tok2 != "" && (acc2 == nil || acc2.Usable()) {
-						token, acc, settings = tok2, acc2, settings2
-						if acc2 != nil {
-							accountID = acc2.ID
-						}
-						continue
-					}
-				}
-			} else {
-				_, _ = s.store.MarkExhausted(accountID, msg)
-				if next := s.store.NextUsableAccountID(accountID); next != "" {
-					_ = s.store.SetActiveAccount(next)
-					tok2, acc2, settings2, err2 := s.ensure(r.Context())
-					if err2 == nil {
 						token, acc, settings = tok2, acc2, settings2
 						if acc2 != nil {
 							accountID = acc2.ID

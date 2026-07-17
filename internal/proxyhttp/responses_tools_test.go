@@ -2,6 +2,7 @@ package proxyhttp
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"net/http/httptest"
 	"strings"
@@ -75,7 +76,7 @@ func TestPipeResponsesSSEToChat_ToolCalls(t *testing.T) {
 	}, "\n")
 
 	rec := httptest.NewRecorder()
-	if err := pipeResponsesSSEToChat(rec, strings.NewReader(sse), "grok-4.5"); err != nil {
+	if err := pipeResponsesSSEToChat(context.Background(), rec, strings.NewReader(sse), "grok-4.5"); err != nil {
 		t.Fatal(err)
 	}
 	body := rec.Body.String()
@@ -139,7 +140,7 @@ func TestPipeResponsesSSEToChat_TextOnlyStop(t *testing.T) {
 		``,
 	}, "\n")
 	rec := httptest.NewRecorder()
-	if err := pipeResponsesSSEToChat(rec, strings.NewReader(sse), "grok-4.5"); err != nil {
+	if err := pipeResponsesSSEToChat(context.Background(), rec, strings.NewReader(sse), "grok-4.5"); err != nil {
 		t.Fatal(err)
 	}
 	body := rec.Body.String()

@@ -151,7 +151,11 @@ func RunBrowserLogin(opts BrowserLoginOptions) (*Session, error) {
 	cmd.Env = env
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
-	err := cmd.Run()
+	err := cmd.Start()
+	_ = SetupProcessJob(cmd)
+	if err == nil {
+		err = cmd.Wait()
+	}
 	outLog := strings.TrimSpace(stdout.String() + "\n" + stderr.String())
 	if err != nil {
 		// still try reading out if partial

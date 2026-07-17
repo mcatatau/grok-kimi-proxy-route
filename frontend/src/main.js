@@ -24,12 +24,11 @@ import {
   IsSignupRunning,
   SetAutoCreateOnExhausted,
   GetAutoCreateOnExhausted,
-  GetKimiStealthHeadless,
-  SetKimiStealthHeadless,
   GetGoogleCredentials,
   SetGoogleCredentials,
+  GetAccountGoogleCredentials,
+  SetAccountGoogleCredentials,
   StartKimiBrowserLogin,
-  StartKimiStealthLogin,
   StartKimiStealthLoginNewAccount,
   AddKimiFromJWT,
   AddKimiAPIKey,
@@ -1292,43 +1291,33 @@ function showAddAccountChooser() {
   };
 }
 
-function showAddKimiChooser() {
+async function showAddKimiChooser() {
   closeOverlay();
+  let activeCount = 0;
+  try {
+    const rows = (await ListAccountsForProvider("kimi_work")) || [];
+    activeCount = rows.filter((a) => !a.exhausted && !a.auth_denied).length;
+  } catch (_) {
+    activeCount = (state.accounts || []).filter((a) => isKimiProvider(a.provider) && !a.exhausted).length;
+  }
+  const atCap = activeCount >= 3;
   const overlay = document.createElement("div");
   overlay.className = "overlay overlay-glass";
   overlay.innerHTML = `
     <div class="sheet sheet-choose sheet-kimi">
       <h3>Adicionar conta Kimi Work</h3>
-      <p><span class="mode-pill mode-auth">Auth</span> Igual o app oficial: abre o <b>navegador do sistema</b> (Google) → Kimi tokens → <code>sk-kimi</code>. Sem Playwright, sem ler o Kimi Desktop.</p>
+      <p><span class="mode-pill mode-auth">Auth</span> Pool de <b>até 3 contas</b> (agora: ${activeCount}/3). Com 1 já funciona. O proxy faz rotação e re-login automático.</p>
       <div class="choose-grid">
-        <button type="button" class="choose-card" id="m-browser">
-          <strong>Login com Google</strong>
-          <span>Abre seu Chrome/Edge normal. Escolha a conta Google. Ao voltar, a conta Kimi Work entra no pool sozinha.</span>
+        <button type="button" class="choose-card" id="m-browser" ${atCap ? "disabled" : ""}>
+          <strong>Login manual (Google)</strong>
+          <span>Abre seu Chrome/Edge. Escolha a conta Google. Tokens entram no pool. Ideal para a 1ª conta ou quando já está logado no navegador.</span>
         </button>
-        <button type="button" class="choose-card" id="m-stealth">
-          <strong>Login Automático (Stealth)</strong>
-          <span>Usa Playwright com perfil persistente. Primeira vez você loga no Google; depois o login é automático ao deletar/recarregar.</span>
-        </button>
-        <button type="button" class="choose-card" id="m-stealth-new">
+        <button type="button" class="choose-card" id="m-clean" ${atCap ? "disabled" : ""}>
           <strong>Nova conta (perfil limpo)</strong>
-          <span>Playwright com perfil ISOLADO — força login Google do zero. Use para adicionar uma conta Google diferente sem reutilizar a sessão salva.</span>
+          <span>Playwright com perfil isolado — login Google do zero. Use para adicionar outra conta Google sem misturar sessão.</span>
         </button>
       </div>
-      <p class="hint" style="margin-top:10px;font-size:12px;opacity:.65">Multi-conta: repita o login com outra conta Google. Refresh token fica salvo por conta.</p>
-      <label style="display:flex;align-items:center;gap:8px;margin-top:10px;font-size:13px;cursor:pointer;">
-        <input type="checkbox" id="m-kimi-headless" style="width:16px;height:16px;" />
-        Playwright em modo <b>headless</b> (sem janela visível)
-      </label>
-      <div style="margin-top:12px;border-top:1px solid rgba(255,255,255,0.08);padding-top:12px;">
-        <p style="font-size:12px;opacity:.7;margin:0 0 8px;">Credenciais Google (auto-login):</p>
-        <input type="email" id="m-google-email" placeholder="seu-email@gmail.com" style="width:100%;padding:8px 10px;border-radius:6px;border:1px solid rgba(255,255,255,0.12);background:rgba(0,0,0,0.3);color:#eee;font-size:13px;margin-bottom:8px;" />
-        <div style="position:relative;width:100%;margin-bottom:8px;">
-          <input type="password" id="m-google-password" placeholder="senha do Google" style="width:100%;padding:8px 10px 8px 10px;border-radius:6px;border:1px solid rgba(255,255,255,0.12);background:rgba(0,0,0,0.3);color:#eee;font-size:13px;box-sizing:border-box;" />
-          <button type="button" id="m-toggle-pass" style="position:absolute;right:6px;top:50%;transform:translateY(-50%);background:none;border:none;color:#888;cursor:pointer;font-size:14px;padding:4px 6px;line-height:1;">👁</button>
-        </div>
-        <button type="button" class="btn btn-quiet" id="m-save-creds" style="width:100%;font-size:13px;">Salvar credenciais</button>
-        <p id="m-creds-status" style="font-size:11px;opacity:.5;margin:6px 0 0;text-align:center;"></p>
-      </div>
+      <p class="hint" style="margin-top:10px;font-size:12px;opacity:.65">${atCap ? "Limite de 3 contas atingido — remova uma em Contas." : "Re-login automático: o proxy renova cada conta com o Google refresh salvo (sem tela). Só abre browser se o HTTP falhar."}</p>
       <div class="sheet-actions">
         <button class="btn btn-quiet" id="m-cancel">Fechar</button>
       </div>
@@ -1338,58 +1327,7 @@ function showAddKimiChooser() {
   overlay.addEventListener("click", (e) => {
     if (e.target === overlay) overlay.remove();
   });
-  GetKimiStealthHeadless()
-    .then((v) => {
-      const el = $("#m-kimi-headless", overlay);
-      if (el) el.checked = !!v;
-    })
-    .catch(() => {});
-  $("#m-kimi-headless", overlay).onchange = (e) => {
-    SetKimiStealthHeadless(!!e.target.checked).catch(() => {});
-  };
-  // Load Google credentials
-  GetGoogleCredentials()
-    .then(([email, password]) => {
-      const elEmail = $("#m-google-email", overlay);
-      const elPass = $("#m-google-password", overlay);
-      if (elEmail) elEmail.value = email || "";
-      if (elPass) elPass.value = password || "";
-      // Show status if already saved
-      const statusEl = $("#m-creds-status", overlay);
-      if (statusEl && email) {
-        statusEl.textContent = "Credenciais salvas ✓";
-        statusEl.style.opacity = "0.7";
-        statusEl.style.color = "#7ee787";
-      }
-    })
-    .catch(() => {});
-  // Toggle password visibility
-  $("#m-toggle-pass", overlay).onclick = () => {
-    const passInput = $("#m-google-password", overlay);
-    if (!passInput) return;
-    const isHidden = passInput.type === "password";
-    passInput.type = isHidden ? "text" : "password";
-    $("#m-toggle-pass", overlay).textContent = isHidden ? "🙈" : "👁";
-  };
-  // Save button
-  $("#m-save-creds", overlay).onclick = async () => {
-    const email = $("#m-google-email", overlay)?.value || "";
-    const password = $("#m-google-password", overlay)?.value || "";
-    const statusEl = $("#m-creds-status", overlay);
-    try {
-      await SetGoogleCredentials(email, password);
-      if (statusEl) {
-        statusEl.textContent = "Credenciais salvas ✓";
-        statusEl.style.opacity = "0.7";
-        statusEl.style.color = "#7ee787";
-      }
-    } catch (e) {
-      if (statusEl) {
-        statusEl.textContent = "Erro ao salvar: " + e;
-        statusEl.style.color = "#ff7b72";
-      }
-    }
-  };
+  if (atCap) return;
   $("#m-browser", overlay).onclick = async () => {
     try {
       setStatus("Kimi: abra o navegador e escolha a conta Google…");
@@ -1399,41 +1337,29 @@ function showAddKimiChooser() {
       const bits = [];
       if (rec.has_refresh) bits.push("kimi refresh");
       if (rec.has_google_refresh) bits.push("google refresh");
+      if (rec.refresh_tested) bits.push("refresh validado");
+      if (rec.upstream_tested) bits.push("upstream ok");
       setStatus(`Kimi ok · ${rec.label || rec.id}${bits.length ? " · " + bits.join(" + ") + " salvo" : ""}`);
     } catch (e) {
       alert("Falha login Kimi: " + e);
       setStatus("Falha login Kimi");
     }
   };
-  $("#m-stealth", overlay).onclick = async () => {
+  $("#m-clean", overlay).onclick = async () => {
     try {
-      setStatus("Kimi: iniciando login automático com Playwright…");
-      overlay.remove();
-      const rec = await StartKimiStealthLogin(false);
-      await refreshBootstrap(false);
-      const bits = [];
-      if (rec.has_refresh) bits.push("kimi refresh");
-      if (rec.has_google_refresh) bits.push("google refresh");
-      const mode = rec.mode === "http_refresh" ? "HTTP" : rec.mode === "playwright" ? "Playwright" : "stealth";
-      setStatus(`Kimi ${mode} ok · ${rec.label || rec.id}${bits.length ? " · " + bits.join(" + ") + " salvo" : ""}`);
-    } catch (e) {
-      alert("Falha login stealth Kimi: " + e);
-      setStatus("Falha login stealth Kimi");
-    }
-  };
-  $("#m-stealth-new", overlay).onclick = async () => {
-    try {
-      setStatus("Kimi: iniciando login com perfil isolado (nova conta)…");
+      setStatus("Kimi: perfil limpo — faça login Google…");
       overlay.remove();
       const rec = await StartKimiStealthLoginNewAccount(false);
       await refreshBootstrap(false);
       const bits = [];
       if (rec.has_refresh) bits.push("kimi refresh");
       if (rec.has_google_refresh) bits.push("google refresh");
-      setStatus(`Kimi nova conta ok · ${rec.label || rec.id}${bits.length ? " · " + bits.join(" + ") + " salvo" : ""}`);
+      if (rec.refresh_tested) bits.push("refresh validado");
+      if (rec.upstream_tested) bits.push("upstream ok");
+      setStatus(`Kimi ok · ${rec.label || rec.id}${bits.length ? " · " + bits.join(" + ") + " salvo" : ""}`);
     } catch (e) {
-      alert("Falha login Kimi (perfil novo): " + e);
-      setStatus("Falha login Kimi nova conta");
+      alert("Falha login Kimi (perfil limpo): " + e);
+      setStatus("Falha login Kimi perfil limpo");
     }
   };
 }
@@ -1471,6 +1397,75 @@ function showKimiPasteModal(kind) {
       setStatus("Conta Kimi adicionada");
     } catch (e) {
       alert("Falha: " + e);
+    }
+  };
+}
+
+async function showAccountCredsModal(account) {
+  closeOverlay();
+  const overlay = document.createElement("div");
+  overlay.className = "overlay overlay-glass";
+  const name = escapeHtml(account.label || account.email || account.id);
+  overlay.innerHTML = `
+    <div class="sheet" style="width:min(420px,92vw)">
+      <h3>Credenciais Google · ${name}</h3>
+      <p style="font-size:12px;opacity:.7;margin:0 0 12px;">Usadas para auto-login Playwright quando o HTTP refresh falhar.</p>
+      <input type="email" id="m-google-email" placeholder="seu-email@gmail.com" style="width:100%;padding:8px 10px;border-radius:6px;border:1px solid rgba(255,255,255,0.12);background:rgba(0,0,0,0.3);color:#eee;font-size:13px;margin-bottom:8px;" />
+      <div style="position:relative;width:100%;margin-bottom:12px;">
+        <input type="password" id="m-google-password" placeholder="senha do Google" style="width:100%;padding:8px 10px 8px 10px;border-radius:6px;border:1px solid rgba(255,255,255,0.12);background:rgba(0,0,0,0.3);color:#eee;font-size:13px;box-sizing:border-box;" />
+        <button type="button" id="m-toggle-pass" style="position:absolute;right:6px;top:50%;transform:translateY(-50%);background:none;border:none;color:#888;cursor:pointer;font-size:14px;padding:4px 6px;line-height:1;">👁</button>
+      </div>
+      <button type="button" class="btn btn-solid" id="m-save-creds" style="width:100%;font-size:13px;margin-bottom:8px;">Salvar credenciais</button>
+      <p id="m-creds-status" style="font-size:11px;opacity:.5;margin:0 0 8px;text-align:center;"></p>
+      <div class="sheet-actions">
+        <button class="btn btn-quiet" id="m-cancel">Fechar</button>
+      </div>
+    </div>`;
+  document.body.appendChild(overlay);
+  $("#m-cancel", overlay).onclick = () => overlay.remove();
+  overlay.addEventListener("click", (e) => {
+    if (e.target === overlay) overlay.remove();
+  });
+
+  // Load per-account credentials
+  try {
+    const [email, password] = await GetAccountGoogleCredentials(account.id);
+    const elEmail = $("#m-google-email", overlay);
+    const elPass = $("#m-google-password", overlay);
+    if (elEmail) elEmail.value = email || "";
+    if (elPass) elPass.value = password || "";
+    const statusEl = $("#m-creds-status", overlay);
+    if (statusEl && email) {
+      statusEl.textContent = "Credenciais salvas ✓";
+      statusEl.style.opacity = "0.7";
+      statusEl.style.color = "#7ee787";
+    }
+  } catch (_) {}
+
+  $("#m-toggle-pass", overlay).onclick = () => {
+    const passInput = $("#m-google-password", overlay);
+    if (!passInput) return;
+    const isHidden = passInput.type === "password";
+    passInput.type = isHidden ? "text" : "password";
+    $("#m-toggle-pass", overlay).textContent = isHidden ? "🙈" : "👁";
+  };
+
+  $("#m-save-creds", overlay).onclick = async () => {
+    const email = $("#m-google-email", overlay)?.value || "";
+    const password = $("#m-google-password", overlay)?.value || "";
+    const statusEl = $("#m-creds-status", overlay);
+    try {
+      await SetAccountGoogleCredentials(account.id, email, password);
+      if (statusEl) {
+        statusEl.textContent = "Credenciais salvas ✓";
+        statusEl.style.opacity = "0.7";
+        statusEl.style.color = "#7ee787";
+      }
+    } catch (e) {
+      if (statusEl) {
+        statusEl.textContent = "Erro ao salvar: " + e;
+        statusEl.style.color = "#ff7b72";
+      }
     }
   };
 }
@@ -1525,7 +1520,8 @@ async function openAccountsModal() {
               <div class="acc-card-actions">
                 ${a.active ? `<button type="button" class="btn btn-xs btn-disabled" disabled>Em uso</button>` : `<button type="button" class="btn btn-xs btn-solid" data-act="use">Usar</button>`}
                 <button type="button" class="btn btn-xs btn-quiet" data-act="rename">Renomear</button>
-                ${a.google_refresh_token ? `<button type="button" class="btn btn-xs btn-quiet" data-act="copy-google-refresh" title="Copiar Google refresh token">Copiar G. Refresh</button>` : ""}
+                ${kimiUI ? `<button type="button" class="btn btn-xs btn-quiet" data-act="creds" title="Configurar credenciais Google para auto-login">Credenciais Google</button>` : ""}
+                ${a.has_google_refresh ? `<button type="button" class="btn btn-xs btn-quiet" data-act="test-google-refresh" title="Google refresh token salvo">Google Refresh OK</button>` : ""}
                 ${kimiUI
                   ? `<button type="button" class="btn btn-xs btn-danger" data-act="logoff">Deletar</button>`
                   : `<button type="button" class="btn btn-xs btn-danger" data-act="remove">Remover</button>`}
@@ -1539,7 +1535,7 @@ async function openAccountsModal() {
       <div class="sheet-head" style="margin-bottom:14px">
         <div>
           <h3 style="font-size:18px;margin-bottom:4px">${title}</h3>
-          <p style="font-size:12px;opacity:.7;margin:0"><span class="mode-pill mode-auth">Auth</span> pool do provedor ativo · ${accounts.length} conta(s)</p>
+          <p style="font-size:12px;opacity:.7;margin:0"><span class="mode-pill mode-auth">Auth</span> pool · ${accounts.length}${kimiUI ? "/3" : ""} conta(s) · rotação + re-login automático</p>
         </div>
         <button class="btn btn-quiet" id="m-close" style="height:30px">Fechar</button>
       </div>
@@ -1574,6 +1570,13 @@ async function openAccountsModal() {
             await refreshBootstrap(false);
             openAccountsModal();
           }
+        } else if (act === "creds") {
+          const a = accounts.find((x) => x.id === id);
+          if (a) {
+            overlay.remove();
+            await showAccountCredsModal(a);
+            openAccountsModal();
+          }
         } else if (act === "logoff") {
           const a = accounts.find((x) => x.id === id);
           if (a) {
@@ -1586,20 +1589,6 @@ async function openAccountsModal() {
             await RemoveAccount(id);
             await refreshBootstrap(false);
             openAccountsModal();
-          }
-        } else if (act === "copy-google-refresh") {
-          const a = accounts.find((x) => x.id === id);
-          const token = a?.google_refresh_token || "";
-          if (!token) {
-            alert("Sem Google refresh token nesta conta.");
-            return;
-          }
-          try {
-            await navigator.clipboard.writeText(token);
-            btn.textContent = "Copiado!";
-            setTimeout(() => (btn.textContent = "Copiar G. Refresh"), 1500);
-          } catch (_) {
-            alert(token);
           }
         }
       };
@@ -2331,9 +2320,9 @@ function wireEvents() {
     const phase = p?.phase || "";
     if (st) {
       if (phase === "start") {
-        st.innerHTML = `Cota Kimi — <strong>Playwright recriando conta…</strong>`;
+        st.innerHTML = `Cota Kimi — <strong>${p?.http ? "re-login HTTP…" : "re-login (perfil limpo)…"}</strong>`;
       } else if (phase === "ok") {
-        st.innerHTML = `Nova conta Kimi · <strong>${escapeHtml(p?.account?.email || p?.account?.label || "ok")}</strong>`;
+        st.innerHTML = `Kimi renovada · <strong>${escapeHtml(p?.account?.email || p?.account?.label || "ok")}</strong>`;
       } else if (phase === "error") {
         st.innerHTML = `Falha re-login Kimi · <strong>${escapeHtml(p?.error || p?.message || "")}</strong>`;
       } else if (p?.message) {

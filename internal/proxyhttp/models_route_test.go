@@ -57,7 +57,8 @@ func TestHandleModelsUnifiedCatalog(t *testing.T) {
 }
 
 func TestWithProviderForModelRouting(t *testing.T) {
-	base := store.Settings{Provider: store.ProviderXAI}
+	// Start from Kimi UI global — client model must still win.
+	base := store.Settings{Provider: store.ProviderKimiWork, DefaultModel: store.KimiWorkDefaultModel}
 	k := base.WithProviderForModel("kimi-for-coding")
 	if !k.IsKimiWork() {
 		t.Fatalf("want kimi, got %s", k.NormalizedProvider())
@@ -67,6 +68,13 @@ func TestWithProviderForModelRouting(t *testing.T) {
 	}
 	g := base.WithProviderForModel("grok-4.5")
 	if !g.IsXAI() {
-		t.Fatalf("want xai, got %s", g.NormalizedProvider())
+		t.Fatalf("want xai when client asks grok, got %s (must ignore UI kimi global)", g.NormalizedProvider())
+	}
+	// Empty / alias / unknown → xAI, not leftover UI provider.
+	for _, m := range []string{"", "default", "auto", "some-unknown-model"} {
+		x := base.WithProviderForModel(m)
+		if !x.IsXAI() {
+			t.Fatalf("model %q: want xai, got %s", m, x.NormalizedProvider())
+		}
 	}
 }

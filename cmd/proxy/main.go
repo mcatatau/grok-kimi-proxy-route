@@ -11,6 +11,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -40,22 +41,71 @@ func main() {
 		return ensureCreds(ctx, st, oa, id, true)
 	}
 
+	// autoReloginKimi tries HTTP-only re-login for exhausted Kimi accounts so the proxy
+	// does not return quota errors to the client while recovery is in progress.
+	autoReloginKimi := func(accountID, reason string) bool {
+		acc, ok := st.GetAccount(accountID)
+		if !ok || acc == nil {
+			return false
+		}
+		// If account has a Google refresh token, try HTTP-only re-login first.
+		if gr := strings.TrimSpace(acc.GoogleRefreshToken); gr != "" {
+			log.Printf("proxy: quota on %s — trying HTTP Google refresh re-login...", accountID)
+			if sess, err := kimi.LoginWithGoogleRefresh(gr); err == nil && sess != nil {
+				log.Printf("proxy: HTTP re-login OK for %s (%s)", accountID, sess.Email)
+				// Upsert the recovered account
+				acc.AccessToken = sess.AccessToken
+				acc.RefreshToken = sess.RefreshToken
+				acc.GoogleRefreshToken = sess.GoogleRefreshToken
+				if sess.Email != "" {
+					acc.Email = sess.Email
+				}
+				acc.ExhaustedAt = time.Time{}
+				acc.ExhaustReason = ""
+				acc.AuthDeniedAt = time.Time{}
+				acc.AuthDeniedReason = ""
+				acc.UpdatedAt = time.Now().UTC()
+				_ = st.UpsertAccount(*acc)
+				// Try to mint a fresh work key immediately
+				_ = tryRemintKimiWork(st, acc)
+				_ = st.SetActiveAccount(accountID)
+				return true
+			} else {
+				log.Printf("proxy: HTTP Google refresh failed for %s: %v", accountID, err)
+			}
+		}
+		// If account has a web session but no Google refresh, try reminting the key.
+		if kimi.HasWebSession(acc.AccessToken, acc.RefreshToken) {
+			log.Printf("proxy: quota on %s — trying remint work key...", accountID)
+			if tryRemintKimiWork(st, acc) {
+				log.Printf("proxy: remint OK for %s", accountID)
+				acc, _ = st.GetAccount(accountID)
+				if acc != nil && acc.Usable() {
+					_ = st.SetActiveAccount(accountID)
+					return true
+				}
+			} else {
+				log.Printf("proxy: remint failed for %s", accountID)
+			}
+		}
+		return false
+	}
+
 	srv := proxyhttp.New(st, up, ensure)
 	srv.SetForceRefresh(forceRefresh)
 	srv.SetQuotaHandler(func(accountID, reason string) bool {
-		// Kimi: delete consumer account on kimi.com when quota ends (web JWT), then drop local.
 		if acc, ok := st.GetAccount(accountID); ok && acc != nil && acc.NormalizedProvider() == store.ProviderKimiWork {
+			// Prefer HTTP re-login of THIS account (keeps pool size; no min-3 requirement).
+			if autoReloginKimi(accountID, reason) {
+				return true
+			}
+			// Remote delete on kimi.com when web session exists, but KEEP local row exhausted
+			// so Google refresh remains for the next auto re-login cycle.
 			if kimi.HasWebSession(acc.AccessToken, acc.RefreshToken) {
 				if _, err := kimi.LogoffWithSession(acc.AccessToken, acc.RefreshToken); err != nil {
 					log.Printf("kimi logoff failed for %s: %v — mark exhausted", accountID, err)
 				} else {
-					log.Printf("kimi logoff OK — deleted remote account %s (%s)", accountID, acc.Email)
-					_ = st.RemoveAccount(accountID)
-					if next := st.NextUsableAccountID(accountID); next != "" {
-						_ = st.SetActiveAccount(next)
-						return true
-					}
-					return false
+					log.Printf("kimi logoff OK — remote deleted %s (%s); local row kept for re-login", accountID, acc.Email)
 				}
 			} else {
 				log.Printf("kimi quota: %s has no web session (sk-kimi only?) — mark exhausted", accountID)
@@ -64,7 +114,22 @@ func main() {
 		_, _ = st.MarkExhausted(accountID, reason)
 		if next := st.NextUsableAccountID(accountID); next != "" {
 			_ = st.SetActiveAccount(next)
+			// Replenish exhausted account in background (HTTP only in headless proxy).
+			go func(id string) {
+				if autoReloginKimi(id, reason+" (rotated; replenish)") {
+					log.Printf("proxy: replenished Kimi account %s", id)
+				}
+			}(accountID)
 			return true
+		}
+		// No other usable account — try recover ANY Kimi account via HTTP (blocks until done).
+		for _, a := range st.ListAccounts() {
+			if a.NormalizedProvider() != store.ProviderKimiWork {
+				continue
+			}
+			if autoReloginKimi(a.ID, reason) {
+				return true
+			}
 		}
 		return false
 	})
@@ -100,6 +165,44 @@ func main() {
 	defer cancel()
 	_ = srv.Stop(ctx)
 	fmt.Println("stopped")
+}
+
+// tryRemintKimiWork attempts to refresh the web JWT and mint a new sk-kimi WORK key.
+// Returns true if a usable key was obtained.
+func tryRemintKimiWork(st *store.Store, acc *store.Account) bool {
+	if acc == nil {
+		return false
+	}
+	if !kimi.HasWebSession(acc.AccessToken, acc.RefreshToken) {
+		return false
+	}
+	access, refresh, err := kimi.EnsureAccessToken(acc.AccessToken, acc.RefreshToken)
+	if err != nil {
+		return false
+	}
+	minted, err := kimi.MintWorkAPIKey(access, "grok-desktop-proxy")
+	if err != nil {
+		return false
+	}
+	acc.APIKey = minted.APIKey
+	acc.AccessToken = access
+	if refresh != "" {
+		acc.RefreshToken = refresh
+	}
+	if minted.DeviceID != "" {
+		acc.DeviceID = minted.DeviceID
+	}
+	if !minted.ExpiresAt.IsZero() {
+		acc.ExpiresAt = minted.ExpiresAt
+	}
+	acc.ExhaustedAt = time.Time{}
+	acc.ExhaustReason = ""
+	acc.AuthDeniedAt = time.Time{}
+	acc.AuthDeniedReason = ""
+	acc.UpdatedAt = time.Now().UTC()
+	_ = st.UpsertAccount(*acc)
+	_ = st.ClearAuthState(acc.ID)
+	return true
 }
 
 func ensureCreds(

@@ -420,6 +420,68 @@ func (c *Client) streamGemini(
 	return nil
 }
 
+func isQuotaPayload(payload map[string]any) (bool, string) {
+	errObj, ok := payload["error"].(map[string]any)
+	if !ok {
+		if s, ok := payload["error"].(string); ok && s != "" {
+			errObj = map[string]any{"message": s}
+		} else {
+			return false, ""
+		}
+	}
+	msg := ""
+	if m, ok := errObj["message"].(string); ok {
+		msg = m
+	} else if m, ok := payload["message"].(string); ok {
+		msg = m
+	}
+	if msg == "" {
+		return false, ""
+	}
+	low := strings.ToLower(msg)
+	if strings.Contains(low, "usage limit") ||
+		strings.Contains(low, "billing cycle") ||
+		strings.Contains(low, "resource_exhausted") ||
+		strings.Contains(low, "access_terminated") ||
+		strings.Contains(low, "balance exhausted") ||
+		strings.Contains(low, "quota exceeded") ||
+		strings.Contains(low, "upgrade to get more") ||
+		(strings.Contains(low, "rate limit exceeded") && (strings.Contains(low, "quota") || strings.Contains(low, "usage") || strings.Contains(low, "billing"))) {
+		return true, msg
+	}
+	return false, ""
+}
+
+type contextReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (c *contextReader) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	type result struct {
+		n   int
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		n, err := c.r.Read(p)
+		done <- result{n, err}
+	}()
+	select {
+	case <-c.ctx.Done():
+		return 0, c.ctx.Err()
+	case res := <-done:
+		return res.n, res.err
+	}
+}
+
+func newContextReader(ctx context.Context, r io.Reader) io.Reader {
+	return &contextReader{ctx: ctx, r: r}
+}
+
 func (c *Client) streamChatCompletions(
 	ctx context.Context,
 	token string,
@@ -510,7 +572,7 @@ func (c *Client) streamChatCompletions(
 	var id, outModel string
 	var contentLen, thinkLen int
 	promptEst := estimatePromptTokens(req.Messages)
-	sc := bufio.NewScanner(resp.Body)
+	sc := bufio.NewScanner(newContextReader(ctx, resp.Body))
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	for sc.Scan() {
 		line := sc.Text()
@@ -529,6 +591,12 @@ func (c *Client) streamChatCompletions(
 		var chunk map[string]any
 		if json.Unmarshal([]byte(payload), &chunk) != nil {
 			continue
+		}
+		// Detect mid-stream quota error (upstream may embed error inside SSE).
+		if isQuota, qmsg := isQuotaPayload(chunk); isQuota {
+			emit(StreamEvent{Type: "error", Error: qmsg, Model: outModel})
+			emit(StreamEvent{Type: "done", Model: outModel})
+			return fmt.Errorf("sse quota error: %s", qmsg)
 		}
 		if id == "" {
 			if v, ok := chunk["id"].(string); ok {
@@ -676,7 +744,7 @@ func (c *Client) streamResponses(
 	if strings.TrimSpace(req.Input) != "" {
 		promptEst = int64((len(req.Input) + 3) / 4)
 	}
-	sc := bufio.NewScanner(resp.Body)
+	sc := bufio.NewScanner(newContextReader(ctx, resp.Body))
 	sc.Buffer(make([]byte, 0, 64*1024), 1024*1024)
 	var eventName string
 	for sc.Scan() {
@@ -695,6 +763,12 @@ func (c *Client) streamResponses(
 		var obj map[string]any
 		if json.Unmarshal([]byte(payload), &obj) != nil {
 			continue
+		}
+		// Detect mid-stream quota error (upstream may embed error inside SSE).
+		if isQuota, qmsg := isQuotaPayload(obj); isQuota {
+			emit(StreamEvent{Type: "error", Error: qmsg, Model: outModel})
+			emit(StreamEvent{Type: "done", Model: outModel})
+			return fmt.Errorf("sse quota error: %s", qmsg)
 		}
 		typ, _ := obj["type"].(string)
 		if typ == "" {

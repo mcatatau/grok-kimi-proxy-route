@@ -9,7 +9,7 @@ import (
 )
 
 // isCodexRequest detects OpenAI Codex CLI / Codex VS Code clients.
-// Only these clients are forced onto the proxy global DefaultModel.
+// Detection only — model is still whatever the client sent (no global force).
 func isCodexRequest(r *http.Request) bool {
 	if r == nil {
 		return false
@@ -39,8 +39,8 @@ func isCodexRequest(r *http.Request) bool {
 	return false
 }
 
-// tokenAccountForSettings returns credentials matching the (possibly re-routed) provider.
-// Does not mutate the global active provider in the store.
+// tokenAccountForSettings returns credentials for the request-scoped provider
+// (from client model). Never uses UI "active provider" to pick credentials.
 func tokenAccountForSettings(
 	s *Server,
 	ctx context.Context,
@@ -59,25 +59,36 @@ func tokenAccountForSettings(
 			ID: "gemini-adc", Label: "Gemini (ADC)", Email: settings.EffectiveGeminiProject(),
 			AccessToken: store.GeminiCredMarker,
 		}
+	case settings.IsKimiWork():
+		if acc != nil && acc.NormalizedProvider() == store.ProviderKimiWork && acc.Usable() {
+			if t := acc.BearerToken(); t != "" {
+				return t, acc
+			}
+		}
+		if s != nil && s.store != nil {
+			if a, ok := s.store.PreferUsableAccountForProvider(store.ProviderKimiWork); ok && a != nil {
+				if t := a.BearerToken(); t != "" {
+					return t, a
+				}
+			}
+		}
+		return token, acc
 	default:
-		// Need a real xAI token. If current ensure already produced one, keep it.
-		if token != "" && token != store.OllieAPIKey && token != store.GeminiCredMarker {
+		// xAI: keep token if already an xAI account from ensure.
+		if acc != nil && acc.NormalizedProvider() == store.ProviderXAI && acc.Usable() && token != "" &&
+			token != store.OllieAPIKey && token != store.GeminiCredMarker && !strings.HasPrefix(token, "sk-kimi-") {
 			return token, acc
 		}
-		// Try store usable xAI account without switching active provider permanently.
 		if s == nil || s.store == nil {
 			return token, acc
 		}
-		if a, ok := s.store.PreferUsableAccount(); ok && a != nil && a.AccessToken != "" {
+		if a, ok := s.store.PreferUsableAccountForProvider(store.ProviderXAI); ok && a != nil && a.AccessToken != "" {
 			return a.AccessToken, a
 		}
-		if a, ok := s.store.ActiveAccount(); ok && a != nil && a.AccessToken != "" &&
-			a.AccessToken != store.OllieAPIKey && a.AccessToken != store.GeminiCredMarker {
-			return a.AccessToken, a
-		}
-		// Last resort: full ensure (may follow current global provider).
-		if tok2, acc2, _, err := s.ensure(ctx); err == nil && tok2 != "" &&
-			tok2 != store.OllieAPIKey && tok2 != store.GeminiCredMarker {
+		// ensure with xAI route override (not UI global provider).
+		ctxXAI := WithRouteProvider(ctx, store.ProviderXAI)
+		if tok2, acc2, _, err := s.ensure(ctxXAI); err == nil && tok2 != "" &&
+			tok2 != store.OllieAPIKey && tok2 != store.GeminiCredMarker && !strings.HasPrefix(tok2, "sk-kimi-") {
 			return tok2, acc2
 		}
 		return token, acc

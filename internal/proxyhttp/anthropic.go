@@ -26,11 +26,6 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "invalid api key")
 		return
 	}
-	token, acc, settings, err := s.ensure(r.Context())
-	if err != nil {
-		writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", err.Error())
-		return
-	}
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", err.Error())
@@ -42,15 +37,18 @@ func (s *Server) handleMessages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Route by client model only — never UI global provider.
 	reqModel := asString(req["model"])
-	var model string
-	if isCodexRequest(r) {
-		model = settings.ResolveModelForCodex(reqModel)
-	} else {
-		settings = settings.WithProviderForModel(reqModel)
-		token, acc = tokenAccountForSettings(s, r.Context(), token, acc, settings)
-		model = settings.ResolveModelForClient(reqModel)
+	settings := s.store.Settings().WithProviderForModel(reqModel)
+	ctx := WithRouteProvider(r.Context(), settings.NormalizedProvider())
+	token, acc, settings2, err := s.ensure(ctx)
+	if err != nil {
+		writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", err.Error())
+		return
 	}
+	settings = settings2.WithProvider(settings.NormalizedProvider())
+	token, acc = tokenAccountForSettings(s, ctx, token, acc, settings)
+	model := settings.ResolveModelForClient(reqModel)
 	_ = acc
 	stream, _ := req["stream"].(bool)
 	maxTokens := asInt(req["max_tokens"], 4096)

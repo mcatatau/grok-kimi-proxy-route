@@ -404,6 +404,7 @@ func LoginWithGoogleStealth(projectRoot, profileDir string, timeout time.Duratio
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("failed to start playwright stealth: %w", err)
 	}
+	_ = SetupProcessJob(cmd)
 
 	// Wait until the user CLOSES the Playwright window (process exit).
 	// Do NOT finish early on loopback code / out-file — that closed the browser too soon
@@ -465,9 +466,7 @@ waitLoop:
 		case <-ticker.C:
 			// Never finalize early — only track timeout for kill.
 			if time.Now().After(deadline) {
-				if cmd.Process != nil {
-					_ = cmd.Process.Kill()
-				}
+				_ = KillProcessTree(cmd)
 				select {
 				case <-doneCh:
 				case <-time.After(3 * time.Second):

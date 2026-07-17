@@ -34,6 +34,10 @@ export function DeleteSkill(arg1) {
   return window['go']['main']['App']['DeleteSkill'](arg1);
 }
 
+export function GetAccountGoogleCredentials(arg1) {
+  return window['go']['main']['App']['GetAccountGoogleCredentials'](arg1);
+}
+
 export function GetActiveRequest() {
   return window['go']['main']['App']['GetActiveRequest']();
 }
@@ -122,6 +126,10 @@ export function SendChat(arg1) {
   return window['go']['main']['App']['SendChat'](arg1);
 }
 
+export function SetAccountGoogleCredentials(arg1, arg2, arg3) {
+  return window['go']['main']['App']['SetAccountGoogleCredentials'](arg1, arg2, arg3);
+}
+
 export function SetActiveAccount(arg1) {
   return window['go']['main']['App']['SetActiveAccount'](arg1);
 }
@@ -152,6 +160,10 @@ export function StartKimiBrowserLogin() {
 
 export function StartKimiStealthLogin(arg1) {
   return window['go']['main']['App']['StartKimiStealthLogin'](arg1);
+}
+
+export function StartKimiStealthLoginForAccount(arg1, arg2) {
+  return window['go']['main']['App']['StartKimiStealthLoginForAccount'](arg1, arg2);
 }
 
 export function StartKimiStealthLoginNewAccount(arg1) {

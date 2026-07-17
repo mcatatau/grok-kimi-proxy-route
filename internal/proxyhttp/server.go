@@ -111,7 +111,37 @@ func RouteProviderFrom(ctx context.Context) string {
 	return strings.TrimSpace(v)
 }
 
+// contextReader wraps an io.Reader so that reads respect context cancellation.
+// This prevents bufio.Scanner from blocking forever when the context is cancelled.
+type contextReader struct {
+	ctx context.Context
+	r   io.Reader
+}
 
+func (c *contextReader) Read(p []byte) (int, error) {
+	if err := c.ctx.Err(); err != nil {
+		return 0, err
+	}
+	type result struct {
+		n   int
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		n, err := c.r.Read(p)
+		done <- result{n, err}
+	}()
+	select {
+	case <-c.ctx.Done():
+		return 0, c.ctx.Err()
+	case res := <-done:
+		return res.n, res.err
+	}
+}
+
+func newContextReader(ctx context.Context, r io.Reader) io.Reader {
+	return &contextReader{ctx: ctx, r: r}
+}
 
 func New(
 
@@ -821,8 +851,8 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 		m = nil
 	}
 
-	// Route by model: grok-* → xAI, kimi-for-coding/k3-agent → Kimi Work.
-	// Empty/alias model falls back to stored settings (desktop chat only cares about that).
+	// Route ONLY by client model (never UI global provider).
+	// grok-* → xAI, k3-agent/kimi-* → Kimi, empty/alias/unknown → xAI.
 	baseSettings := s.store.Settings()
 	routeSettings := baseSettings.WithProviderForModel(reqModel)
 	routeProv := routeSettings.NormalizedProvider()
@@ -837,14 +867,14 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 	if acc != nil {
 		defer s.store.DecAccountRequestCount(acc.ID)
 	}
-	// ensure returns store settings; re-apply route so upstream base/API match the model.
-	settings = settings.WithProvider(routeProv)
+	// ensure may return store settings; force route from client model again.
+	settings = routeSettings
 	if routeProv == store.ProviderKimiWork {
 		settings.UpstreamBase = store.KimiWorkUpstream
 		settings.APIMode = "chat"
 	} else if routeProv == store.ProviderXAI {
 		settings.UpstreamBase = store.DefaultUpstream
-		// Client default is chat/completions; xAI upstream still uses /responses.
+		// Client often uses /chat/completions; xAI wire still goes /responses.
 		settings.APIMode = "chat"
 	}
 
@@ -1172,12 +1202,12 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 
 
 			// Quota first (Kimi billing 403 must not be treated as auth-denied).
-			// Handler may block while Playwright stealth recreates a Kimi account.
+			// Handler may block while re-login refills a Kimi account (HTTP or clean profile).
 			if isQuotaStatus(resp.StatusCode, errBody) {
 				if fn := s.quotaHandler(); fn != nil && accountID != "" {
 					if rotated := fn(accountID, reason); rotated {
 						tok2, acc2, settings2, err2 := s.ensure(r.Context())
-						// Retry on new account OR same id refilled (stealth re-login / remint).
+						// Retry on new account OR same id refilled (re-login / remint).
 						if err2 == nil && tok2 != "" && (acc2 == nil || acc2.Usable()) {
 							prev := accountID
 							token, acc, settings = tok2, acc2, settings2
@@ -1342,7 +1372,7 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 			}
 			if isSSE {
 				tee := newUsageTeeReader(resp.Body)
-				if err := pipeResponsesSSEToChat(w, tee, resolvedModel); err != nil {
+				if err := pipeResponsesSSEToChat(r.Context(), w, tee, resolvedModel); err != nil {
 					log.Printf("proxyhttp grok responses→chat sse: %v", err)
 				}
 				_ = resp.Body.Close()
@@ -1387,7 +1417,7 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 
 			tee := newUsageTeeReader(resp.Body)
 
-			if err := pipeSSE(w, tee); err != nil {
+			if err := pipeSSE(r.Context(), w, tee); err != nil {
 
 				log.Printf("proxyhttp sse: %v", err)
 
@@ -1640,6 +1670,39 @@ func isQuotaStatus(code int, body []byte) bool {
 }
 
 
+
+func isQuotaErrorPayload(payload map[string]any) (bool, string) {
+	errObj, ok := payload["error"].(map[string]any)
+	if !ok {
+		// Some providers emit a top-level error as a string
+		if s, ok := payload["error"].(string); ok && s != "" {
+			errObj = map[string]any{"message": s}
+		} else {
+			return false, ""
+		}
+	}
+	msg := ""
+	if m, ok := errObj["message"].(string); ok {
+		msg = m
+	} else if m, ok := payload["message"].(string); ok {
+		msg = m
+	}
+	if msg == "" {
+		return false, ""
+	}
+	low := strings.ToLower(msg)
+	if strings.Contains(low, "usage limit") ||
+		strings.Contains(low, "billing cycle") ||
+		strings.Contains(low, "resource_exhausted") ||
+		strings.Contains(low, "access_terminated") ||
+		strings.Contains(low, "balance exhausted") ||
+		strings.Contains(low, "quota exceeded") ||
+		strings.Contains(low, "upgrade to get more") ||
+		(strings.Contains(low, "rate limit exceeded") && (strings.Contains(low, "quota") || strings.Contains(low, "usage") || strings.Contains(low, "billing"))) {
+		return true, msg
+	}
+	return false, ""
+}
 
 // isAuthStatus detects upstream auth failures that should force-refresh / rotate accounts.
 
@@ -2824,7 +2887,7 @@ func normalizeUsageToChat(u any) map[string]any {
 
 // pipeResponsesSSEToChat translates xAI Responses SSE into OpenAI chat.completion.chunk SSE.
 // Forwards output_text and client function_call items as OpenAI tool_calls so agents (Kilo, etc.) execute tools.
-func pipeResponsesSSEToChat(w http.ResponseWriter, body io.Reader, model string) error {
+func pipeResponsesSSEToChat(ctx context.Context, w http.ResponseWriter, body io.Reader, model string) error {
 	flusher, _ := w.(http.Flusher)
 	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-cache, no-transform")
@@ -3009,7 +3072,7 @@ func pipeResponsesSSEToChat(w http.ResponseWriter, body io.Reader, model string)
 		}
 	}
 
-	sc := bufio.NewScanner(body)
+	sc := bufio.NewScanner(newContextReader(ctx, body))
 	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
 	for sc.Scan() {
 		line := sc.Text()
@@ -3023,6 +3086,24 @@ func pipeResponsesSSEToChat(w http.ResponseWriter, body io.Reader, model string)
 		var ev map[string]any
 		if json.Unmarshal([]byte(data), &ev) != nil {
 			continue
+		}
+		// Detect mid-stream quota error (some providers send error inside SSE).
+		if isQuota, qmsg := isQuotaErrorPayload(ev); isQuota {
+			// Emit a graceful SSE error chunk so the client gets a clean termination.
+			writeChatDelta(map[string]any{"content": "\n\n[Erro: quota esgotada — " + qmsg + "]"}, "stop")
+			b, _ := json.Marshal(map[string]any{
+				"error": map[string]any{
+					"message": qmsg,
+					"type":    "upstream_error",
+					"code":    "quota_exhausted",
+				},
+			})
+			fmt.Fprintf(w, "data: %s\n\n", b)
+			fmt.Fprintf(w, "data: [DONE]\n\n")
+			if flusher != nil {
+				flusher.Flush()
+			}
+			return fmt.Errorf("sse quota error: %s", qmsg)
 		}
 		typ, _ := ev["type"].(string)
 		switch typ {
