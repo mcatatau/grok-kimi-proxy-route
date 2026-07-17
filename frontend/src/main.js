@@ -26,6 +26,8 @@ import {
   GetAutoCreateOnExhausted,
   GetKimiStealthHeadless,
   SetKimiStealthHeadless,
+  GetGoogleCredentials,
+  SetGoogleCredentials,
   StartKimiBrowserLogin,
   StartKimiStealthLogin,
   AddKimiFromJWT,
@@ -1193,6 +1195,11 @@ function showAddKimiChooser() {
         <input type="checkbox" id="m-kimi-headless" style="width:16px;height:16px;" />
         Playwright em modo <b>headless</b> (sem janela visível)
       </label>
+      <div style="margin-top:12px;border-top:1px solid rgba(255,255,255,0.08);padding-top:12px;">
+        <p style="font-size:12px;opacity:.7;margin:0 0 8px;">Credenciais Google (auto-login):</p>
+        <input type="email" id="m-google-email" placeholder="seu-email@gmail.com" style="width:100%;padding:8px 10px;border-radius:6px;border:1px solid rgba(255,255,255,0.12);background:rgba(0,0,0,0.3);color:#eee;font-size:13px;margin-bottom:8px;" />
+        <input type="password" id="m-google-password" placeholder="senha do Google" style="width:100%;padding:8px 10px;border-radius:6px;border:1px solid rgba(255,255,255,0.12);background:rgba(0,0,0,0.3);color:#eee;font-size:13px;" />
+      </div>
       <div class="sheet-actions">
         <button class="btn btn-quiet" id="m-cancel">Fechar</button>
       </div>
@@ -1211,6 +1218,23 @@ function showAddKimiChooser() {
   $("#m-kimi-headless", overlay).onchange = (e) => {
     SetKimiStealthHeadless(!!e.target.checked).catch(() => {});
   };
+  // Load Google credentials
+  GetGoogleCredentials()
+    .then(([email, password]) => {
+      const elEmail = $("#m-google-email", overlay);
+      const elPass = $("#m-google-password", overlay);
+      if (elEmail) elEmail.value = email || "";
+      if (elPass) elPass.value = password || "";
+    })
+    .catch(() => {});
+  // Save on change
+  const saveCreds = () => {
+    const email = $("#m-google-email", overlay)?.value || "";
+    const password = $("#m-google-password", overlay)?.value || "";
+    SetGoogleCredentials(email, password).catch(() => {});
+  };
+  $("#m-google-email", overlay)?.addEventListener("change", saveCreds);
+  $("#m-google-password", overlay)?.addEventListener("change", saveCreds);
   $("#m-browser", overlay).onclick = async () => {
     try {
       setStatus("Kimi: abra o navegador e escolha a conta Google…");

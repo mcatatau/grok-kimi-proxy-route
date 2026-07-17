@@ -29,6 +29,8 @@ export function GetBootstrap():Promise<Record<string, any>>;
 
 export function GetDeviceLoginState():Promise<main.deviceLoginState>;
 
+export function GetGoogleCredentials():Promise<string|string>;
+
 export function GetKimiStealthHeadless():Promise<boolean>;
 
 export function GetSettings():Promise<store.Settings>;
@@ -66,6 +68,8 @@ export function SendChat(arg1:upstream.ChatRequest):Promise<void>;
 export function SetActiveAccount(arg1:string):Promise<void>;
 
 export function SetAutoCreateOnExhausted(arg1:boolean):Promise<void>;
+
+export function SetGoogleCredentials(arg1:string,arg2:string):Promise<void>;
 
 export function SetKimiStealthHeadless(arg1:boolean):Promise<void>;
 

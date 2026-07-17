@@ -436,7 +436,7 @@ func (a *App) StartKimiStealthLogin(autoClose bool) (map[string]any, error) {
 		"phase":   "stealth",
 		"message": "Iniciando login automático com perfil persistente (Playwright)…",
 	})
-	gl, err := kimi.LoginWithGoogleStealth(root, "", 5*time.Minute, autoClose, a.store.Settings().KimiStealthHeadless)
+	gl, err := kimi.LoginWithGoogleStealth(root, "", 5*time.Minute, autoClose, a.store.Settings().KimiStealthHeadless, a.store.Settings().GoogleEmail, a.store.Settings().GooglePassword)
 	if err != nil {
 		return nil, err
 	}
@@ -1555,6 +1555,24 @@ func (a *App) SetKimiStealthHeadless(enabled bool) {
 	}
 	_ = a.store.UpdateSettings(func(s *store.Settings) {
 		s.KimiStealthHeadless = enabled
+	})
+}
+
+func (a *App) GetGoogleCredentials() (email, password string) {
+	if a.store == nil {
+		return "", ""
+	}
+	s := a.store.Settings()
+	return s.GoogleEmail, s.GooglePassword
+}
+
+func (a *App) SetGoogleCredentials(email, password string) {
+	if a.store == nil {
+		return
+	}
+	_ = a.store.UpdateSettings(func(s *store.Settings) {
+		s.GoogleEmail = strings.TrimSpace(email)
+		s.GooglePassword = password
 	})
 }
 

@@ -249,7 +249,7 @@ func LoginWithGoogleBrowser(timeout time.Duration) (*GoogleLoginSession, error) 
 // LoginWithGoogleStealth uses Playwright with persistent Google profile to automate
 // the OAuth consent/account-chooser click, while still capturing the authorization code
 // via the local loopback callback so Go can exchange it for Kimi tokens.
-func LoginWithGoogleStealth(projectRoot, profileDir string, timeout time.Duration, autoClose, headless bool) (*GoogleLoginSession, error) {
+func LoginWithGoogleStealth(projectRoot, profileDir string, timeout time.Duration, autoClose, headless bool, googleEmail, googlePassword string) (*GoogleLoginSession, error) {
 	if timeout <= 0 {
 		timeout = 5 * time.Minute
 	}
@@ -372,8 +372,20 @@ func LoginWithGoogleStealth(projectRoot, profileDir string, timeout time.Duratio
 	if autoClose {
 		args = append(args, "--auto-close", "true")
 	}
+	if googleEmail != "" {
+		args = append(args, "--email", googleEmail)
+	}
+	if googlePassword != "" {
+		args = append(args, "--password", googlePassword)
+	}
 	cmd := exec.Command(node, args...)
 	cmd.Dir = projectRoot
+
+	if headless {
+		fullyHideConsoleWindow(cmd)
+	} else {
+		hideConsoleWindow(cmd)
+	}
 
 	env := append([]string{}, os.Environ()...)
 	localNode := filepath.Join(projectRoot, "node_modules")

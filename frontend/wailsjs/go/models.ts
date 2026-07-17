@@ -95,6 +95,8 @@ export namespace store {
 	    gemini_location?: string;
 	    theme_accent?: string;
 	    kimi_stealth_headless: boolean;
+	    google_email?: string;
+	    google_password?: string;
 	
 	    static createFrom(source: any = {}) {
 	        return new Settings(source);
@@ -118,6 +120,8 @@ export namespace store {
 	        this.gemini_location = source["gemini_location"];
 	        this.theme_accent = source["theme_accent"];
 	        this.kimi_stealth_headless = source["kimi_stealth_headless"];
+	        this.google_email = source["google_email"];
+	        this.google_password = source["google_password"];
 	    }
 	}
 

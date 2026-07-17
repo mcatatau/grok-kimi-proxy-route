@@ -50,6 +50,10 @@ export function GetDeviceLoginState() {
   return window['go']['main']['App']['GetDeviceLoginState']();
 }
 
+export function GetGoogleCredentials() {
+  return window['go']['main']['App']['GetGoogleCredentials']();
+}
+
 export function GetKimiStealthHeadless() {
   return window['go']['main']['App']['GetKimiStealthHeadless']();
 }
@@ -124,6 +128,10 @@ export function SetActiveAccount(arg1) {
 
 export function SetAutoCreateOnExhausted(arg1) {
   return window['go']['main']['App']['SetAutoCreateOnExhausted'](arg1);
+}
+
+export function SetGoogleCredentials(arg1, arg2) {
+  return window['go']['main']['App']['SetGoogleCredentials'](arg1, arg2);
 }
 
 export function SetKimiStealthHeadless(arg1) {

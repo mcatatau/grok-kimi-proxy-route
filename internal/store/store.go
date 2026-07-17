@@ -226,6 +226,8 @@ type Settings struct {
 	GeminiLocation string `json:"gemini_location,omitempty"`
 	ThemeAccent    string `json:"theme_accent,omitempty"`
 	KimiStealthHeadless bool `json:"kimi_stealth_headless"`
+	GoogleEmail    string `json:"google_email,omitempty"`
+	GooglePassword string `json:"google_password,omitempty"`
 }
 
 // ForceModel reports whether the proxy should ignore the client's model field.
