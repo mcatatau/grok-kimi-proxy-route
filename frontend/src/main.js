@@ -1198,7 +1198,12 @@ function showAddKimiChooser() {
       <div style="margin-top:12px;border-top:1px solid rgba(255,255,255,0.08);padding-top:12px;">
         <p style="font-size:12px;opacity:.7;margin:0 0 8px;">Credenciais Google (auto-login):</p>
         <input type="email" id="m-google-email" placeholder="seu-email@gmail.com" style="width:100%;padding:8px 10px;border-radius:6px;border:1px solid rgba(255,255,255,0.12);background:rgba(0,0,0,0.3);color:#eee;font-size:13px;margin-bottom:8px;" />
-        <input type="password" id="m-google-password" placeholder="senha do Google" style="width:100%;padding:8px 10px;border-radius:6px;border:1px solid rgba(255,255,255,0.12);background:rgba(0,0,0,0.3);color:#eee;font-size:13px;" />
+        <div style="position:relative;width:100%;margin-bottom:8px;">
+          <input type="password" id="m-google-password" placeholder="senha do Google" style="width:100%;padding:8px 10px 8px 10px;border-radius:6px;border:1px solid rgba(255,255,255,0.12);background:rgba(0,0,0,0.3);color:#eee;font-size:13px;box-sizing:border-box;" />
+          <button type="button" id="m-toggle-pass" style="position:absolute;right:6px;top:50%;transform:translateY(-50%);background:none;border:none;color:#888;cursor:pointer;font-size:14px;padding:4px 6px;line-height:1;">👁</button>
+        </div>
+        <button type="button" class="btn btn-quiet" id="m-save-creds" style="width:100%;font-size:13px;">Salvar credenciais</button>
+        <p id="m-creds-status" style="font-size:11px;opacity:.5;margin:6px 0 0;text-align:center;"></p>
       </div>
       <div class="sheet-actions">
         <button class="btn btn-quiet" id="m-cancel">Fechar</button>
@@ -1225,16 +1230,42 @@ function showAddKimiChooser() {
       const elPass = $("#m-google-password", overlay);
       if (elEmail) elEmail.value = email || "";
       if (elPass) elPass.value = password || "";
+      // Show status if already saved
+      const statusEl = $("#m-creds-status", overlay);
+      if (statusEl && email) {
+        statusEl.textContent = "Credenciais salvas ✓";
+        statusEl.style.opacity = "0.7";
+        statusEl.style.color = "#7ee787";
+      }
     })
     .catch(() => {});
-  // Save on change
-  const saveCreds = () => {
+  // Toggle password visibility
+  $("#m-toggle-pass", overlay).onclick = () => {
+    const passInput = $("#m-google-password", overlay);
+    if (!passInput) return;
+    const isHidden = passInput.type === "password";
+    passInput.type = isHidden ? "text" : "password";
+    $("#m-toggle-pass", overlay).textContent = isHidden ? "🙈" : "👁";
+  };
+  // Save button
+  $("#m-save-creds", overlay).onclick = async () => {
     const email = $("#m-google-email", overlay)?.value || "";
     const password = $("#m-google-password", overlay)?.value || "";
-    SetGoogleCredentials(email, password).catch(() => {});
+    const statusEl = $("#m-creds-status", overlay);
+    try {
+      await SetGoogleCredentials(email, password);
+      if (statusEl) {
+        statusEl.textContent = "Credenciais salvas ✓";
+        statusEl.style.opacity = "0.7";
+        statusEl.style.color = "#7ee787";
+      }
+    } catch (e) {
+      if (statusEl) {
+        statusEl.textContent = "Erro ao salvar: " + e;
+        statusEl.style.color = "#ff7b72";
+      }
+    }
   };
-  $("#m-google-email", overlay)?.addEventListener("change", saveCreds);
-  $("#m-google-password", overlay)?.addEventListener("change", saveCreds);
   $("#m-browser", overlay).onclick = async () => {
     try {
       setStatus("Kimi: abra o navegador e escolha a conta Google…");
