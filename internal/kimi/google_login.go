@@ -68,7 +68,8 @@ var loopbackPorts = []int{61120, 61121, 61122, 61123, 61124}
 // GoogleLoginSession is the result of browser Google login → Kimi tokens.
 type GoogleLoginSession struct {
 	Session
-	IDToken string `json:"-"`
+	IDToken            string `json:"-"`
+	GoogleRefreshToken string `json:"-"`
 }
 
 // googleIDClaims is a minimal decode of Google id_token (email/profile).
@@ -194,6 +195,7 @@ func LoginWithGoogleBrowser(timeout time.Duration) (*GoogleLoginSession, error) 
 	defer srv.Close()
 
 	redirectURI := fmt.Sprintf("http://127.0.0.1:%d/callback", port)
+	// prompt=consent forces Google to re-issue refresh_token (select_account alone often omits it).
 	authURL := googleAuthURL + "?" + url.Values{
 		"client_id":             {clientID},
 		"redirect_uri":          {redirectURI},
@@ -202,7 +204,8 @@ func LoginWithGoogleBrowser(timeout time.Duration) (*GoogleLoginSession, error) 
 		"code_challenge":        {challenge},
 		"code_challenge_method": {"S256"},
 		"access_type":           {"offline"},
-		"prompt":                {"select_account"},
+		"prompt":                {"consent"},
+		"include_granted_scopes": {"true"},
 	}.Encode()
 
 	if err := openBrowser(authURL); err != nil {
@@ -218,7 +221,7 @@ func LoginWithGoogleBrowser(timeout time.Duration) (*GoogleLoginSession, error) 
 		return nil, fmt.Errorf("timeout Google OAuth (%s) — tente de novo", timeout)
 	}
 
-	idToken, err := exchangeGoogleCode(code, verifier, redirectURI, clientID, clientSecret)
+	idToken, googleRefresh, err := exchangeGoogleCode(code, verifier, redirectURI, clientID, clientSecret)
 	if err != nil {
 		return nil, err
 	}
@@ -243,7 +246,7 @@ func LoginWithGoogleBrowser(timeout time.Duration) (*GoogleLoginSession, error) 
 			sess.UserID = g.Sub
 		}
 	}
-	return &GoogleLoginSession{Session: *sess, IDToken: idToken}, nil
+	return &GoogleLoginSession{Session: *sess, IDToken: idToken, GoogleRefreshToken: googleRefresh}, nil
 }
 
 // LoginWithGoogleStealth uses Playwright with persistent Google profile to automate
@@ -311,6 +314,7 @@ func LoginWithGoogleStealth(projectRoot, profileDir string, timeout time.Duratio
 	defer srv.Close()
 
 	redirectURI := fmt.Sprintf("http://127.0.0.1:%d/callback", port)
+	// prompt=consent forces Google to re-issue refresh_token (select_account alone often omits it).
 	authURL := googleAuthURL + "?" + url.Values{
 		"client_id":             {clientID},
 		"redirect_uri":          {redirectURI},
@@ -319,7 +323,8 @@ func LoginWithGoogleStealth(projectRoot, profileDir string, timeout time.Duratio
 		"code_challenge":        {challenge},
 		"code_challenge_method": {"S256"},
 		"access_type":           {"offline"},
-		"prompt":                {"select_account"},
+		"prompt":                {"consent"},
+		"include_granted_scopes": {"true"},
 	}.Encode()
 
 	// Launch Playwright Chromium script (bundled browser + persistent profile).
@@ -525,7 +530,7 @@ waitLoop:
 		return nil, fmt.Errorf("playwright stealth: browser closed without authorization code — complete Google login then close the window")
 	}
 
-	idToken, err := exchangeGoogleCode(code, verifier, redirectURI, clientID, clientSecret)
+	idToken, googleRefresh, err := exchangeGoogleCode(code, verifier, redirectURI, clientID, clientSecret)
 	if err != nil {
 		return nil, err
 	}
@@ -550,10 +555,10 @@ waitLoop:
 		}
 	}
 	_ = os.Remove(outPath)
-	return &GoogleLoginSession{Session: *sess, IDToken: idToken}, nil
+	return &GoogleLoginSession{Session: *sess, IDToken: idToken, GoogleRefreshToken: googleRefresh}, nil
 }
 
-func exchangeGoogleCode(code, verifier, redirectURI, clientID, clientSecret string) (string, error) {
+func exchangeGoogleCode(code, verifier, redirectURI, clientID, clientSecret string) (string, string, error) {
 	form := url.Values{
 		"code":          {code},
 		"client_id":     {clientID},
@@ -561,6 +566,50 @@ func exchangeGoogleCode(code, verifier, redirectURI, clientID, clientSecret stri
 		"code_verifier": {verifier},
 		"redirect_uri":  {redirectURI},
 		"grant_type":    {"authorization_code"},
+	}
+	req, err := http.NewRequest(http.MethodPost, googleTokenURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return "", "", err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	client := &http.Client{Timeout: 45 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", "", err
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode >= 400 {
+		return "", "", fmt.Errorf("google token exchange HTTP %d: %s", resp.StatusCode, truncate(string(b), 200))
+	}
+	var data map[string]any
+	if err := json.Unmarshal(b, &data); err != nil {
+		return "", "", err
+	}
+	idToken, _ := data["id_token"].(string)
+	googleRefresh, _ := data["refresh_token"].(string)
+	if idToken == "" {
+		return "", "", fmt.Errorf("google response missing id_token")
+	}
+	return idToken, googleRefresh, nil
+}
+
+// RefreshGoogleIDToken exchanges a stored Google OAuth refresh_token for a fresh id_token.
+// No browser / Playwright required.
+func RefreshGoogleIDToken(googleRefreshToken string) (idToken string, err error) {
+	googleRefreshToken = strings.TrimSpace(googleRefreshToken)
+	if googleRefreshToken == "" {
+		return "", fmt.Errorf("google refresh_token required")
+	}
+	clientID, clientSecret, err := googleOAuthCreds()
+	if err != nil {
+		return "", err
+	}
+	form := url.Values{
+		"refresh_token": {googleRefreshToken},
+		"client_id":     {clientID},
+		"client_secret": {clientSecret},
+		"grant_type":    {"refresh_token"},
 	}
 	req, err := http.NewRequest(http.MethodPost, googleTokenURL, strings.NewReader(form.Encode()))
 	if err != nil {
@@ -575,17 +624,48 @@ func exchangeGoogleCode(code, verifier, redirectURI, clientID, clientSecret stri
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode >= 400 {
-		return "", fmt.Errorf("google token exchange HTTP %d: %s", resp.StatusCode, truncate(string(b), 200))
+		return "", fmt.Errorf("google refresh HTTP %d: %s", resp.StatusCode, truncate(string(b), 240))
 	}
 	var data map[string]any
 	if err := json.Unmarshal(b, &data); err != nil {
 		return "", err
 	}
-	idToken, _ := data["id_token"].(string)
+	idToken, _ = data["id_token"].(string)
 	if idToken == "" {
-		return "", fmt.Errorf("google response missing id_token")
+		return "", fmt.Errorf("google refresh response missing id_token")
 	}
 	return idToken, nil
+}
+
+// LoginWithGoogleRefresh performs full Google→Kimi auth over HTTP only (no browser).
+// Requires a previously stored Google OAuth refresh_token from a browser/stealth login.
+func LoginWithGoogleRefresh(googleRefreshToken string) (*GoogleLoginSession, error) {
+	idToken, err := RefreshGoogleIDToken(googleRefreshToken)
+	if err != nil {
+		return nil, err
+	}
+	sess, err := exchangeGoogleIDTokenForKimi(idToken)
+	if err != nil {
+		return nil, err
+	}
+	if g := decodeGoogleIDToken(idToken); g != nil {
+		if sess.Email == "" && g.Email != "" {
+			sess.Email = g.Email
+		}
+		if sess.Name == "" {
+			if g.Name != "" {
+				sess.Name = g.Name
+			} else {
+				sess.Name = strings.TrimSpace(g.GivenName + " " + g.FamilyName)
+			}
+		}
+		if sess.UserID == "" && g.Sub != "" {
+			sess.UserID = g.Sub
+		}
+	}
+	sess.Source = "google_http_refresh"
+	// Keep the same Google refresh_token (token refresh does not rotate it).
+	return &GoogleLoginSession{Session: *sess, IDToken: idToken, GoogleRefreshToken: googleRefreshToken}, nil
 }
 
 // exchangeGoogleIDTokenForKimi — SPA: POST /api/auth/login/google {code: <google id_token>}

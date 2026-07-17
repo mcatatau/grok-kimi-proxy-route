@@ -1272,7 +1272,10 @@ function showAddKimiChooser() {
       overlay.remove();
       const rec = await StartKimiBrowserLogin();
       await refreshBootstrap(false);
-      setStatus(`Kimi ok · ${rec.label || rec.id}${rec.has_refresh ? " · refresh salvo" : ""}`);
+      const bits = [];
+      if (rec.has_refresh) bits.push("kimi refresh");
+      if (rec.has_google_refresh) bits.push("google refresh");
+      setStatus(`Kimi ok · ${rec.label || rec.id}${bits.length ? " · " + bits.join(" + ") + " salvo" : ""}`);
     } catch (e) {
       alert("Falha login Kimi: " + e);
       setStatus("Falha login Kimi");
@@ -1284,7 +1287,11 @@ function showAddKimiChooser() {
       overlay.remove();
       const rec = await StartKimiStealthLogin(false);
       await refreshBootstrap(false);
-      setStatus(`Kimi stealth ok · ${rec.label || rec.id}${rec.has_refresh ? " · refresh salvo" : ""}`);
+      const bits = [];
+      if (rec.has_refresh) bits.push("kimi refresh");
+      if (rec.has_google_refresh) bits.push("google refresh");
+      const mode = rec.mode === "http_refresh" ? "HTTP" : rec.mode === "playwright" ? "Playwright" : "stealth";
+      setStatus(`Kimi ${mode} ok · ${rec.label || rec.id}${bits.length ? " · " + bits.join(" + ") + " salvo" : ""}`);
     } catch (e) {
       alert("Falha login stealth Kimi: " + e);
       setStatus("Falha login stealth Kimi");
@@ -1358,12 +1365,14 @@ async function openAccountsModal() {
                   ${a.exhausted ? `<span class="badge badge-danger">esgotada</span>` : ""}
                   ${a.auth_denied ? `<span class="badge badge-danger">auth</span>` : ""}
                   ${kimiUI && a.has_web_session ? `<span class="badge badge-ok">web</span>` : ""}
+                  ${a.has_google_refresh ? `<span class="badge badge-ok" title="Google refresh token salvo">google refresh</span>` : ""}
                   ${a.api_key_hint ? `<span class="badge badge-ok">${escapeHtml(a.api_key_hint)}</span>` : ""}
                   <span>${fmt(u.total_tokens || 0)} tok · ${fmtUSD(u.cost_usd || 0)}</span>
                 </div>
               </div>
               <div class="acc-actions">
                 ${a.active ? "" : `<button type="button" class="btn btn-solid btn-xs" data-act="use">Usar</button>`}
+                ${a.google_refresh_token ? `<button type="button" class="btn btn-quiet btn-xs" data-act="copy-google-refresh" title="Copiar Google refresh token">Copiar Google Refresh</button>` : ""}
                 <button type="button" class="btn btn-quiet btn-xs" data-act="rename">Renomear</button>
                 ${
                   kimiUI
@@ -1426,6 +1435,20 @@ async function openAccountsModal() {
             await RemoveAccount(id);
             await refreshBootstrap(false);
             openAccountsModal();
+          }
+        } else if (act === "copy-google-refresh") {
+          const a = accounts.find((x) => x.id === id);
+          const token = a?.google_refresh_token || "";
+          if (!token) {
+            alert("Sem Google refresh token nesta conta.");
+            return;
+          }
+          try {
+            await navigator.clipboard.writeText(token);
+            btn.textContent = "Copiado!";
+            setTimeout(() => (btn.textContent = "Copiar Google Refresh"), 1500);
+          } catch (_) {
+            alert(token);
           }
         }
       };

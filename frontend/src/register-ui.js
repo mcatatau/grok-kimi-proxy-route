@@ -75,6 +75,9 @@ function accountBadges(a) {
   if (!a.active && !a.exhausted && !a.chat_denied && !a.needs_login && !(a.expired && a.has_refresh === false)) {
     bits.push(`<span class="badge badge-ok">pronta</span>`);
   }
+  if (a.has_google_refresh) {
+    bits.push(`<span class="badge badge-ok" title="Google refresh token salvo — re-login sem browser possível.">google refresh</span>`);
+  }
   return bits.join("");
 }
 
@@ -408,6 +411,7 @@ export function openAccountsManager({ refreshBootstrap, paintChrome }) {
                 : `<button type="button" class="icon-btn" data-act="use">Usar</button>`
             }
             ${a.exhausted || a.chat_denied ? `<button type="button" class="icon-btn" data-act="reset" title="Limpa cota esgotada e chat negado">Resetar</button>` : ""}
+            ${a.google_refresh_token ? `<button type="button" class="icon-btn" data-act="copy-google-refresh" title="Copiar Google refresh token">Copiar Google Refresh</button>` : ""}
             <button type="button" class="icon-btn" data-act="rename">Renomear</button>
             <button type="button" class="icon-btn danger" data-act="remove">Remover</button>
           </div>
@@ -447,6 +451,13 @@ export function openAccountsManager({ refreshBootstrap, paintChrome }) {
               await refreshBootstrap?.(false);
               renderList();
               await paintChrome?.();
+            } else if (act === "copy-google-refresh") {
+              const a = state.accounts.find((x) => x.id === id);
+              const token = a?.google_refresh_token || "";
+              if (!token) { alert("Sem Google refresh token nesta conta."); return; }
+              await navigator.clipboard.writeText(token);
+              btn.textContent = "Copiado!";
+              setTimeout(() => (btn.textContent = "Copiar Google Refresh"), 1500);
             }
           } catch (e) {
             alert(String(e));

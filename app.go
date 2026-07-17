@@ -418,16 +418,57 @@ func (a *App) StartKimiBrowserLogin() (map[string]any, error) {
 		}
 	}
 	payload, _ := kimi.DecodeJWT(access)
-	return a.addKimiSession(access, refresh, payload, "google_browser", gl.Email, gl.Name)
+	return a.addKimiSession(access, refresh, gl.GoogleRefreshToken, payload, "google_browser", gl.Email, gl.Name)
 }
 
-// StartKimiStealthLogin uses Playwright with persistent Google profile to automate
-// the OAuth account chooser click. Same end result as StartKimiBrowserLogin but
-// with browser automation (stealth anti-detection).
+// StartKimiStealthLogin prefers full-HTTP Google refresh when a stored Google
+// refresh_token exists; falls back to Playwright stealth only if HTTP fails or
+// no Google refresh is available.
 func (a *App) StartKimiStealthLogin(autoClose bool) (map[string]any, error) {
 	if a.store == nil {
 		return nil, fmt.Errorf("store not ready")
 	}
+	// HTTP-first: reuse any stored Google refresh token (prefer active, then any).
+	if googleRT, emailHint := a.pickGoogleRefreshToken(); googleRT != "" {
+		a.safeEmit("kimi:login", map[string]any{
+			"phase":   "http_refresh",
+			"message": "Login Kimi via HTTP (Google refresh, sem Playwright)…",
+		})
+		gl, err := kimi.LoginWithGoogleRefresh(googleRT)
+		if err == nil && gl != nil {
+			access := gl.AccessToken
+			refresh := gl.RefreshToken
+			if p, _ := kimi.DecodeJWT(access); p != nil && p.Exp > 0 && time.Until(time.Unix(p.Exp, 0)) < 2*time.Minute && refresh != "" {
+				if renewed, rerr := kimi.RefreshAccessToken(refresh); rerr == nil && renewed != nil {
+					access = renewed.AccessToken
+					if renewed.RefreshToken != "" {
+						refresh = renewed.RefreshToken
+					}
+				}
+			}
+			payload, _ := kimi.DecodeJWT(access)
+			email := gl.Email
+			if email == "" {
+				email = emailHint
+			}
+			rec, serr := a.addKimiSession(access, refresh, gl.GoogleRefreshToken, payload, "google_http_refresh", email, gl.Name)
+			if serr == nil {
+				if rec != nil {
+					rec["mode"] = "http_refresh"
+				}
+				return rec, nil
+			}
+			err = serr
+		}
+		// Fall through to Playwright on HTTP failure.
+		log.Printf("kimi http google-refresh failed, falling back to Playwright: %v", err)
+		a.safeEmit("kimi:login", map[string]any{
+			"phase":   "http_refresh_failed",
+			"message": "HTTP falhou — caindo para Playwright…",
+			"error":   err.Error(),
+		})
+	}
+
 	root, err := a.kimiProjectRoot()
 	if err != nil {
 		return nil, err
@@ -451,7 +492,33 @@ func (a *App) StartKimiStealthLogin(autoClose bool) (map[string]any, error) {
 		}
 	}
 	payload, _ := kimi.DecodeJWT(access)
-	return a.addKimiSession(access, refresh, payload, "google_stealth", gl.Email, gl.Name)
+	rec, err := a.addKimiSession(access, refresh, gl.GoogleRefreshToken, payload, "google_stealth", gl.Email, gl.Name)
+	if err != nil {
+		return nil, err
+	}
+	if rec != nil {
+		rec["mode"] = "playwright"
+	}
+	return rec, nil
+}
+
+// pickGoogleRefreshToken returns a stored Google OAuth refresh_token for HTTP re-login.
+// Prefers the active Kimi account, then any Kimi account that has one.
+func (a *App) pickGoogleRefreshToken() (token, email string) {
+	if a.store == nil {
+		return "", ""
+	}
+	if acc, ok := a.store.ActiveAccount(); ok && acc != nil && acc.NormalizedProvider() == store.ProviderKimiWork {
+		if t := strings.TrimSpace(acc.GoogleRefreshToken); t != "" {
+			return t, acc.Email
+		}
+	}
+	for _, row := range a.store.ListAccountsForProvider(store.ProviderKimiWork) {
+		if t := strings.TrimSpace(row.GoogleRefreshToken); t != "" {
+			return t, row.Email
+		}
+	}
+	return "", ""
 }
 
 // AddKimiFromJWT mints/reuses sk-kimi from an explicit web access_token JWT (optional fallback).
@@ -462,7 +529,7 @@ func (a *App) AddKimiFromJWT(accessToken string) (map[string]any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("jwt inválido: %w", err)
 	}
-	return a.addKimiSession(accessToken, "", payload, "paste_jwt", "", "")
+	return a.addKimiSession(accessToken, "", "", payload, "paste_jwt", "", "")
 }
 
 // AddKimiAPIKey registers a pasted sk-kimi key (optional fallback).
@@ -536,7 +603,7 @@ func (a *App) kimiProjectRoot() (string, error) {
 	return "", fmt.Errorf("scripts/kimi-browser-login.mjs não encontrado — rode a partir do repo GrokDesktop")
 }
 
-func (a *App) addKimiSession(accessToken, refreshToken string, payload *kimi.JWTPayload, source, email, displayName string) (map[string]any, error) {
+func (a *App) addKimiSession(accessToken, refreshToken, googleRefreshToken string, payload *kimi.JWTPayload, source, email, displayName string) (map[string]any, error) {
 	if a.store == nil {
 		return nil, fmt.Errorf("store not ready")
 	}
@@ -576,6 +643,11 @@ func (a *App) addKimiSession(accessToken, refreshToken string, payload *kimi.JWT
 		if email == "" && prev.Email != "" && strings.Contains(prev.Email, "@") {
 			email = prev.Email
 		}
+		// Preserve existing Google refresh token if new login didn't provide one.
+		// (Google only sends refresh_token on the first authorization_code exchange.)
+		if googleRefreshToken == "" && prev.GoogleRefreshToken != "" {
+			googleRefreshToken = prev.GoogleRefreshToken
+		}
 	}
 	if email == "" {
 		email = label
@@ -586,21 +658,22 @@ func (a *App) addKimiSession(accessToken, refreshToken string, payload *kimi.JWT
 		created = prev.CreatedAt
 	}
 	acc := store.Account{
-		ID:           id,
-		Provider:     store.ProviderKimiWork,
-		Label:        label,
-		Email:        email,
-		UserID:       userID,
-		APIKey:       minted.APIKey,
-		DeviceID:     minted.DeviceID,
-		Source:       source,
-		ClientID:     "kimi-work",
-		Issuer:       "https://www.kimi.com",
-		AccessToken:  accessToken,
-		RefreshToken: refreshToken,
-		ExpiresAt:    minted.ExpiresAt,
-		CreatedAt:    created,
-		UpdatedAt:    now,
+		ID:                 id,
+		Provider:           store.ProviderKimiWork,
+		Label:              label,
+		Email:              email,
+		UserID:             userID,
+		APIKey:             minted.APIKey,
+		DeviceID:           minted.DeviceID,
+		Source:             source,
+		ClientID:           "kimi-work",
+		Issuer:             "https://www.kimi.com",
+		AccessToken:        accessToken,
+		RefreshToken:       refreshToken,
+		GoogleRefreshToken: googleRefreshToken,
+		ExpiresAt:          minted.ExpiresAt,
+		CreatedAt:          created,
+		UpdatedAt:          now,
 		// Fresh login always clears prior poison marks.
 		ExhaustedAt:      time.Time{},
 		ExhaustReason:    "",
@@ -626,7 +699,10 @@ func (a *App) addKimiSession(accessToken, refreshToken string, payload *kimi.JWT
 	}
 	return map[string]any{
 		"id": acc.ID, "label": acc.Label, "email": email, "user_id": userID, "provider": store.ProviderKimiWork,
-		"api_key_hint": hint, "source": source, "has_refresh": refreshToken != "",
+		"api_key_hint": hint, "source": source,
+		"has_refresh":          refreshToken != "",
+		"has_google_refresh":   googleRefreshToken != "",
+		"google_refresh_token": googleRefreshToken,
 	}, nil
 }
 
@@ -1617,15 +1693,33 @@ func (a *App) markAccountExhausted(id, reason string) {
 }
 
 // remintKimiWorkKey refreshes the web JWT if needed and mints a fresh sk-kimi WORK key.
+// If Kimi refresh fails but a Google refresh_token exists, recovers session via HTTP.
 func (a *App) remintKimiWorkKey(acc *store.Account) error {
 	if a.store == nil || acc == nil {
 		return fmt.Errorf("no account")
 	}
 	if !kimi.HasWebSession(acc.AccessToken, acc.RefreshToken) {
+		// Recover via Google HTTP refresh when available.
+		if gr := strings.TrimSpace(acc.GoogleRefreshToken); gr != "" {
+			gl, err := kimi.LoginWithGoogleRefresh(gr)
+			if err != nil {
+				return fmt.Errorf("no web session and google http refresh failed: %w", err)
+			}
+			_, err = a.addKimiSession(gl.AccessToken, gl.RefreshToken, gl.GoogleRefreshToken, nil, "google_http_refresh", gl.Email, gl.Name)
+			return err
+		}
 		return fmt.Errorf("no web session to remint sk-kimi")
 	}
 	access, refresh, err := kimi.EnsureAccessToken(acc.AccessToken, acc.RefreshToken)
 	if err != nil {
+		// Last resort: Google HTTP re-login.
+		if gr := strings.TrimSpace(acc.GoogleRefreshToken); gr != "" {
+			gl, gerr := kimi.LoginWithGoogleRefresh(gr)
+			if gerr == nil && gl != nil {
+				_, err2 := a.addKimiSession(gl.AccessToken, gl.RefreshToken, gl.GoogleRefreshToken, nil, "google_http_refresh", gl.Email, gl.Name)
+				return err2
+			}
+		}
 		return err
 	}
 	minted, err := kimi.MintWorkAPIKey(access, "grok-desktop-kimi")
@@ -1703,12 +1797,12 @@ func (a *App) tryKimiLogoffOnQuota(acc *store.Account, reason string) bool {
 	return true
 }
 
-// maybeAutoKimiStealthRelogin starts Playwright stealth Google→Kimi login in background.
+// maybeAutoKimiStealthRelogin starts Kimi re-login in background (HTTP refresh first, Playwright fallback).
 func (a *App) maybeAutoKimiStealthRelogin(reason string) {
 	a.startKimiStealthRelogin(reason, nil)
 }
 
-// waitAutoKimiStealthRelogin runs (or joins) stealth re-login and blocks until a usable
+// waitAutoKimiStealthRelogin runs (or joins) Kimi re-login and blocks until a usable
 // Kimi account is active, failure, or timeout. Returns true if a usable account is ready.
 func (a *App) waitAutoKimiStealthRelogin(reason string) bool {
 	done := make(chan bool, 1)
@@ -1725,21 +1819,21 @@ func (a *App) waitAutoKimiStealthRelogin(reason string) bool {
 	case ok := <-done:
 		return ok
 	case <-timer.C:
-		log.Printf("kimi stealth re-login wait timed out after %s (reason=%s)", timeout, reason)
+		log.Printf("kimi re-login wait timed out after %s (reason=%s)", timeout, reason)
 		return false
 	case <-a.ctx.Done():
 		return false
 	}
 }
 
-// startKimiStealthRelogin launches Playwright stealth Google→Kimi login once.
-// If already running, optional onDone waits for the in-flight run to finish.
+// startKimiStealthRelogin runs Kimi re-login once: Google HTTP refresh when available,
+// else Playwright stealth. If already running, optional onDone waits for the in-flight run.
 // onDone may be nil for fire-and-forget (pool replenish).
 func (a *App) startKimiStealthRelogin(reason string, onDone func(bool)) {
 	a.mu.Lock()
 	if a.kimiReloginRunning {
 		a.mu.Unlock()
-		log.Printf("kimi stealth re-login already running — join wait (reason=%s)", reason)
+		log.Printf("kimi re-login already running — join wait (reason=%s)", reason)
 		if onDone == nil {
 			return
 		}
@@ -1781,16 +1875,26 @@ func (a *App) startKimiStealthRelogin(reason string, onDone func(bool)) {
 			}
 		}()
 
-		log.Printf("kimi stealth re-login starting after quota: %s", reason)
+		hasHTTP := false
+		if t, _ := a.pickGoogleRefreshToken(); t != "" {
+			hasHTTP = true
+		}
+		msg := "Cota esgotada — re-login Kimi (HTTP refresh se possível, senão Playwright)…"
+		if hasHTTP {
+			msg = "Cota esgotada — re-login Kimi via HTTP (Google refresh)…"
+		}
+		log.Printf("kimi re-login starting (http_first=%v) after: %s", hasHTTP, reason)
 		runtime.EventsEmit(a.ctx, "kimi:relogin", map[string]any{
 			"phase":   "start",
 			"reason":  reason,
-			"message": "Cota esgotada — abrindo Playwright para recriar conta Kimi…",
+			"message": msg,
+			"http":    hasHTTP,
 		})
 
+		// autoClose=true for background relogin (Playwright closes when done).
 		rec, err := a.StartKimiStealthLogin(true)
 		if err != nil {
-			log.Printf("kimi stealth re-login failed: %v", err)
+			log.Printf("kimi re-login failed: %v", err)
 			runtime.EventsEmit(a.ctx, "kimi:relogin", map[string]any{
 				"phase":   "error",
 				"reason":  reason,
@@ -1800,16 +1904,27 @@ func (a *App) startKimiStealthRelogin(reason string, onDone func(bool)) {
 			return
 		}
 		ok = a.kimiUsableActiveReady()
-		log.Printf("kimi stealth re-login OK (usable=%v): %v", ok, rec)
+		mode, _ := rec["mode"].(string)
+		if mode == "" {
+			mode = "unknown"
+		}
+		log.Printf("kimi re-login OK mode=%s usable=%v: %v", mode, ok, rec)
+		doneMsg := "Conta Kimi renovada"
+		if mode == "http_refresh" {
+			doneMsg = "Conta Kimi renovada via HTTP (sem Playwright)"
+		} else if mode == "playwright" {
+			doneMsg = "Conta Kimi renovada via Playwright"
+		}
 		runtime.EventsEmit(a.ctx, "kimi:relogin", map[string]any{
 			"phase":   "ok",
 			"reason":  reason,
 			"account": rec,
-			"message": "Nova conta Kimi criada via Playwright",
+			"mode":    mode,
+			"message": doneMsg,
 		})
-		runtime.EventsEmit(a.ctx, "accounts:changed", map[string]any{"source": "kimi_stealth_relogin"})
+		runtime.EventsEmit(a.ctx, "accounts:changed", map[string]any{"source": "kimi_relogin", "mode": mode})
 		if id, _ := rec["id"].(string); id != "" {
-			runtime.EventsEmit(a.ctx, "account:rotated", map[string]any{"id": id, "reason": "kimi_stealth_relogin"})
+			runtime.EventsEmit(a.ctx, "account:rotated", map[string]any{"id": id, "reason": "kimi_relogin", "mode": mode})
 		}
 	}()
 }

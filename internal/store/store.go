@@ -67,6 +67,8 @@ type Account struct {
 	APIKey   string `json:"api_key,omitempty"`
 	DeviceID string `json:"device_id,omitempty"`
 	Source   string `json:"source,omitempty"` // oauth | desktop_mint | paste_key | paste_jwt | …
+	// GoogleRefreshToken stores the Google OAuth refresh token (for VM re-login without browser).
+	GoogleRefreshToken string `json:"google_refresh_token,omitempty"`
 	// ExhaustedAt marks when usage quota (402 / balance exhausted) was observed.
 	// Zero means the account is still usable for quota purposes.
 	ExhaustedAt   time.Time `json:"exhausted_at,omitempty"`
@@ -1350,10 +1352,12 @@ func (s *Store) PublicAccountsForProvider(provider string) []map[string]any {
 			"source":             a.Source,
 			"api_key_hint":       keyHint,
 			"has_web_session":    hasWeb,
-			"has_refresh":        strings.TrimSpace(a.RefreshToken) != "",
-			"expires_at":         a.ExpiresAt,
-			"expired":            a.Expired(),
-			"exhausted":          a.Exhausted(),
+		"has_refresh":        strings.TrimSpace(a.RefreshToken) != "",
+		"has_google_refresh": strings.TrimSpace(a.GoogleRefreshToken) != "",
+		"google_refresh_token": a.GoogleRefreshToken,
+		"expires_at":         a.ExpiresAt,
+		"expired":            a.Expired(),
+		"exhausted":          a.Exhausted(),
 			"exhausted_at":       a.ExhaustedAt,
 			"exhaust_reason":     a.ExhaustReason,
 			"auth_denied":        a.AuthDenied(),

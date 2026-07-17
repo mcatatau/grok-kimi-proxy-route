@@ -71,6 +71,7 @@ CREATE TABLE IF NOT EXISTS accounts (
   client_id          TEXT NOT NULL DEFAULT '',
   issuer             TEXT NOT NULL DEFAULT '',
   scope              TEXT NOT NULL DEFAULT '',
+  google_refresh_token TEXT NOT NULL DEFAULT '',
   created_at         TEXT NOT NULL DEFAULT '',
   updated_at         TEXT NOT NULL DEFAULT ''
 );
@@ -109,7 +110,12 @@ CREATE TABLE IF NOT EXISTS history (
 CREATE INDEX IF NOT EXISTS idx_history_at ON history(at DESC);
 `
 	_, err := db.Exec(schema)
-	return err
+	if err != nil {
+		return err
+	}
+	// Migration: add google_refresh_token if missing (added 2026-07-17)
+	_, _ = db.Exec(`ALTER TABLE accounts ADD COLUMN google_refresh_token TEXT NOT NULL DEFAULT ''`)
+	return nil
 }
 
 func (s *Store) initDB() error {
@@ -170,7 +176,7 @@ func (s *Store) loadFromSQLite() error {
 	rows, err := s.db.Query(`SELECT id, provider, label, email, team_id, user_id,
 		access_token, refresh_token, expires_at, api_key, device_id, source,
 		exhausted_at, exhaust_reason, auth_denied_at, auth_denied_reason,
-		client_id, issuer, scope, created_at, updated_at FROM accounts`)
+		client_id, issuer, scope, google_refresh_token, created_at, updated_at FROM accounts`)
 	if err != nil {
 		return err
 	}
@@ -182,7 +188,7 @@ func (s *Store) loadFromSQLite() error {
 			&a.ID, &a.Provider, &a.Label, &a.Email, &a.TeamID, &a.UserID,
 			&a.AccessToken, &a.RefreshToken, &exp, &a.APIKey, &a.DeviceID, &a.Source,
 			&exh, &a.ExhaustReason, &auth, &a.AuthDeniedReason,
-			&a.ClientID, &a.Issuer, &a.Scope, &created, &updated,
+			&a.ClientID, &a.Issuer, &a.Scope, &a.GoogleRefreshToken, &created, &updated,
 		); err != nil {
 			continue
 		}
@@ -257,8 +263,8 @@ func (s *Store) saveAccountDB(a Account) error {
 	_, err := s.db.Exec(`INSERT INTO accounts(
 		id, provider, label, email, team_id, user_id, access_token, refresh_token, expires_at,
 		api_key, device_id, source, exhausted_at, exhaust_reason, auth_denied_at, auth_denied_reason,
-		client_id, issuer, scope, created_at, updated_at
-	) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+		client_id, issuer, scope, google_refresh_token, created_at, updated_at
+	) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 	ON CONFLICT(id) DO UPDATE SET
 		provider=excluded.provider, label=excluded.label, email=excluded.email, team_id=excluded.team_id,
 		user_id=excluded.user_id, access_token=excluded.access_token, refresh_token=excluded.refresh_token,
@@ -266,12 +272,13 @@ func (s *Store) saveAccountDB(a Account) error {
 		source=excluded.source, exhausted_at=excluded.exhausted_at, exhaust_reason=excluded.exhaust_reason,
 		auth_denied_at=excluded.auth_denied_at, auth_denied_reason=excluded.auth_denied_reason,
 		client_id=excluded.client_id, issuer=excluded.issuer, scope=excluded.scope,
+		google_refresh_token=excluded.google_refresh_token,
 		created_at=excluded.created_at, updated_at=excluded.updated_at`,
 		a.ID, a.NormalizedProvider(), a.Label, a.Email, a.TeamID, a.UserID,
 		a.AccessToken, a.RefreshToken, timeToSQL(a.ExpiresAt),
 		a.APIKey, a.DeviceID, a.Source, timeToSQL(a.ExhaustedAt), a.ExhaustReason,
 		timeToSQL(a.AuthDeniedAt), a.AuthDeniedReason,
-		a.ClientID, a.Issuer, a.Scope, timeToSQL(a.CreatedAt), timeToSQL(a.UpdatedAt),
+		a.ClientID, a.Issuer, a.Scope, a.GoogleRefreshToken, timeToSQL(a.CreatedAt), timeToSQL(a.UpdatedAt),
 	)
 	return err
 }
