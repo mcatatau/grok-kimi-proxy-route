@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -41,6 +42,8 @@ type App struct {
 	signupRunning bool
 	signupCancel  context.CancelFunc
 	autoCreate    bool
+	// kimiReloginRunning avoids concurrent Playwright stealth re-logins after quota delete.
+	kimiReloginRunning bool
 
 	// Per-account refresh serialization (refresh-token rotation is not concurrent-safe).
 	refreshGates sync.Map // accountID → *sync.Mutex
@@ -90,9 +93,11 @@ func (a *App) startup(ctx context.Context) {
 	a.proxy = proxyhttp.New(st, a.upstream, a.ensureCreds)
 	a.proxy.SetForceRefresh(a.forceRefreshAccount)
 	a.proxy.SetQuotaHandler(func(accountID, reason string) bool {
+		// For Kimi with no spare account this blocks until Playwright stealth finishes.
 		a.markAccountExhausted(accountID, reason)
 		after, ok := a.store.ActiveAccount()
-		return ok && after != nil && after.ID != accountID && after.Usable()
+		// true when a usable account is ready (rotated or stealth re-login refilled).
+		return ok && after != nil && after.Usable()
 	})
 	a.proxy.SetAuthFailHandler(func(accountID, reason string) bool {
 		a.markAccountAuthDenied(accountID, reason)
@@ -346,6 +351,38 @@ func (a *App) RemoveAccount(id string) error {
 	return a.store.RemoveAccount(id)
 }
 
+// LogoffKimiAccount permanently deletes the Kimi user on kimi.com (Settings → Delete Account)
+// using the stored web JWT, then removes the local pool entry. Requires access/refresh session
+// (Google login or paste JWT) — sk-kimi-only accounts cannot remote-delete.
+func (a *App) LogoffKimiAccount(id string) (map[string]any, error) {
+	if a.store == nil {
+		return nil, fmt.Errorf("store not ready")
+	}
+	acc, ok := a.store.GetAccount(id)
+	if !ok || acc == nil {
+		return nil, fmt.Errorf("account not found")
+	}
+	if acc.NormalizedProvider() != store.ProviderKimiWork {
+		return nil, fmt.Errorf("só contas Kimi Work podem ser deletadas no site")
+	}
+	if !kimi.HasWebSession(acc.AccessToken, acc.RefreshToken) {
+		return nil, fmt.Errorf("esta conta não tem sessão web (só sk-kimi). Faça login Google ou cole o JWT para poder deletar no kimi.com")
+	}
+	// Refresh web JWT if needed, then DELETE /api/user/logoff.
+	if _, err := kimi.LogoffWithSession(acc.AccessToken, acc.RefreshToken); err != nil {
+		return nil, fmt.Errorf("falha ao deletar no kimi.com: %w", err)
+	}
+	email := acc.Email
+	label := acc.Label
+	_ = a.store.RemoveAccount(id)
+	a.safeEmit("account:logoff", map[string]any{
+		"id": id, "email": email, "reason": "manual_ui", "remote": true,
+	})
+	return map[string]any{
+		"id": id, "email": email, "label": label, "remote": true, "removed": true,
+	}, nil
+}
+
 func (a *App) RenameAccount(id, label string) error {
 	acc, ok := a.store.GetAccount(id)
 	if !ok {
@@ -381,7 +418,40 @@ func (a *App) StartKimiBrowserLogin() (map[string]any, error) {
 		}
 	}
 	payload, _ := kimi.DecodeJWT(access)
-	return a.addKimiSession(access, refresh, payload, "google_browser")
+	return a.addKimiSession(access, refresh, payload, "google_browser", gl.Email, gl.Name)
+}
+
+// StartKimiStealthLogin uses Playwright with persistent Google profile to automate
+// the OAuth account chooser click. Same end result as StartKimiBrowserLogin but
+// with browser automation (stealth anti-detection).
+func (a *App) StartKimiStealthLogin(autoClose bool) (map[string]any, error) {
+	if a.store == nil {
+		return nil, fmt.Errorf("store not ready")
+	}
+	root, err := a.kimiProjectRoot()
+	if err != nil {
+		return nil, err
+	}
+	a.safeEmit("kimi:login", map[string]any{
+		"phase":   "stealth",
+		"message": "Iniciando login automático com perfil persistente (Playwright)…",
+	})
+	gl, err := kimi.LoginWithGoogleStealth(root, "", 5*time.Minute, autoClose, a.store.Settings().KimiStealthHeadless)
+	if err != nil {
+		return nil, err
+	}
+	access := gl.AccessToken
+	refresh := gl.RefreshToken
+	if p, _ := kimi.DecodeJWT(access); p != nil && p.Exp > 0 && time.Until(time.Unix(p.Exp, 0)) < 2*time.Minute && refresh != "" {
+		if renewed, rerr := kimi.RefreshAccessToken(refresh); rerr == nil && renewed != nil {
+			access = renewed.AccessToken
+			if renewed.RefreshToken != "" {
+				refresh = renewed.RefreshToken
+			}
+		}
+	}
+	payload, _ := kimi.DecodeJWT(access)
+	return a.addKimiSession(access, refresh, payload, "google_stealth", gl.Email, gl.Name)
 }
 
 // AddKimiFromJWT mints/reuses sk-kimi from an explicit web access_token JWT (optional fallback).
@@ -392,7 +462,7 @@ func (a *App) AddKimiFromJWT(accessToken string) (map[string]any, error) {
 	if err != nil {
 		return nil, fmt.Errorf("jwt inválido: %w", err)
 	}
-	return a.addKimiSession(accessToken, "", payload, "paste_jwt")
+	return a.addKimiSession(accessToken, "", payload, "paste_jwt", "", "")
 }
 
 // AddKimiAPIKey registers a pasted sk-kimi key (optional fallback).
@@ -466,7 +536,7 @@ func (a *App) kimiProjectRoot() (string, error) {
 	return "", fmt.Errorf("scripts/kimi-browser-login.mjs não encontrado — rode a partir do repo GrokDesktop")
 }
 
-func (a *App) addKimiSession(accessToken, refreshToken string, payload *kimi.JWTPayload, source string) (map[string]any, error) {
+func (a *App) addKimiSession(accessToken, refreshToken string, payload *kimi.JWTPayload, source, email, displayName string) (map[string]any, error) {
 	if a.store == nil {
 		return nil, fmt.Errorf("store not ready")
 	}
@@ -478,12 +548,19 @@ func (a *App) addKimiSession(accessToken, refreshToken string, payload *kimi.JWT
 	if userID == "" && payload != nil {
 		userID = payload.Sub
 	}
+	email = strings.TrimSpace(email)
+	displayName = strings.TrimSpace(displayName)
 	id := "kimi-" + userID
 	if userID == "" {
 		id = "kimi-" + minted.APIKey[len(minted.APIKey)-8:]
 	}
+	// Prefer Gmail so multi-account UI is readable.
 	label := "Kimi Work"
-	if userID != "" {
+	if email != "" {
+		label = email
+	} else if displayName != "" {
+		label = displayName
+	} else if userID != "" {
 		label = "Kimi · " + userID
 		if len(userID) > 12 {
 			label = "Kimi · " + userID[:8] + "…"
@@ -491,15 +568,28 @@ func (a *App) addKimiSession(accessToken, refreshToken string, payload *kimi.JWT
 	}
 	// Preserve custom label / created on re-login same user
 	if prev, ok := a.store.GetAccount(id); ok && prev != nil {
-		if prev.Label != "" && prev.Label != prev.Email {
+		if prev.Label != "" && prev.Label != prev.Email && prev.Label != userID &&
+			!strings.HasPrefix(strings.ToLower(prev.Label), "esgotada") &&
+			!strings.HasPrefix(strings.ToLower(prev.Label), "auth-denied") {
 			label = prev.Label
 		}
+		if email == "" && prev.Email != "" && strings.Contains(prev.Email, "@") {
+			email = prev.Email
+		}
+	}
+	if email == "" {
+		email = label
+	}
+	now := time.Now().UTC()
+	created := now
+	if prev, ok := a.store.GetAccount(id); ok && prev != nil && !prev.CreatedAt.IsZero() {
+		created = prev.CreatedAt
 	}
 	acc := store.Account{
 		ID:           id,
 		Provider:     store.ProviderKimiWork,
 		Label:        label,
-		Email:        userID,
+		Email:        email,
 		UserID:       userID,
 		APIKey:       minted.APIKey,
 		DeviceID:     minted.DeviceID,
@@ -509,25 +599,33 @@ func (a *App) addKimiSession(accessToken, refreshToken string, payload *kimi.JWT
 		AccessToken:  accessToken,
 		RefreshToken: refreshToken,
 		ExpiresAt:    minted.ExpiresAt,
-		CreatedAt:    time.Now().UTC(),
-		UpdatedAt:    time.Now().UTC(),
+		CreatedAt:    created,
+		UpdatedAt:    now,
+		// Fresh login always clears prior poison marks.
+		ExhaustedAt:      time.Time{},
+		ExhaustReason:    "",
+		AuthDeniedAt:     time.Time{},
+		AuthDeniedReason: "",
 	}
 	_ = a.store.UpdateSettings(func(s *store.Settings) {
 		if s.NormalizedProvider() != store.ProviderKimiWork {
 			s.ApplyProviderDefaults(store.ProviderKimiWork)
 		}
+		s.ActiveAccountID = acc.ID
+		s.Provider = store.ProviderKimiWork
 	})
 	if err := a.store.UpsertAccount(acc); err != nil {
 		return nil, err
 	}
 	_ = a.store.SetActiveAccount(acc.ID)
+	_ = a.store.ClearAuthState(acc.ID)
 	a.safeEmit("account:added", map[string]any{"id": acc.ID, "provider": store.ProviderKimiWork, "user_id": userID, "source": source})
 	hint := minted.APIKey
 	if len(hint) > 14 {
 		hint = hint[:10] + "…" + hint[len(hint)-4:]
 	}
 	return map[string]any{
-		"id": acc.ID, "label": acc.Label, "user_id": userID, "provider": store.ProviderKimiWork,
+		"id": acc.ID, "label": acc.Label, "email": email, "user_id": userID, "provider": store.ProviderKimiWork,
 		"api_key_hint": hint, "source": source, "has_refresh": refreshToken != "",
 	}, nil
 }
@@ -706,27 +804,18 @@ func (a *App) GetStats() map[string]any {
 		proxyAddr = a.store.Settings().ProxyListen
 	}
 	baseURL := fmt.Sprintf("http://%s/v1", proxyAddr)
+	modelsURL := baseURL + "/models"
 	settings := a.store.Settings()
 	apiKey := settings.ProxyAPIKey
 	if apiKey == "" {
-		if settings.IsOllie() {
-			apiKey = "ollie"
-		} else {
-			apiKey = "grok-desktop" // placeholder for clients that require a key
-		}
+		apiKey = "local" // placeholder for clients that require a key
 	}
-	// Clients should pin model=default; proxy routes to settings.DefaultModel.
-	model := "default"
-	resolved := settings.ResolveModel(model)
-	providerName := "Grok Desktop"
-	if settings.IsOllie() {
-		providerName = "Grok Desktop · OllieChat"
-	}
+	providerName := "Grok Proxy Plus"
 
-	// Open Code / Continue / Cursor style snippets
+	// OpenCode: same baseURL lists Grok + Kimi; client picks model id.
 	openCodeJSON := fmt.Sprintf(`{
   "provider": {
-    "grok-desktop": {
+    "grok-proxy-plus": {
       "npm": "@ai-sdk/openai-compatible",
       "name": "%s",
       "options": {
@@ -734,46 +823,114 @@ func (a *App) GetStats() map[string]any {
         "apiKey": "%s"
       },
       "models": {
-        "default": {
-          "name": "proxy global → %s"
-        }
+        "grok-4.5": { "name": "Grok 4.5 (xAI · /v1/responses)" },
+        "k3-agent": { "name": "K3 Max (Work)" },
+        "k3-agent-low": { "name": "K3 Max Low Think" },
+        "k3-agent-medium": { "name": "K3 Max Medium Think" },
+        "k3-agent-high": { "name": "K3 Max High Think" },
+        "k3-agent-xhigh": { "name": "K3 Max Extra High Think" },
+        "k2d6-agent": { "name": "K2.6 Agent (Work)" },
+        "k2d6-agent-low": { "name": "K2.6 Agent Low Think" },
+        "k2d6-agent-medium": { "name": "K2.6 Agent Medium Think" },
+        "k2d6-agent-high": { "name": "K2.6 Agent High Think" },
+        "k2d6-agent-xhigh": { "name": "K2.6 Agent Extra High Think" }
       }
     }
   }
-}`, providerName, baseURL, apiKey, resolved)
+}`, providerName, baseURL, apiKey)
 
-	openaiEnv := fmt.Sprintf(`OPENAI_BASE_URL=%s
+	kiloGuide := fmt.Sprintf(`Kilo Code · OpenAI Compatible
+
+1. Provider type: OpenAI Compatible
+2. Base URL:  %s
+3. API Key:   %s  (qualquer string se o app não exige key)
+4. Models:    o Kilo chama GET %s
+              e lista o que o proxy devolve (Grok + Kimi juntos).
+5. Escolha o model no dropdown do Kilo:
+   • grok-4.5          → Grok (POST /v1/responses)
+   • k3-agent          → K3 Max (padrão)
+   • k3-agent-low      → K3 Max Low Think
+   • k3-agent-medium   → K3 Max Medium Think
+   • k3-agent-high     → K3 Max High Think
+   • k3-agent-xhigh    → K3 Max Extra High Think
+   • k2d6-agent        → K2.6 Agent (padrão)
+   • k2d6-agent-low    → K2.6 Agent Low Think
+   • k2d6-agent-medium → K2.6 Agent Medium Think
+   • k2d6-agent-high   → K2.6 Agent High Think
+   • k2d6-agent-xhigh  → K2.6 Agent Extra High Think
+
+Importante:
+• Não precisa trocar "provedor ativo" no app desktop.
+• O model da request decide Grok vs Kimi.
+• App precisa estar aberto (proxy local).`, baseURL, apiKey, modelsURL)
+
+	openaiEnv := fmt.Sprintf(`# Base do proxy (OpenAI-compatible)
+OPENAI_BASE_URL=%s
 OPENAI_API_KEY=%s
-OPENAI_MODEL=default`, baseURL, apiKey)
 
-	curlExample := fmt.Sprintf(`curl %s/chat/completions \
+# Escolha UM model por request:
+# Grok:  OPENAI_MODEL=grok-4.5          → use /v1/responses
+# Kimi:  OPENAI_MODEL=kimi-for-coding   → use /v1/chat/completions`, baseURL, apiKey)
+
+	curlExample := fmt.Sprintf(`# Listar models (Grok + Kimi)
+curl %s
+
+# Grok (Responses)
+curl %s/responses \
   -H "Authorization: Bearer %s" \
   -H "Content-Type: application/json" \
-  -d "{\"model\":\"default\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"stream\":true}"`,
-		baseURL, apiKey)
+  -d "{\"model\":\"grok-4.5\",\"stream\":true,\"input\":\"Olá\"}"
 
-	rate := pricing.RateFor(resolved)
+# Kimi Work (chat/completions)
+curl %s/chat/completions \
+  -H "Authorization: Bearer %s" \
+  -H "Content-Type: application/json" \
+  -d "{\"model\":\"kimi-for-coding\",\"stream\":false,\"messages\":[{\"role\":\"user\",\"content\":\"Olá\"}]}"`,
+		modelsURL, baseURL, apiKey, baseURL, apiKey)
+
+	zooGuide := fmt.Sprintf(`Zoo Code · VS Code Extension
+
+1. Open VS Code Settings (Ctrl+,) → search "Zoo Code provider"
+2. Add a custom OpenAI-compatible provider:
+   • Name:     Grok Proxy Plus
+   • Base URL: %s
+   • API Key:  %s
+3. Models (add all or pick the ones you want):
+   • grok-4.5
+   • kimi-for-coding
+   • k3-agent
+   • k3-agent-low
+   • k3-agent-medium
+   • k3-agent-high
+   • k3-agent-xhigh
+
+Tip: The proxy auto-routes by model id.
+   grok-4.5 → xAI /responses
+   kimi-*   → Kimi Work /chat/completions`, baseURL, apiKey)
 
 	return map[string]any{
-		"usage":            usage,
-		"global":           g,
-		"history":          hist,
-		"latency_series":   latSeries,
-		"ttft_series":      ttftSeries,
-		"cost_series":      costSeries,
-		"avg_latency_ms":   avgLat,
-		"avg_ttft_ms":      avgTTFT,
-		"pricing":          pricing.AllRates(),
-		"active_rate":      rate,
+		"usage":          usage,
+		"global":         g,
+		"history":        hist,
+		"latency_series": latSeries,
+		"ttft_series":    ttftSeries,
+		"cost_series":    costSeries,
+		"avg_latency_ms": avgLat,
+		"avg_ttft_ms":    avgTTFT,
+		"pricing":        pricing.AllRates(),
+		"zoo_guide":      zooGuide,
+		"active_rate":    "auto",
 		"proxy": map[string]any{
-			"base_url":         baseURL,
-			"api_key":          apiKey,
-			"model":            model,
-			"resolved_model":   resolved,
-			"force_default":    settings.ForceModel(),
-			"openai_env":       openaiEnv,
-			"opencode":         openCodeJSON,
-			"curl":             curlExample,
+			"base_url":       baseURL,
+			"models_url":     modelsURL,
+			"api_key":        apiKey,
+			"route":          "model",
+			"openai_env":     openaiEnv,
+			"opencode":       openCodeJSON,
+			"kilo":           kiloGuide,
+			"curl":           curlExample,
+			"models_note":    "GET /v1/models lista Grok + Kimi. O client escolhe o model; o proxy roteia.",
+			"models_example": []string{"grok-4.5", "kimi-for-coding", "k3-agent", "k3-agent-low", "k3-agent-medium", "k3-agent-high", "k3-agent-xhigh"},
 		},
 		"data_dir": a.store.Root(),
 	}
@@ -996,8 +1153,15 @@ func (a *App) SendChat(req upstream.ChatRequest) error {
 				}
 			}
 			if isQuotaExhaustedErr(err) {
+				// Blocks on Kimi when Playwright stealth recreates the only account.
 				a.markAccountExhausted(acc.ID, err.Error())
-				if nextID := a.pickNonExhausted(acc.ID); nextID != "" {
+				nextID := a.pickNonExhausted(acc.ID)
+				if nextID == "" {
+					if after, ok := a.store.ActiveAccount(); ok && after != nil && after.Usable() {
+						nextID = after.ID
+					}
+				}
+				if nextID != "" {
 					if tok2, acc2, settings2, err2 := a.ensureCredsFor(ctx, nextID); err2 == nil {
 						label2 := acc2.Label
 						if label2 == "" {
@@ -1057,6 +1221,10 @@ func (a *App) ensureCredsInner(ctx context.Context, preferID string, forceRefres
 		return "", nil, store.Settings{}, fmt.Errorf("store not ready")
 	}
 	settings := a.store.Settings()
+	// Request-scoped provider from HTTP multi-route (model → provider). Does not mutate store.
+	if rp := proxyhttp.RouteProviderFrom(ctx); rp != "" {
+		settings = settings.WithProvider(rp)
+	}
 	// OllieChat is keyless — no xAI OAuth account required.
 	if settings.IsOllie() {
 		acc := &store.Account{
@@ -1085,6 +1253,8 @@ func (a *App) ensureCredsInner(ctx context.Context, preferID string, forceRefres
 	}
 	// Kimi Work: multi-account pool of sk-kimi keys (session auth mode).
 	if settings.IsKimiWork() {
+		// ActiveAccountID often still points at an xAI row — fix provider-local active.
+		_ = a.store.PreferHealthyActive()
 		var acc *store.Account
 		var ok bool
 		if preferID != "" {
@@ -1097,18 +1267,34 @@ func (a *App) ensureCredsInner(ctx context.Context, preferID string, forceRefres
 			}
 		}
 		if !ok || acc == nil {
-			acc, ok = a.store.PreferUsableAccount()
+			acc, ok = a.store.PreferUsableAccountForProvider(store.ProviderKimiWork)
 		}
 		if !ok || acc == nil || acc.NormalizedProvider() != store.ProviderKimiWork {
-			return "", nil, settings, fmt.Errorf("nenhuma conta Kimi Work — use Adicionar (Desktop / JWT / sk-kimi)")
+			// Se auto-create está habilitado, aguarda stealth re-login em vez de falhar imediatamente.
+			if a.GetAutoCreateOnExhausted() {
+				a.waitAutoKimiStealthRelogin("ensureCreds: no kimi account available")
+				acc, ok = a.store.PreferUsableAccountForProvider(store.ProviderKimiWork)
+			}
+			if !ok || acc == nil || acc.NormalizedProvider() != store.ProviderKimiWork {
+				return "", nil, settings, fmt.Errorf("nenhuma conta Kimi Work — use Adicionar (Desktop / JWT / sk-kimi)")
+			}
+		}
+		// forceRefresh / auth retry: remint sk-kimi from web session (keys can be revoked).
+		if forceRefresh {
+			if err := a.remintKimiWorkKey(acc); err != nil {
+				// keep existing key if remint fails
+				runtime.LogErrorf(a.ctx, "kimi remint: %v", err)
+			} else if fresh, ok2 := a.store.GetAccount(acc.ID); ok2 && fresh != nil {
+				acc = fresh
+			}
 		}
 		tok := acc.BearerToken()
 		if tok == "" {
 			return "", nil, settings, fmt.Errorf("conta Kimi sem sk-kimi")
 		}
-		if settings.ActiveAccountID != acc.ID {
+		// Align active account for this provider so UI + proxy stay consistent.
+		if cur, _ := a.store.ActiveAccount(); cur == nil || cur.NormalizedProvider() != store.ProviderKimiWork || cur.ID != acc.ID {
 			_ = a.store.SetActiveAccount(acc.ID)
-			settings = a.store.Settings()
 		}
 		return tok, acc, settings, nil
 	}
@@ -1125,7 +1311,12 @@ func (a *App) ensureCredsInner(ctx context.Context, preferID string, forceRefres
 			a.safeEmit("account:cli_synced", map[string]any{"updated": n})
 		}
 	}
-	settings = a.store.Settings()
+	// Keep route override (xAI) after CLI sync reloads store settings.
+	if rp := proxyhttp.RouteProviderFrom(ctx); rp != "" {
+		settings = a.store.Settings().WithProvider(rp)
+	} else {
+		settings = a.store.Settings()
+	}
 
 	var acc *store.Account
 	var ok bool
@@ -1134,13 +1325,16 @@ func (a *App) ensureCredsInner(ctx context.Context, preferID string, forceRefres
 		if ok && acc != nil && (acc.Exhausted() || acc.AuthDenied()) && !forceRefresh {
 			ok = false
 		}
+		if ok && acc != nil && acc.NormalizedProvider() != store.ProviderXAI {
+			ok = false
+		}
 	}
 	if !ok || acc == nil {
-		// Prefer a still-usable active account; if active is exhausted/auth-denied, rotate.
-		acc, ok = a.store.PreferUsableAccount()
+		// Prefer a still-usable xAI account; if active is exhausted/auth-denied, rotate.
+		acc, ok = a.store.PreferUsableAccountForProvider(store.ProviderXAI)
 	}
 	if !ok || acc == nil {
-		if raw, has := a.store.ActiveAccount(); has && raw != nil && (raw.Exhausted() || raw.AuthDenied()) {
+		if raw, has := a.store.ActiveAccount(); has && raw != nil && raw.NormalizedProvider() == store.ProviderXAI && (raw.Exhausted() || raw.AuthDenied()) {
 			a.maybeAutoCreate(firstNonEmpty(raw.ExhaustReason, raw.AuthDeniedReason))
 			return "", nil, settings, fmt.Errorf("todas as contas esgotadas ou bloqueadas — adicione conta ou relogue")
 		}
@@ -1348,7 +1542,37 @@ func (a *App) GetAutoCreateOnExhausted() bool {
 	return a.autoCreate
 }
 
+func (a *App) GetKimiStealthHeadless() bool {
+	if a.store == nil {
+		return false
+	}
+	return a.store.Settings().KimiStealthHeadless
+}
+
+func (a *App) SetKimiStealthHeadless(enabled bool) {
+	if a.store == nil {
+		return
+	}
+	_ = a.store.UpdateSettings(func(s *store.Settings) {
+		s.KimiStealthHeadless = enabled
+	})
+}
+
 func (a *App) markAccountExhausted(id, reason string) {
+	acc, ok := a.store.GetAccount(id)
+	if !ok || acc == nil {
+		return
+	}
+	isKimi := acc.NormalizedProvider() == store.ProviderKimiWork
+	// Kimi Work: on quota exhaustion, delete the consumer account on kimi.com
+	// (same as Settings → Delete Account) using the web JWT, then drop local row.
+	// When no other usable account remains, blocks until Playwright stealth recreates one
+	// so the proxy can retry the same client request instead of returning quota to the client.
+	if isKimi {
+		if a.tryKimiLogoffOnQuota(acc, reason) {
+			return
+		}
+	}
 	acc, err := a.store.MarkExhausted(id, reason)
 	if err != nil || acc == nil {
 		return
@@ -1360,12 +1584,244 @@ func (a *App) markAccountExhausted(id, reason string) {
 	if next != "" {
 		_ = a.store.SetActiveAccount(next)
 		runtime.EventsEmit(a.ctx, "account:rotated", map[string]any{"id": next, "reason": "quota"})
+		if isKimi {
+			// Replenish pool in background while request continues on another account.
+			a.maybeAutoKimiStealthRelogin(reason + " (rotated; replenish)")
+		}
+		return
+	}
+	if isKimi {
+		// No usable account left — open Playwright and wait so proxy can retry.
+		a.waitAutoKimiStealthRelogin(reason)
 		return
 	}
 	a.maybeAutoCreate(reason)
 }
 
+// remintKimiWorkKey refreshes the web JWT if needed and mints a fresh sk-kimi WORK key.
+func (a *App) remintKimiWorkKey(acc *store.Account) error {
+	if a.store == nil || acc == nil {
+		return fmt.Errorf("no account")
+	}
+	if !kimi.HasWebSession(acc.AccessToken, acc.RefreshToken) {
+		return fmt.Errorf("no web session to remint sk-kimi")
+	}
+	access, refresh, err := kimi.EnsureAccessToken(acc.AccessToken, acc.RefreshToken)
+	if err != nil {
+		return err
+	}
+	minted, err := kimi.MintWorkAPIKey(access, "grok-desktop-kimi")
+	if err != nil {
+		return err
+	}
+	acc.APIKey = minted.APIKey
+	acc.AccessToken = access
+	if refresh != "" {
+		acc.RefreshToken = refresh
+	}
+	if minted.DeviceID != "" {
+		acc.DeviceID = minted.DeviceID
+	}
+	if !minted.ExpiresAt.IsZero() {
+		acc.ExpiresAt = minted.ExpiresAt
+	}
+	acc.AuthDeniedAt = time.Time{}
+	acc.AuthDeniedReason = ""
+	acc.ExhaustedAt = time.Time{}
+	acc.ExhaustReason = ""
+	acc.UpdatedAt = time.Now().UTC()
+	if strings.HasPrefix(strings.ToLower(acc.Label), "auth-denied") || strings.HasPrefix(strings.ToLower(acc.Label), "esgotada") {
+		if acc.Email != "" {
+			acc.Label = acc.Email
+		}
+	}
+	if err := a.store.UpsertAccount(*acc); err != nil {
+		return err
+	}
+	_ = a.store.ClearAuthState(acc.ID)
+	return nil
+}
+
+// tryKimiLogoffOnQuota permanently deletes the Kimi user when quota is exhausted.
+// Returns true if the local account was removed (success or already-gone remote).
+// When no other usable account remains, waits for Playwright stealth re-login so the
+// proxy quota handler can report rotation and retry the client request.
+func (a *App) tryKimiLogoffOnQuota(acc *store.Account, reason string) bool {
+	if acc == nil {
+		return false
+	}
+	if !kimi.HasWebSession(acc.AccessToken, acc.RefreshToken) {
+		log.Printf("kimi quota: account %s has no web session — mark exhausted only (paste sk-kimi?)", acc.ID)
+		return false
+	}
+	_, err := kimi.LogoffWithSession(acc.AccessToken, acc.RefreshToken)
+	if err != nil {
+		log.Printf("kimi logoff failed for %s: %v — falling back to exhausted mark", acc.ID, err)
+		runtime.EventsEmit(a.ctx, "account:logoff_failed", map[string]any{
+			"id": acc.ID, "email": acc.Email, "reason": reason, "error": err.Error(),
+		})
+		return false
+	}
+	email, id := acc.Email, acc.ID
+	_ = a.store.RemoveAccount(id)
+	log.Printf("kimi logoff OK — account deleted on kimi.com and removed locally: %s (%s)", id, email)
+	runtime.EventsEmit(a.ctx, "account:logoff", map[string]any{
+		"id": id, "email": email, "reason": reason, "remote": true,
+	})
+	runtime.EventsEmit(a.ctx, "account:exhausted", map[string]any{
+		"id": id, "email": email, "reason": reason, "logoff": true,
+	})
+	next := a.pickNonExhausted(id)
+	if next != "" {
+		_ = a.store.SetActiveAccount(next)
+		runtime.EventsEmit(a.ctx, "account:rotated", map[string]any{"id": next, "reason": "quota_logoff"})
+		// Replenish Kimi pool in background while request continues on next account.
+		a.maybeAutoKimiStealthRelogin(reason + " (rotated; replenish)")
+		return true
+	}
+	// No other usable account: wait for Playwright stealth (Google profile) re-login.
+	// Do NOT use maybeAutoCreate (that is the xAI/Grok signup bot).
+	a.waitAutoKimiStealthRelogin(reason)
+	return true
+}
+
+// maybeAutoKimiStealthRelogin starts Playwright stealth Google→Kimi login in background.
+func (a *App) maybeAutoKimiStealthRelogin(reason string) {
+	a.startKimiStealthRelogin(reason, nil)
+}
+
+// waitAutoKimiStealthRelogin runs (or joins) stealth re-login and blocks until a usable
+// Kimi account is active, failure, or timeout. Returns true if a usable account is ready.
+func (a *App) waitAutoKimiStealthRelogin(reason string) bool {
+	done := make(chan bool, 1)
+	a.startKimiStealthRelogin(reason, func(ok bool) {
+		select {
+		case done <- ok:
+		default:
+		}
+	})
+	timeout := 6 * time.Minute
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case ok := <-done:
+		return ok
+	case <-timer.C:
+		log.Printf("kimi stealth re-login wait timed out after %s (reason=%s)", timeout, reason)
+		return false
+	case <-a.ctx.Done():
+		return false
+	}
+}
+
+// startKimiStealthRelogin launches Playwright stealth Google→Kimi login once.
+// If already running, optional onDone waits for the in-flight run to finish.
+// onDone may be nil for fire-and-forget (pool replenish).
+func (a *App) startKimiStealthRelogin(reason string, onDone func(bool)) {
+	a.mu.Lock()
+	if a.kimiReloginRunning {
+		a.mu.Unlock()
+		log.Printf("kimi stealth re-login already running — join wait (reason=%s)", reason)
+		if onDone == nil {
+			return
+		}
+		go func() {
+			deadline := time.Now().Add(6 * time.Minute)
+			for time.Now().Before(deadline) {
+				if a.ctx != nil {
+					select {
+					case <-a.ctx.Done():
+						onDone(false)
+						return
+					default:
+					}
+				}
+				a.mu.Lock()
+				running := a.kimiReloginRunning
+				a.mu.Unlock()
+				if !running {
+					onDone(a.kimiUsableActiveReady())
+					return
+				}
+				time.Sleep(400 * time.Millisecond)
+			}
+			onDone(false)
+		}()
+		return
+	}
+	a.kimiReloginRunning = true
+	a.mu.Unlock()
+
+	go func() {
+		ok := false
+		defer func() {
+			a.mu.Lock()
+			a.kimiReloginRunning = false
+			a.mu.Unlock()
+			if onDone != nil {
+				onDone(ok)
+			}
+		}()
+
+		log.Printf("kimi stealth re-login starting after quota: %s", reason)
+		runtime.EventsEmit(a.ctx, "kimi:relogin", map[string]any{
+			"phase":   "start",
+			"reason":  reason,
+			"message": "Cota esgotada — abrindo Playwright para recriar conta Kimi…",
+		})
+
+		rec, err := a.StartKimiStealthLogin(true)
+		if err != nil {
+			log.Printf("kimi stealth re-login failed: %v", err)
+			runtime.EventsEmit(a.ctx, "kimi:relogin", map[string]any{
+				"phase":   "error",
+				"reason":  reason,
+				"error":   err.Error(),
+				"message": "Falha no re-login automático Kimi: " + err.Error(),
+			})
+			return
+		}
+		ok = a.kimiUsableActiveReady()
+		log.Printf("kimi stealth re-login OK (usable=%v): %v", ok, rec)
+		runtime.EventsEmit(a.ctx, "kimi:relogin", map[string]any{
+			"phase":   "ok",
+			"reason":  reason,
+			"account": rec,
+			"message": "Nova conta Kimi criada via Playwright",
+		})
+		runtime.EventsEmit(a.ctx, "accounts:changed", map[string]any{"source": "kimi_stealth_relogin"})
+		if id, _ := rec["id"].(string); id != "" {
+			runtime.EventsEmit(a.ctx, "account:rotated", map[string]any{"id": id, "reason": "kimi_stealth_relogin"})
+		}
+	}()
+}
+
+func (a *App) kimiUsableActiveReady() bool {
+	if a.store == nil {
+		return false
+	}
+	after, ok := a.store.ActiveAccount()
+	return ok && after != nil && after.Usable() && after.NormalizedProvider() == store.ProviderKimiWork
+}
+
 func (a *App) markAccountAuthDenied(id, reason string) {
+	// Never poison a Kimi sk-kimi account with an xAI-shaped auth error (wrong upstream).
+	low := strings.ToLower(reason)
+	if acc, ok := a.store.GetAccount(id); ok && acc != nil && acc.NormalizedProvider() == store.ProviderKimiWork {
+		if strings.Contains(low, "x_xai_token_auth") ||
+			(strings.Contains(low, "no auth context") && strings.Contains(low, "auth_kind=bearer")) {
+			return
+		}
+		// Invalid sk-kimi: try remint from web JWT before permanently denying.
+		if strings.Contains(low, "invalid_authentication") ||
+			strings.Contains(low, "api key appears to be invalid") ||
+			strings.Contains(low, "may have expired") {
+			if err := a.remintKimiWorkKey(acc); err == nil {
+				runtime.LogInfof(a.ctx, "kimi: reminted sk-kimi after auth failure for %s", id)
+				return
+			}
+		}
+	}
 	acc, err := a.store.MarkAuthDenied(id, reason)
 	if err != nil || acc == nil {
 		return
@@ -1411,7 +1867,18 @@ func isQuotaExhaustedErr(err error) bool {
 	if strings.Contains(s, "http 402") {
 		return true
 	}
-	if strings.Contains(s, "http 429") && (strings.Contains(s, "exhausted") || strings.Contains(s, "quota") || strings.Contains(s, "balance")) {
+	// Kimi Work plan / billing cycle cap
+	kimiQuota := []string{
+		"usage limit", "billing cycle", "resource_exhausted", "access_terminated",
+		"upgrade to get more", "quota exceeded", "quota limit", "credit exhausted",
+		"insufficient quota", "no remaining quota", "daily limit", "monthly limit",
+	}
+	for _, p := range kimiQuota {
+		if strings.Contains(s, p) {
+			return true
+		}
+	}
+	if strings.Contains(s, "http 429") && (strings.Contains(s, "exhausted") || strings.Contains(s, "quota") || strings.Contains(s, "balance") || strings.Contains(s, "rate limit")) {
 		return true
 	}
 	// Some gateways only return the message without status in the error string.
@@ -1426,6 +1893,10 @@ func isAuthDeniedErr(err error) bool {
 		return false
 	}
 	s := strings.ToLower(err.Error())
+	// Prefer quota classification for Kimi billing 403s.
+	if isQuotaExhaustedErr(err) {
+		return false
+	}
 	if strings.Contains(s, "permission-denied") || strings.Contains(s, "access to the chat endpoint is denied") {
 		return true
 	}

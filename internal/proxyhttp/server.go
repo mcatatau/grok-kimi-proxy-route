@@ -1,46 +1,26 @@
 package proxyhttp
 
 
-
 import (
-
+	"bufio"
 	"bytes"
-
 	"context"
-
 	"encoding/json"
-
 	"fmt"
-
 	"io"
-
 	"log"
-
 	"net"
-
 	"net/http"
-
 	"strconv"
-
 	"strings"
-
 	"sync"
-
 	"time"
-
-
 
 	"github.com/google/uuid"
 
-
-
 	"grok-desktop/internal/gemini"
-
-
 	"grok-desktop/internal/store"
-
 	"grok-desktop/internal/upstream"
-
 )
 
 
@@ -66,6 +46,14 @@ import (
 //
 
 // Not supported (explicit 404): /v1/completions (legacy).
+
+//
+
+// Multi-route: HTTP clients pick provider by model id on the same base URL
+
+// (e.g. grok-4.5 → xAI, kimi-for-coding → Kimi Work). Global UI "active provider"
+
+// is only a fallback when model is empty/alias.
 
 type Server struct {
 
@@ -99,6 +87,28 @@ type Server struct {
 
 	addr       string
 
+}
+
+type ctxKey int
+
+const routeProviderKey ctxKey = 1
+
+// WithRouteProvider pins request-scoped provider for ensureCreds (xai|kimi_work|…).
+func WithRouteProvider(ctx context.Context, provider string) context.Context {
+	p := strings.TrimSpace(provider)
+	if p == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, routeProviderKey, p)
+}
+
+// RouteProviderFrom returns the request-scoped provider override, if any.
+func RouteProviderFrom(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	v, _ := ctx.Value(routeProviderKey).(string)
+	return strings.TrimSpace(v)
 }
 
 
@@ -553,142 +563,87 @@ func (s *Server) handleModels(w http.ResponseWriter, r *http.Request) {
 
 	}
 
-	settings := s.store.Settings()
-
-	// Optional ensure so provider-specific live lists can work.
-
-	token, _, active, ensureErr := s.ensure(r.Context())
-
-	if ensureErr == nil && active.NormalizedProvider() != "" {
-
-		settings = active
-
-	}
-
-	_ = token
+	// Unified catalog: same base URL lists Grok + Kimi (and optional others).
+	// Clients pick provider by model id — no "active provider" gate on listing.
+	base := s.store.Settings()
 
 	var models []upstream.ModelInfo
+	var data []map[string]any
 
-	switch settings.NormalizedProvider() {
-
-	case store.ProviderKimiWork:
-
-		models = []upstream.ModelInfo{
-
-			{ID: "kimi-for-coding", Name: "Kimi For Coding", Description: "Kimi Work · chat/completions", APIMode: "chat"},
-
-			{ID: "k3-agent", Name: "K3 Max (Work)", Description: "alias → kimi-for-coding", APIMode: "chat"},
-
-			{ID: "k3-agent-swarm", Name: "K3 Swarm Max (Work)", Description: "alias → kimi-for-coding", APIMode: "chat"},
-
-			{ID: "k2d6-agent", Name: "K2.6 Agent (Work)", Description: "alias → kimi-for-coding", APIMode: "chat"},
-
-		}
-
-	case store.ProviderOllie:
-
-		models = []upstream.ModelInfo{
-
-			{ID: "claude-sonnet-5", Name: "claude-sonnet-5", Description: "OllieChat", APIMode: "chat"},
-
-			{ID: "claude-fable-5", Name: "claude-fable-5", Description: "OllieChat", APIMode: "chat"},
-
-			{ID: "claude-opus-4-8", Name: "claude-opus-4-8", Description: "OllieChat", APIMode: "chat"},
-
-			{ID: "deepseek-v4-flash-free", Name: "deepseek-v4-flash-free", Description: "OllieChat", APIMode: "chat"},
-
-		}
-
-	case store.ProviderGemini:
-
-		for _, id := range gemini.ListModels(r.Context(), settings) {
-
-			models = append(models, upstream.ModelInfo{ID: id, Name: id, Description: "Vertex AI · ADC", APIMode: "chat"})
-
-		}
-
-	default: // xAI Grok — Responses only
-
-		models = []upstream.ModelInfo{
-
-			{ID: "grok-4.5", Name: "Grok 4.5", Description: "xAI · /v1/responses", APIMode: "responses"},
-
-		}
-
-		// best-effort live list, keep only response-capable ids
-
-		if token != "" && !settings.IsKimiWork() {
-
-			xai := settings
-
-			xai.Provider = store.ProviderXAI
-
-			xai.UpstreamBase = store.DefaultUpstream
-
-			if xm, err := s.upstream.ListModels(r.Context(), token, xai); err == nil {
-
-				seen := map[string]bool{"grok-4.5": true}
-
-				for _, m := range xm {
-
-					id := strings.ToLower(m.ID)
-
-					if strings.Contains(id, "grok") && !seen[m.ID] {
-
-						m.APIMode = "responses"
-
-						if m.Description == "" {
-
-							m.Description = "xAI · /v1/responses"
-
-						}
-
-						models = append(models, m)
-
-						seen[m.ID] = true
-
+	// --- Grok / xAI ---
+	xaiModels := []upstream.ModelInfo{
+		{ID: "grok-4.5", Name: "Grok 4.5", Description: "xAI · /v1/responses", APIMode: "responses"},
+	}
+	// best-effort live list using any usable xAI token
+	if tok, _, _, err := s.ensure(WithRouteProvider(r.Context(), store.ProviderXAI)); err == nil && tok != "" {
+		xai := base.WithProvider(store.ProviderXAI)
+		if xm, err := s.upstream.ListModels(r.Context(), tok, xai); err == nil {
+			seen := map[string]bool{"grok-4.5": true}
+			for _, m := range xm {
+				id := strings.ToLower(m.ID)
+				if strings.Contains(id, "grok") && !seen[m.ID] {
+					m.APIMode = "responses"
+					if m.Description == "" {
+						m.Description = "xAI · /v1/responses"
 					}
-
+					xaiModels = append(xaiModels, m)
+					seen[m.ID] = true
 				}
-
 			}
-
 		}
-
+	}
+	for _, m := range xaiModels {
+		data = append(data, enrichModelMeta(m, store.ProviderXAI))
 	}
 
-	data := make([]map[string]any, 0, len(models)+1)
-
-	for _, m := range models {
-
-		data = append(data, enrichModelMeta(m, settings.NormalizedProvider()))
-
+	// --- Kimi Work ---
+	kimiModels := []upstream.ModelInfo{
+		{ID: "k3-agent", Name: "K3 Max (Work)", Description: "Kimi Work · chat/completions", APIMode: "chat"},
+		{ID: "k3-agent-low", Name: "K3 Max — Low Think", Description: "Kimi Work · low reasoning", APIMode: "chat"},
+		{ID: "k3-agent-medium", Name: "K3 Max — Medium Think", Description: "Kimi Work · medium reasoning", APIMode: "chat"},
+		{ID: "k3-agent-high", Name: "K3 Max — High Think", Description: "Kimi Work · high reasoning", APIMode: "chat"},
+		{ID: "k3-agent-xhigh", Name: "K3 Max — Extra High Think", Description: "Kimi Work · xhigh reasoning", APIMode: "chat"},
+		{ID: "k2d6-agent", Name: "K2.6 Agent (Work)", Description: "Kimi Work · chat/completions", APIMode: "chat"},
+		{ID: "k2d6-agent-low", Name: "K2.6 Agent — Low Think", Description: "Kimi Work · low reasoning", APIMode: "chat"},
+		{ID: "k2d6-agent-medium", Name: "K2.6 Agent — Medium Think", Description: "Kimi Work · medium reasoning", APIMode: "chat"},
+		{ID: "k2d6-agent-high", Name: "K2.6 Agent — High Think", Description: "Kimi Work · high reasoning", APIMode: "chat"},
+		{ID: "k2d6-agent-xhigh", Name: "K2.6 Agent — Extra High Think", Description: "Kimi Work · xhigh reasoning", APIMode: "chat"},
 	}
+	for _, m := range kimiModels {
+		data = append(data, enrichModelMeta(m, store.ProviderKimiWork))
+	}
+
+	// Optional: Ollie / Gemini still listed if configured as default (legacy)
+	switch base.NormalizedProvider() {
+	case store.ProviderOllie:
+		for _, m := range []upstream.ModelInfo{
+			{ID: "claude-sonnet-5", Name: "claude-sonnet-5", Description: "OllieChat", APIMode: "chat"},
+			{ID: "claude-fable-5", Name: "claude-fable-5", Description: "OllieChat", APIMode: "chat"},
+			{ID: "claude-opus-4-8", Name: "claude-opus-4-8", Description: "OllieChat", APIMode: "chat"},
+			{ID: "deepseek-v4-flash-free", Name: "deepseek-v4-flash-free", Description: "OllieChat", APIMode: "chat"},
+		} {
+			data = append(data, enrichModelMeta(m, store.ProviderOllie))
+		}
+	case store.ProviderGemini:
+		for _, id := range gemini.ListModels(r.Context(), base) {
+			data = append(data, enrichModelMeta(upstream.ModelInfo{ID: id, Name: id, Description: "Vertex AI · ADC", APIMode: "chat"}, store.ProviderGemini))
+		}
+	}
+
+	_ = models
 
 	w.Header().Set("Content-Type", "application/json")
-
 	_ = json.NewEncoder(w).Encode(map[string]any{
-
-		"object":          "list",
-
-		"data":            data,
-
-		"active_provider": settings.NormalizedProvider(),
-
-		"active_model":    settings.DefaultModel,
-
+		"object": "list",
+		"data":   data,
+		"route":  "model",
 		"api_policy": map[string]string{
-
 			"xai":       "responses",
-
 			"kimi_work": "chat",
-
 		},
-
+		"note": "Pick model on the client; same baseURL routes Grok vs Kimi automatically.",
 	})
-
 }
-
 
 func enrichModelMeta(m upstream.ModelInfo, provider string) map[string]any {
 	ctxWindow := 256000
@@ -869,141 +824,97 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 
 	}
 
-	token, acc, settings, err := s.ensure(r.Context())
-
-	if err != nil {
-
-		http.Error(w, err.Error(), http.StatusUnauthorized)
-
-		return
-
-	}
-
-	// Endpoint policy by active provider (no silent rewrite chaos):
-	//   xAI  → /v1/responses only
-	//   Kimi → /v1/chat/completions only
-	if settings.IsXAI() && path == "/chat/completions" {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"error": map[string]any{
-				"message": "Grok (xAI) uses /v1/responses only. Switch provider or call POST /v1/responses.",
-				"type":    "invalid_request_error",
-				"code":    "grok_responses_only",
-			},
-		})
-		return
-	}
-	if settings.IsKimiWork() && path == "/responses" {
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusBadRequest)
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"error": map[string]any{
-				"message": "Kimi Work uses /v1/chat/completions only (agent-gw has no /responses).",
-				"type":    "invalid_request_error",
-				"code":    "kimi_chat_only",
-			},
-		})
-		return
-	}
-
-	startedAt := time.Now()
-
+	// Read body first so we can route provider from client model id (same baseURL).
 	body, err := io.ReadAll(r.Body)
-
 	if err != nil {
-
 		http.Error(w, err.Error(), http.StatusBadRequest)
-
 		return
-
 	}
-
-
 
 	stream := false
-
-	clientPath := path // original path before any Ollie rewrite (/responses → /chat/completions)
-
+	clientPath := path // original path before any rewrite
 	codexClient := isCodexRequest(r)
-
-	resolvedModel := settings.ResolveModelForClient("")
-
-	_ = codexClient // kept for optional headers / future; no longer forces model
+	_ = codexClient
 
 	var m map[string]any
-
+	reqModel := ""
 	if json.Unmarshal(body, &m) == nil {
-
 		if v, ok := m["stream"].(bool); ok {
-
 			stream = v
-
 		}
+		reqModel, _ = m["model"].(string)
+	} else {
+		m = nil
+	}
 
-		// Inherit global reasoning effort when client omits it (both providers).
+	// Route by model: grok-* → xAI, kimi-for-coding/k3-agent → Kimi Work.
+	// Empty/alias model falls back to stored settings (desktop chat only cares about that).
+	baseSettings := s.store.Settings()
+	routeSettings := baseSettings.WithProviderForModel(reqModel)
+	routeProv := routeSettings.NormalizedProvider()
+	ctx := WithRouteProvider(r.Context(), routeProv)
 
-		// Ollie still sanitizes high/xhigh + max_tokens below so content is not emptied.
+	token, acc, settings, err := s.ensure(ctx)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusUnauthorized)
+		return
+	}
+	// ensure returns store settings; re-apply route so upstream base/API match the model.
+	settings = settings.WithProvider(routeProv)
+	if routeProv == store.ProviderKimiWork {
+		settings.UpstreamBase = store.KimiWorkUpstream
+		settings.APIMode = "chat"
+	} else if routeProv == store.ProviderXAI {
+		settings.UpstreamBase = store.DefaultUpstream
+		// Client default is chat/completions; xAI upstream still uses /responses.
+		settings.APIMode = "chat"
+	}
 
+	// Endpoint rewrite (same baseURL, model decides provider):
+	//   Grok default: client /chat/completions → upstream /responses → client chat again
+	//   Grok optional: client /responses stays /responses end-to-end
+	//   Kimi: /responses → /chat/completions
+	wantClientChat := path == "/chat/completions"
+	wantClientResponses := path == "/responses"
+
+	startedAt := time.Now()
+	resolvedModel := settings.ResolveModelForClient(reqModel)
+
+	if m != nil {
+		// Inherit global reasoning effort when client omits it.
 		if _, ok := m["reasoning_effort"]; !ok {
-
 			if settings.ReasoningEffort != "" {
-
 				m["reasoning_effort"] = settings.ReasoningEffort
-
 			}
-
 		}
-
-		// HTTP proxy: honor client model. UI default model is ONLY for desktop chat.
-		// Only empty/alias models map to DefaultModel of the ACTIVE provider.
-
-		reqModel, _ := m["model"].(string)
-
-		// Keep active provider from settings — do NOT auto-switch provider from model id.
-
+		// Honor client model; only empty/alias → default of ROUTEd provider.
 		m["model"] = settings.ResolveModelForClient(reqModel)
-
-		// Kimi wire id
-
-		if settings.IsKimiWork() {
-
-			m["model"] = settings.ResolveModelForClient(reqModel)
-
-		}
-
 		resolvedModel, _ = m["model"].(string)
 
 		// alias last_response_id
-
 		if prev, ok := m["last_response_id"].(string); ok && prev != "" {
-
 			m["previous_response_id"] = prev
-
 			delete(m, "last_response_id")
-
 		}
 
-
-
-		// Non-xAI providers without native Responses: rewrite /responses → chat/completions.
-
-		// Kimi Work coding gateway is OpenAI chat/completions-native; map responses → chat
-
-		// and still accept /v1/chat/completions (recommended default remains responses in UI).
-
+		// Kimi / Ollie / Gemini: /responses → chat/completions
 		if (settings.IsOllie() || settings.IsGemini() || settings.IsKimiWork()) && path == "/responses" {
-
 			path = "/chat/completions"
-
+			wantClientChat = true
+			wantClientResponses = false
 			m = responsesBodyToChatCompletions(m, settings)
-
 			if mid, ok := m["model"].(string); ok && mid != "" {
-
 				resolvedModel = mid
-
 			}
+		}
 
+		// Grok default path: client chat/completions → xAI /responses (response translated back later)
+		if settings.IsXAI() && path == "/chat/completions" {
+			path = "/responses"
+			m = chatCompletionsBodyToResponses(m, settings)
+			if mid, ok := m["model"].(string); ok && mid != "" {
+				resolvedModel = mid
+			}
 		}
 
 
@@ -1282,176 +1193,102 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 
 
 
-			// Auth denial: force-refresh same account once, then rotate.
-
-			if isAuthStatus(resp.StatusCode, errBody) && accountID != "" {
-
-				if !authRetried {
-
-					authRetried = true
-
-					if fr := s.forceRefreshFn(); fr != nil {
-
-						tok2, acc2, settings2, err2 := fr(r.Context(), accountID)
-
-						if err2 == nil && tok2 != "" && tok2 != token {
-
-							token, acc, settings = tok2, acc2, settings2
-
-							if acc2 != nil {
-
-								accountID = acc2.ID
-
-							}
-
-							log.Printf("proxyhttp: auth failure — force-refreshed account %s and retrying", accountID)
-
-							continue
-
-						}
-
-					}
-
-					// Also re-run ensure (pulls CLI sync) in case refresh path was unavailable.
-
-					tok2, acc2, settings2, err2 := s.ensure(r.Context())
-
-					if err2 == nil && tok2 != "" && tok2 != token {
-
-						token, acc, settings = tok2, acc2, settings2
-
-						if acc2 != nil {
-
-							accountID = acc2.ID
-
-						}
-
-						log.Printf("proxyhttp: auth failure — ensure got different token, retrying")
-
-						continue
-
-					}
-
-				}
-
-				// Mark auth-denied and rotate to another account.
-
-				if fn := s.authFailHandler(); fn != nil {
-
+			// Quota first (Kimi billing 403 must not be treated as auth-denied).
+			// Handler may block while Playwright stealth recreates a Kimi account.
+			if isQuotaStatus(resp.StatusCode, errBody) {
+				if fn := s.quotaHandler(); fn != nil && accountID != "" {
 					if rotated := fn(accountID, reason); rotated {
-
 						tok2, acc2, settings2, err2 := s.ensure(r.Context())
-
-						if err2 == nil && (acc2 == nil || acc2.ID != accountID) {
-
+						// Retry on new account OR same id refilled (stealth re-login / remint).
+						if err2 == nil && tok2 != "" && (acc2 == nil || acc2.Usable()) {
 							prev := accountID
-
 							token, acc, settings = tok2, acc2, settings2
-
 							if acc2 != nil {
-
 								accountID = acc2.ID
-
 							}
-
-							log.Printf("proxyhttp: auth denied on %s — rotated to %s and retrying", prev, accountID)
-
+							log.Printf("proxyhttp: quota on account %s — ready %s, retrying", prev, accountID)
 							continue
-
 						}
-
 					}
-
-				} else {
-
-					_, _ = s.store.MarkAuthDenied(accountID, reason)
-
+				} else if accountID != "" {
+					_, _ = s.store.MarkExhausted(accountID, reason)
 					if next := s.store.NextUsableAccountID(accountID); next != "" {
-
 						_ = s.store.SetActiveAccount(next)
-
 						tok2, acc2, settings2, err2 := s.ensure(r.Context())
-
 						if err2 == nil {
-
 							token, acc, settings = tok2, acc2, settings2
-
 							if acc2 != nil {
-
 								accountID = acc2.ID
-
 							}
-
 							continue
-
 						}
-
 					}
-
 				}
-
 			}
 
-
-
-			if isQuotaStatus(resp.StatusCode, errBody) {
-
-				if fn := s.quotaHandler(); fn != nil && accountID != "" {
-
-					if rotated := fn(accountID, reason); rotated {
-
-						// Pick fresh creds for the newly active account and retry once.
-
-						tok2, acc2, settings2, err2 := s.ensure(r.Context())
-
-						if err2 == nil && (acc2 == nil || acc2.ID != accountID) {
-
-							token, acc, settings = tok2, acc2, settings2
-
-							if acc2 != nil {
-
-								accountID = acc2.ID
-
+			// Auth denial: force-refresh same account once, then rotate.
+			// Skip permanent auth-denied when the error is clearly from the wrong
+			// upstream (e.g. sk-kimi hit cli-chat-proxy / xAI JWT hit agent-gw).
+			if isAuthStatus(resp.StatusCode, errBody) && accountID != "" && !isQuotaStatus(resp.StatusCode, errBody) {
+				if isCrossProviderAuthMismatch(acc, settings, errBody) {
+					log.Printf("proxyhttp: cross-provider auth mismatch on %s — not marking auth-denied: %s",
+						accountID, truncateForLog(string(errBody), 180))
+					// Fall through to return the upstream error without poisoning the account.
+				} else {
+					if !authRetried {
+						authRetried = true
+						if fr := s.forceRefreshFn(); fr != nil {
+							tok2, acc2, settings2, err2 := fr(r.Context(), accountID)
+							if err2 == nil && tok2 != "" && tok2 != token {
+								token, acc, settings = tok2, acc2, settings2
+								if acc2 != nil {
+									accountID = acc2.ID
+								}
+								log.Printf("proxyhttp: auth failure — force-refreshed account %s and retrying", accountID)
+								continue
 							}
-
-							log.Printf("proxyhttp: quota on account — rotated and retrying")
-
-							continue
-
 						}
-
+						// Also re-run ensure (pulls CLI sync) in case refresh path was unavailable.
+						tok2, acc2, settings2, err2 := s.ensure(r.Context())
+						if err2 == nil && tok2 != "" && tok2 != token {
+							token, acc, settings = tok2, acc2, settings2
+							if acc2 != nil {
+								accountID = acc2.ID
+							}
+							log.Printf("proxyhttp: auth failure — ensure got different token, retrying")
+							continue
+						}
 					}
 
-				} else if accountID != "" {
-
-					// No handler — still stamp store so UI/next ensure skips this account.
-
-					_, _ = s.store.MarkExhausted(accountID, reason)
-
-					if next := s.store.NextUsableAccountID(accountID); next != "" {
-
-						_ = s.store.SetActiveAccount(next)
-
-						tok2, acc2, settings2, err2 := s.ensure(r.Context())
-
-						if err2 == nil {
-
-							token, acc, settings = tok2, acc2, settings2
-
-							if acc2 != nil {
-
-								accountID = acc2.ID
-
+					// Mark auth-denied and rotate to another account.
+					if fn := s.authFailHandler(); fn != nil {
+						if rotated := fn(accountID, reason); rotated {
+							tok2, acc2, settings2, err2 := s.ensure(r.Context())
+							if err2 == nil && (acc2 == nil || acc2.ID != accountID) {
+								prev := accountID
+								token, acc, settings = tok2, acc2, settings2
+								if acc2 != nil {
+									accountID = acc2.ID
+								}
+								log.Printf("proxyhttp: auth denied on %s — rotated to %s and retrying", prev, accountID)
+								continue
 							}
-
-							continue
-
 						}
-
+					} else {
+						_, _ = s.store.MarkAuthDenied(accountID, reason)
+						if next := s.store.NextUsableAccountID(accountID); next != "" {
+							_ = s.store.SetActiveAccount(next)
+							tok2, acc2, settings2, err2 := s.ensure(r.Context())
+							if err2 == nil {
+								token, acc, settings = tok2, acc2, settings2
+								if acc2 != nil {
+									accountID = acc2.ID
+								}
+								continue
+							}
+						}
 					}
-
 				}
-
 			}
 
 			// Final error to client
@@ -1491,64 +1328,66 @@ func (s *Server) proxyUpstream(w http.ResponseWriter, r *http.Request, path stri
 
 
 		// Ollie/Gemini: client asked for Responses but we hit chat/completions — translate wire format.
-
 		if settings.IsOllie() && clientPath == "/responses" {
-
 			if isSSE {
-
 				if err := pipeOllieChatSSEToResponses(w, resp.Body, resolvedModel); err != nil {
-
 					log.Printf("proxyhttp ollie responses sse: %v", err)
-
 				}
-
 				_ = resp.Body.Close()
-
 				return
-
 			}
-
 			raw, _ := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
-
 			_ = resp.Body.Close()
-
 			out, err := chatCompletionJSONToResponse(raw, resolvedModel)
-
 			if err != nil {
-
-				// Fall back to raw upstream body.
-
 				w.Header().Set("Content-Type", "application/json")
-
 				w.WriteHeader(resp.StatusCode)
-
 				_, _ = w.Write(raw)
-
 				return
-
 			}
-
 			accountID := ""
-
 			if acc != nil {
-
 				accountID = acc.ID
-
 			}
-
 			s.recordUsageFromJSONBody(raw, accountID, resolvedModel, time.Since(startedAt).Milliseconds())
-
 			w.Header().Set("Content-Type", "application/json")
-
 			w.WriteHeader(http.StatusOK)
-
 			_ = json.NewEncoder(w).Encode(out)
-
 			return
-
 		}
 
-
+		// Grok default: client used /chat/completions, upstream was /responses → translate back to chat.
+		if settings.IsXAI() && wantClientChat && !wantClientResponses {
+			accountID := ""
+			if acc != nil {
+				accountID = acc.ID
+			}
+			if isSSE {
+				tee := newUsageTeeReader(resp.Body)
+				if err := pipeResponsesSSEToChat(w, tee, resolvedModel); err != nil {
+					log.Printf("proxyhttp grok responses→chat sse: %v", err)
+				}
+				_ = resp.Body.Close()
+				if len(tee.lastJSON) > 0 {
+					s.recordUsageFromSSECapture(tee.lastJSON, accountID, resolvedModel, time.Since(startedAt).Milliseconds())
+				}
+				return
+			}
+			raw, _ := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+			_ = resp.Body.Close()
+			s.recordUsageFromJSONBody(raw, accountID, resolvedModel, time.Since(startedAt).Milliseconds())
+			out, err := responsesJSONToChatCompletion(raw, resolvedModel)
+			if err != nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(resp.StatusCode)
+				_, _ = w.Write(raw)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_ = json.NewEncoder(w).Encode(out)
+			return
+		}
 
 		if isSSE {
 
@@ -1790,7 +1629,29 @@ func isQuotaStatus(code int, body []byte) bool {
 
 	}
 
-	if code == http.StatusTooManyRequests && (strings.Contains(low, "exhausted") || strings.Contains(low, "quota") || strings.Contains(low, "balance")) {
+	// Kimi Work billing / plan cap (often HTTP 403 with access_terminated / resource_exhausted).
+	if strings.Contains(low, "usage limit") ||
+		strings.Contains(low, "billing cycle") ||
+		strings.Contains(low, "resource_exhausted") ||
+		strings.Contains(low, "access_terminated") ||
+		strings.Contains(low, "rate limit exceeded") && (strings.Contains(low, "quota") || strings.Contains(low, "usage") || strings.Contains(low, "billing")) ||
+		strings.Contains(low, "upgrade to get more") {
+
+		return true
+
+	}
+
+	if code == http.StatusTooManyRequests && (strings.Contains(low, "exhausted") || strings.Contains(low, "quota") || strings.Contains(low, "balance") || strings.Contains(low, "rate limit")) {
+
+		return true
+
+	}
+
+	// Kimi sometimes returns 403 (not 429) for plan exhaustion.
+	if code == http.StatusForbidden && (strings.Contains(low, "usage limit") ||
+		strings.Contains(low, "resource_exhausted") ||
+		strings.Contains(low, "access_terminated") ||
+		strings.Contains(low, "billing cycle")) {
 
 		return true
 
@@ -1848,6 +1709,36 @@ func isAuthStatus(code int, body []byte) bool {
 
 }
 
+// isCrossProviderAuthMismatch reports that an auth error is almost certainly from
+// sending the wrong credential type to the wrong upstream (must not MarkAuthDenied).
+// Example we hit: Kimi sk-kimi against cli-chat-proxy.grok.com →
+//   "x_xai_token_auth=none ... no auth context"
+func isCrossProviderAuthMismatch(acc *store.Account, settings store.Settings, body []byte) bool {
+	low := strings.ToLower(string(body))
+	up := strings.ToLower(settings.EffectiveUpstream())
+	provAcc := ""
+	if acc != nil {
+		provAcc = acc.NormalizedProvider()
+	}
+	// xAI gateway rejecting non-JWT / non-xAI bearer
+	xaiishErr := strings.Contains(low, "x_xai_token_auth") ||
+		strings.Contains(low, "xai_token") ||
+		(strings.Contains(low, "no auth context") && strings.Contains(low, "auth_kind=bearer"))
+	kimiCred := provAcc == store.ProviderKimiWork ||
+		(acc != nil && (strings.HasPrefix(acc.BearerToken(), "sk-kimi-") || strings.HasPrefix(acc.APIKey, "sk-kimi-")))
+	xaiUpstream := strings.Contains(up, "cli-chat-proxy") || strings.Contains(up, "grok.com") || settings.IsXAI()
+	if kimiCred && xaiUpstream && xaiishErr {
+		return true
+	}
+	// Kimi gateway rejecting an xAI JWT
+	if provAcc == store.ProviderXAI && (settings.IsKimiWork() || strings.Contains(up, "agent-gw") || strings.Contains(up, "kimi.com")) {
+		if strings.Contains(low, "invalid") || strings.Contains(low, "unauthorized") || strings.Contains(low, "unauthenticated") {
+			return true
+		}
+	}
+	return false
+}
+
 
 
 func setUpstreamAuthHeaders(req *http.Request, token string, settings store.Settings) {
@@ -1899,6 +1790,146 @@ func setUpstreamAuthHeaders(req *http.Request, token string, settings store.Sett
 }
 
 
+
+// chatCompletionsBodyToResponses converts OpenAI chat/completions body into /v1/responses
+// so OpenCode/Kilo (which only call chat/completions) work with Grok/xAI.
+func chatCompletionsBodyToResponses(m map[string]any, settings store.Settings) map[string]any {
+	out := map[string]any{}
+	if model, ok := m["model"].(string); ok && model != "" {
+		out["model"] = settings.ResolveModelForClient(model)
+	} else {
+		out["model"] = settings.ResolveModelForClient("")
+	}
+	if v, ok := m["stream"].(bool); ok {
+		out["stream"] = v
+	}
+	if v, ok := m["temperature"]; ok {
+		out["temperature"] = v
+	}
+	if v, ok := m["top_p"]; ok {
+		out["top_p"] = v
+	}
+	if v, ok := m["max_tokens"]; ok {
+		out["max_output_tokens"] = v
+	} else if v, ok := m["max_completion_tokens"]; ok {
+		out["max_output_tokens"] = v
+	}
+	if v, ok := m["reasoning_effort"].(string); ok && strings.TrimSpace(v) != "" {
+		out["reasoning"] = map[string]any{"effort": v, "summary": "auto"}
+		out["reasoning_effort"] = v
+	} else if settings.ReasoningEffort != "" {
+		out["reasoning"] = map[string]any{"effort": settings.ReasoningEffort, "summary": "auto"}
+	}
+	// tools: chat function tools → responses tools when possible
+	if tools, ok := m["tools"]; ok {
+		if sanitized := sanitizeResponsesTools(tools); len(sanitized) > 0 {
+			out["tools"] = sanitized
+			if tc, ok := m["tool_choice"]; ok {
+				out["tool_choice"] = tc
+			} else {
+				out["tool_choice"] = "auto"
+			}
+		}
+	}
+	// messages → input (Responses)
+	if msgs, ok := m["messages"].([]any); ok && len(msgs) > 0 {
+		input := make([]any, 0, len(msgs))
+		var instructions strings.Builder
+		for _, raw := range msgs {
+			msg, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			role, _ := msg["role"].(string)
+			content := flattenResponsesContent(msg["content"])
+			if s, ok := msg["content"].(string); ok && content == "" {
+				content = s
+			}
+			role = strings.ToLower(strings.TrimSpace(role))
+			if role == "system" || role == "developer" {
+				if instructions.Len() > 0 {
+					instructions.WriteString("\n\n")
+				}
+				instructions.WriteString(content)
+				continue
+			}
+			if role == "" {
+				role = "user"
+			}
+			// tool result
+			if role == "tool" {
+				item := map[string]any{
+					"type":   "function_call_output",
+					"output": content,
+				}
+				if id, ok := msg["tool_call_id"].(string); ok && id != "" {
+					item["call_id"] = id
+				}
+				input = append(input, item)
+				continue
+			}
+			// assistant with tool_calls
+			if tcs, ok := msg["tool_calls"].([]any); ok && len(tcs) > 0 {
+				for _, tc := range tcs {
+					tcm, ok := tc.(map[string]any)
+					if !ok {
+						continue
+					}
+					fn, _ := tcm["function"].(map[string]any)
+					name, _ := fn["name"].(string)
+					args, _ := fn["arguments"].(string)
+					callID, _ := tcm["id"].(string)
+					item := map[string]any{
+						"type":      "function_call",
+						"name":      name,
+						"arguments": args,
+					}
+					if callID != "" {
+						item["call_id"] = callID
+					}
+					input = append(input, item)
+				}
+				if content != "" {
+					input = append(input, map[string]any{
+						"type": "message",
+						"role": "assistant",
+						"content": []any{
+							map[string]any{"type": "output_text", "text": content},
+						},
+					})
+				}
+				continue
+			}
+			ctype := "input_text"
+			if role == "assistant" {
+				ctype = "output_text"
+			}
+			input = append(input, map[string]any{
+				"type": "message",
+				"role": role,
+				"content": []any{
+					map[string]any{"type": ctype, "text": content},
+				},
+			})
+		}
+		if instructions.Len() > 0 {
+			out["instructions"] = instructions.String()
+		}
+		if len(input) == 0 {
+			out["input"] = "Hello"
+		} else {
+			out["input"] = input
+		}
+	} else if s, ok := m["input"].(string); ok && s != "" {
+		out["input"] = s
+	} else {
+		out["input"] = "Hello"
+	}
+	if settings.StoreResponses {
+		out["store"] = true
+	}
+	return out
+}
 
 // responsesBodyToChatCompletions converts an OpenAI Responses body into chat/completions
 
@@ -2555,11 +2586,15 @@ func chatCompletionJSONToResponse(raw []byte, model string) (map[string]any, err
 		return nil, err
 	}
 	text := ""
+	var toolCalls []any
 	if choices, ok := in["choices"].([]any); ok && len(choices) > 0 {
 		if ch, ok := choices[0].(map[string]any); ok {
 			if msg, ok := ch["message"].(map[string]any); ok {
 				if c, ok := msg["content"].(string); ok {
 					text = c
+				}
+				if tcs, ok := msg["tool_calls"].([]any); ok {
+					toolCalls = tcs
 				}
 			}
 		}
@@ -2569,25 +2604,504 @@ func chatCompletionJSONToResponse(raw []byte, model string) (map[string]any, err
 			model = m
 		}
 	}
-	out := map[string]any{
-		"id":      in["id"],
-		"object":  "response",
-		"model":   model,
-		"status":  "completed",
-		"output": []any{
-			map[string]any{
-				"type": "message",
-				"role": "assistant",
-				"content": []any{
-					map[string]any{"type": "output_text", "text": text},
-				},
+	output := make([]any, 0, 1+len(toolCalls))
+	if text != "" || len(toolCalls) == 0 {
+		output = append(output, map[string]any{
+			"type": "message",
+			"role": "assistant",
+			"content": []any{
+				map[string]any{"type": "output_text", "text": text},
 			},
-		},
+		})
+	}
+	for _, rawTC := range toolCalls {
+		tcm, ok := rawTC.(map[string]any)
+		if !ok {
+			continue
+		}
+		fn, _ := tcm["function"].(map[string]any)
+		name := asString(fn["name"])
+		if name == "" {
+			continue
+		}
+		args := asString(fn["arguments"])
+		if args == "" {
+			args = "{}"
+		}
+		callID := asString(tcm["id"])
+		if callID == "" {
+			callID = "call_" + strings.ReplaceAll(uuid.NewString(), "-", "")[:20]
+		}
+		output = append(output, map[string]any{
+			"type":      "function_call",
+			"call_id":   callID,
+			"name":      name,
+			"arguments": args,
+			"status":    "completed",
+		})
+	}
+	status := "completed"
+	out := map[string]any{
+		"id":     in["id"],
+		"object": "response",
+		"model":  model,
+		"status": status,
+		"output": output,
 	}
 	if u, ok := in["usage"]; ok {
 		out["usage"] = u
 	}
 	return out, nil
+}
+
+// responsesJSONToChatCompletion maps xAI /responses JSON → OpenAI chat.completion.
+func responsesJSONToChatCompletion(raw []byte, model string) (map[string]any, error) {
+	var in map[string]any
+	if err := json.Unmarshal(raw, &in); err != nil {
+		return nil, err
+	}
+	if model == "" {
+		if m, ok := in["model"].(string); ok {
+			model = m
+		}
+	}
+	id, _ := in["id"].(string)
+	if id == "" {
+		id = "chatcmpl-" + uuid.NewString()
+	}
+	text := extractResponsesOutputText(in)
+	toolCalls := extractResponsesFunctionCalls(in)
+	created := time.Now().Unix()
+	if c, ok := in["created_at"].(float64); ok {
+		created = int64(c)
+	}
+	msg := map[string]any{
+		"role": "assistant",
+	}
+	finish := "stop"
+	if len(toolCalls) > 0 {
+		msg["tool_calls"] = toolCalls
+		// OpenAI: content is null when the turn is tool-only; keep text if present.
+		if text == "" {
+			msg["content"] = nil
+		} else {
+			msg["content"] = text
+		}
+		finish = "tool_calls"
+	} else {
+		msg["content"] = text
+	}
+	out := map[string]any{
+		"id":      id,
+		"object":  "chat.completion",
+		"created": created,
+		"model":   model,
+		"choices": []any{
+			map[string]any{
+				"index":         0,
+				"message":       msg,
+				"finish_reason": finish,
+			},
+		},
+	}
+	if u, ok := in["usage"]; ok {
+		out["usage"] = normalizeUsageToChat(u)
+	}
+	return out, nil
+}
+
+func extractResponsesOutputText(in map[string]any) string {
+	var b strings.Builder
+	// output_text shortcut
+	if t, ok := in["output_text"].(string); ok && t != "" {
+		return t
+	}
+	out, _ := in["output"].([]any)
+	for _, raw := range out {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		typ, _ := item["type"].(string)
+		if typ == "message" || typ == "" {
+			if content, ok := item["content"].([]any); ok {
+				for _, c := range content {
+					part, ok := c.(map[string]any)
+					if !ok {
+						continue
+					}
+					pt, _ := part["type"].(string)
+					if pt == "output_text" || pt == "text" {
+						if t, ok := part["text"].(string); ok {
+							b.WriteString(t)
+						}
+					}
+				}
+			}
+			if t, ok := item["text"].(string); ok {
+				b.WriteString(t)
+			}
+		}
+	}
+	return b.String()
+}
+
+// extractResponsesFunctionCalls pulls client function_call items from Responses output.
+// Server-side tools (web_search, x_search, reasoning) are ignored.
+func extractResponsesFunctionCalls(in map[string]any) []any {
+	out, _ := in["output"].([]any)
+	if len(out) == 0 {
+		return nil
+	}
+	calls := make([]any, 0)
+	for _, raw := range out {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if tc := responsesItemToChatToolCall(item); tc != nil {
+			calls = append(calls, tc)
+		}
+	}
+	return calls
+}
+
+func responsesItemToChatToolCall(item map[string]any) map[string]any {
+	typ := strings.ToLower(strings.TrimSpace(asString(item["type"])))
+	if typ != "function_call" && typ != "custom_tool_call" {
+		return nil
+	}
+	name := asString(item["name"])
+	if name == "" {
+		return nil
+	}
+	callID := asString(item["call_id"])
+	if callID == "" {
+		callID = asString(item["id"])
+	}
+	if callID == "" {
+		callID = "call_" + strings.ReplaceAll(uuid.NewString(), "-", "")[:20]
+	}
+	args := ""
+	if a, ok := item["arguments"].(string); ok {
+		args = a
+	} else if item["arguments"] != nil {
+		b, _ := json.Marshal(item["arguments"])
+		args = string(b)
+	} else if in, ok := item["input"].(string); ok {
+		args = in
+	} else if item["input"] != nil {
+		b, _ := json.Marshal(item["input"])
+		args = string(b)
+	}
+	if args == "" {
+		args = "{}"
+	}
+	return map[string]any{
+		"id":   callID,
+		"type": "function",
+		"function": map[string]any{
+			"name":      name,
+			"arguments": args,
+		},
+	}
+}
+
+func normalizeUsageToChat(u any) map[string]any {
+	m, ok := u.(map[string]any)
+	if !ok {
+		return map[string]any{}
+	}
+	out := map[string]any{}
+	// Responses uses input_tokens / output_tokens; chat uses prompt/completion.
+	if v, ok := m["prompt_tokens"]; ok {
+		out["prompt_tokens"] = v
+	} else if v, ok := m["input_tokens"]; ok {
+		out["prompt_tokens"] = v
+	}
+	if v, ok := m["completion_tokens"]; ok {
+		out["completion_tokens"] = v
+	} else if v, ok := m["output_tokens"]; ok {
+		out["completion_tokens"] = v
+	}
+	if v, ok := m["total_tokens"]; ok {
+		out["total_tokens"] = v
+	} else {
+		pt, _ := out["prompt_tokens"].(float64)
+		ct, _ := out["completion_tokens"].(float64)
+		if pt == 0 {
+			if i, ok := out["prompt_tokens"].(int); ok {
+				pt = float64(i)
+			}
+		}
+		if ct == 0 {
+			if i, ok := out["completion_tokens"].(int); ok {
+				ct = float64(i)
+			}
+		}
+		out["total_tokens"] = pt + ct
+	}
+	return out
+}
+
+// pipeResponsesSSEToChat translates xAI Responses SSE into OpenAI chat.completion.chunk SSE.
+// Forwards output_text and client function_call items as OpenAI tool_calls so agents (Kilo, etc.) execute tools.
+func pipeResponsesSSEToChat(w http.ResponseWriter, body io.Reader, model string) error {
+	flusher, _ := w.(http.Flusher)
+	w.Header().Set("Content-Type", "text/event-stream; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache, no-transform")
+	w.Header().Set("Connection", "keep-alive")
+	w.WriteHeader(http.StatusOK)
+
+	id := "chatcmpl-" + uuid.NewString()
+	created := time.Now().Unix()
+	writeChatDelta := func(delta map[string]any, finish any) {
+		chunk := map[string]any{
+			"id":      id,
+			"object":  "chat.completion.chunk",
+			"created": created,
+			"model":   model,
+			"choices": []any{
+				map[string]any{
+					"index":         0,
+					"delta":         delta,
+					"finish_reason": finish,
+				},
+			},
+		}
+		b, _ := json.Marshal(chunk)
+		fmt.Fprintf(w, "data: %s\n\n", b)
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+	writeChatDelta(map[string]any{"role": "assistant"}, nil)
+
+	toolIndexByKey := map[string]int{}
+	argDeltaSeen := map[string]bool{}
+	nextToolIdx := 0
+	sawToolCall := false
+
+	resolveToolIdx := func(keys ...string) (int, bool) {
+		for _, k := range keys {
+			if k == "" {
+				continue
+			}
+			if i, ok := toolIndexByKey[k]; ok {
+				return i, true
+			}
+		}
+		return -1, false
+	}
+	markToolKeys := func(idx int, keys ...string) {
+		for _, k := range keys {
+			if k != "" {
+				toolIndexByKey[k] = idx
+			}
+		}
+	}
+	markArgSeen := func(keys ...string) {
+		for _, k := range keys {
+			if k != "" {
+				argDeltaSeen[k] = true
+			}
+		}
+	}
+	anyArgSeen := func(keys ...string) bool {
+		for _, k := range keys {
+			if k != "" && argDeltaSeen[k] {
+				return true
+			}
+		}
+		return false
+	}
+
+	// allowFullArgs: true on output_item.done / completed harvest; false on .added (args often empty yet).
+	emitToolCallStart := func(item map[string]any, allowFullArgs bool) {
+		tc := responsesItemToChatToolCall(item)
+		if tc == nil {
+			return
+		}
+		callID := asString(tc["id"])
+		itemID := asString(item["id"])
+		fn, _ := tc["function"].(map[string]any)
+		name := asString(fn["name"])
+		args := asString(fn["arguments"])
+		if !allowFullArgs {
+			args = ""
+		} else if args == "{}" {
+			// keep "{}" only when this is the sole source of args
+		}
+		if idx, ok := resolveToolIdx(itemID, callID); ok {
+			if allowFullArgs && args != "" && !anyArgSeen(itemID, callID) {
+				writeChatDelta(map[string]any{
+					"tool_calls": []any{
+						map[string]any{
+							"index":    idx,
+							"function": map[string]any{"arguments": args},
+						},
+					},
+				}, nil)
+				markArgSeen(itemID, callID)
+			}
+			return
+		}
+		idx := nextToolIdx
+		nextToolIdx++
+		markToolKeys(idx, itemID, callID)
+		if itemID == "" && callID == "" {
+			markToolKeys(idx, "idx_"+strconv.Itoa(idx))
+		}
+		sawToolCall = true
+		writeChatDelta(map[string]any{
+			"tool_calls": []any{
+				map[string]any{
+					"index": idx,
+					"id":    callID,
+					"type":  "function",
+					"function": map[string]any{
+						"name":      name,
+						"arguments": args,
+					},
+				},
+			},
+		}, nil)
+		if args != "" {
+			markArgSeen(itemID, callID)
+		}
+	}
+
+	emitToolArgsDelta := func(itemID, callID, delta string) {
+		if delta == "" {
+			return
+		}
+		idx, ok := resolveToolIdx(itemID, callID)
+		if !ok {
+			idx = nextToolIdx
+			nextToolIdx++
+			markToolKeys(idx, itemID, callID)
+			sawToolCall = true
+			writeChatDelta(map[string]any{
+				"tool_calls": []any{
+					map[string]any{
+						"index": idx,
+						"id":    callID,
+						"type":  "function",
+						"function": map[string]any{
+							"name":      "",
+							"arguments": delta,
+						},
+					},
+				},
+			}, nil)
+		} else {
+			sawToolCall = true
+			writeChatDelta(map[string]any{
+				"tool_calls": []any{
+					map[string]any{
+						"index":    idx,
+						"function": map[string]any{"arguments": delta},
+					},
+				},
+			}, nil)
+		}
+		markArgSeen(itemID, callID)
+	}
+
+	finishStream := func(usage any) {
+		fr := "stop"
+		if sawToolCall {
+			fr = "tool_calls"
+		}
+		chunk := map[string]any{
+			"id": id, "object": "chat.completion.chunk", "created": created, "model": model,
+			"choices": []any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": fr}},
+		}
+		if usage != nil {
+			chunk["usage"] = normalizeUsageToChat(usage)
+		}
+		b, _ := json.Marshal(chunk)
+		fmt.Fprintf(w, "data: %s\n\n", b)
+		if flusher != nil {
+			flusher.Flush()
+		}
+		fmt.Fprintf(w, "data: [DONE]\n\n")
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+
+	sc := bufio.NewScanner(body)
+	sc.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
+	for sc.Scan() {
+		line := sc.Text()
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		data := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if data == "" || data == "[DONE]" {
+			continue
+		}
+		var ev map[string]any
+		if json.Unmarshal([]byte(data), &ev) != nil {
+			continue
+		}
+		typ, _ := ev["type"].(string)
+		switch typ {
+		case "response.output_text.delta":
+			if d, ok := ev["delta"].(string); ok && d != "" {
+				writeChatDelta(map[string]any{"content": d}, nil)
+			}
+		case "response.output_item.added":
+			if item, ok := ev["item"].(map[string]any); ok {
+				emitToolCallStart(item, false)
+			}
+		case "response.output_item.done":
+			if item, ok := ev["item"].(map[string]any); ok {
+				emitToolCallStart(item, true)
+			}
+		case "response.function_call_arguments.delta":
+			d, _ := ev["delta"].(string)
+			if d == "" {
+				d, _ = ev["arguments"].(string)
+			}
+			emitToolArgsDelta(asString(ev["item_id"]), asString(ev["call_id"]), d)
+		case "response.function_call_arguments.done":
+			itemID := asString(ev["item_id"])
+			callID := asString(ev["call_id"])
+			args, _ := ev["arguments"].(string)
+			if args == "" || anyArgSeen(itemID, callID) {
+				continue
+			}
+			emitToolArgsDelta(itemID, callID, args)
+		case "response.completed", "response.done":
+			if resp, ok := ev["response"].(map[string]any); ok {
+				for _, raw := range extractResponsesFunctionCalls(resp) {
+					if tcm, ok := raw.(map[string]any); ok {
+						fn, _ := tcm["function"].(map[string]any)
+						item := map[string]any{
+							"type":      "function_call",
+							"call_id":   asString(tcm["id"]),
+							"id":        asString(tcm["id"]),
+							"name":      asString(fn["name"]),
+							"arguments": asString(fn["arguments"]),
+						}
+						emitToolCallStart(item, true)
+					}
+				}
+				var usage any
+				if u, ok := resp["usage"]; ok {
+					usage = u
+				}
+				finishStream(usage)
+				return nil
+			}
+			finishStream(nil)
+			return nil
+		}
+	}
+	finishStream(nil)
+	return sc.Err()
 }
 
 func truncateForLog(s string, n int) string {

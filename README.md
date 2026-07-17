@@ -41,16 +41,17 @@
 
 | Provedor | Modo de auth | Como adicionar contas | API HTTP do proxy | Modelos (exemplos) |
 |----------|--------------|------------------------|-------------------|--------------------|
-| **Grok (xAI)** | **Auth** (pool de sessão) | OAuth device / SSO / auto-registro | **Só `POST /v1/responses`** | `grok-4.5` |
-| **Kimi Work** | **Auth** (pool de sessão) | **Login com Google** (navegador do sistema) → mint `sk-kimi` | **Só `POST /v1/chat/completions`** | `kimi-for-coding`, `k3-agent`, `k3-agent-swarm`, `k2d6-agent` |
+| **Grok (xAI)** | **Auth** (pool de sessão) | OAuth device / SSO / auto-registro | **Padrão `POST /v1/chat/completions`** (também aceita `/v1/responses`) | `grok-4.5` |
+| **Kimi Work** | **Auth** (pool de sessão) | **Login com Google** (navegador do sistema) → mint `sk-kimi` | **`POST /v1/chat/completions`** | `kimi-for-coding`, `k3-agent`, `k3-agent-{low,medium,high,xhigh}`, `k2d6-agent` |
 
 ### Regras de roteamento (v1.3+)
 
-- O **modelo escolhido na UI do app** vale **somente no chat interno**. **Não** reescreve o `model` das requests HTTP (OpenCode/Cursor/SDK).
-- Clientes HTTP mandam o `model` que quiserem; o proxy respeita (aliases como `default` viram o default do provedor ativo).
-- **Grok** recusa `/v1/chat/completions` com erro claro → use **Responses**.
-- **Kimi** recusa `/v1/responses` → use **chat/completions** (o agent-gw não tem Responses nativo).
-- O **provedor ativo** em Global define qual pool de contas e qual upstream entram em jogo.
+- O **modelo escolhido na UI do app** vale **somente no chat interno**. **Não** reescreve o `model` das requests HTTP (OpenCode/Cursor/SDK/Kilo).
+- Clientes HTTP mandam o `model` que quiserem; o proxy **roteia o provedor pelo model** na mesma base URL (`grok-*` → xAI, `kimi-for-coding` / `k3-agent` → Kimi Work).
+- `GET /v1/models` lista **Grok + Kimi** juntos.
+- **Grok** padrão: `/v1/chat/completions` (OpenCode/Kilo). `/v1/responses` continua opcional.
+- **Kimi** usa `/v1/chat/completions` (se mandar `/responses`, o proxy reescreve).
+- Contas: pool separado por provedor (login Grok e login Kimi no app; o proxy puxa o pool certo pelo model).
 
 ---
 
@@ -147,18 +148,32 @@ http://127.0.0.1:8787/v1
 |--------------|--------|
 | **Base URL** | `http://127.0.0.1:8787/v1` |
 | **API key** | qualquer string (ou a key opcional definida no app) |
-| **Provedor ativo** | Global → Provedor (`xai` ou `kimi_work`) |
+| **Roteamento** | **pelo `model` do cliente** (mesma base URL lista Grok + Kimi) |
 
-### Grok (provedor = xAI)
+`GET /v1/models` devolve **Grok e Kimi juntos**. Não precisa trocar “provedor ativo” no app para o proxy HTTP.
+
+### Grok (model `grok-*`)
 
 | Item | Valor |
 |------|--------|
-| Endpoint | **`POST /v1/responses`** (`/chat/completions` retorna 400) |
+| Endpoint padrão | **`POST /v1/chat/completions`** (OpenCode/Kilo) |
+| Endpoint opcional | **`POST /v1/responses`** (formato nativo xAI) |
 | Modelo | `grok-4.5` |
 
 ```bash
+# Padrão (chat/completions) — o proxy traduz internamente para a xAI
+curl http://127.0.0.1:8787/v1/chat/completions \
+  -H "Authorization: Bearer local" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "grok-4.5",
+    "stream": true,
+    "messages": [{"role":"user","content":"Olá"}]
+  }'
+
+# Opcional: Responses nativo
 curl http://127.0.0.1:8787/v1/responses \
-  -H "Authorization: Bearer grok-desktop" \
+  -H "Authorization: Bearer local" \
   -H "Content-Type: application/json" \
   -d '{
     "model": "grok-4.5",
@@ -167,12 +182,12 @@ curl http://127.0.0.1:8787/v1/responses \
   }'
 ```
 
-### Kimi Work (provedor = kimi_work)
+### Kimi Work (model `kimi-for-coding` / `k3-agent` / …)
 
 | Item | Valor |
 |------|--------|
 | Endpoint | **`POST /v1/chat/completions`** (`/responses` retorna 400) |
-| Modelos | `kimi-for-coding` (id de fio), aliases `k3-agent`, `k3-agent-swarm`, `k2d6-agent` |
+| Modelos | `kimi-for-coding` (id de fio), aliases `k3-agent`, `k3-agent-{low,medium,high,xhigh}`, `k2d6-agent` |
 | Tools | OpenAI nativo: `tools` / `tool_calls` |
 
 ```bash
@@ -186,9 +201,9 @@ curl http://127.0.0.1:8787/v1/chat/completions \
   }'
 ```
 
-### Exemplo — OpenCode (mesma baseURL)
+### Exemplo — OpenCode / Kilo (mesma baseURL, sem trocar provedor no app)
 
-Troque **Global → Provedor** no app e use os models correspondentes:
+Escolha o **model** no cliente: `grok-4.5` → Grok · `kimi-for-coding` → Kimi.
 
 ```json
 {
@@ -204,7 +219,11 @@ Troque **Global → Provedor** no app e use os models correspondentes:
         "grok-4.5": { "name": "Grok 4.5 (Responses)" },
         "kimi-for-coding": { "name": "Kimi For Coding" },
         "k3-agent": { "name": "K3 Max (Work)" },
-        "k3-agent-swarm": { "name": "K3 Swarm Max (Work)" }
+        "k3-agent": { "name": "K3 Max (Work)" },
+        "k3-agent-low": { "name": "K3 Max Low Think" },
+        "k3-agent-medium": { "name": "K3 Max Medium Think" },
+        "k3-agent-high": { "name": "K3 Max High Think" },
+        "k3-agent-xhigh": { "name": "K3 Max Extra High Think" }
       }
     }
   }
@@ -215,9 +234,9 @@ Troque **Global → Provedor** no app e use os models correspondentes:
 
 | Endpoint | Grok | Kimi Work | Notas |
 |----------|------|-----------|--------|
-| `/v1/models` | ✓ | ✓ | Catálogo do **provedor ativo** |
-| `/v1/responses` | ✓ | ✗ | Só Grok |
-| `/v1/chat/completions` | ✗ | ✓ | Só Kimi (tools OpenAI nativos) |
+| `/v1/models` | ✓ | ✓ | Catálogo unificado (Grok + Kimi na mesma base URL) |
+| `/v1/chat/completions` | ✓ (padrão) | ✓ | OpenCode/Kilo usam este |
+| `/v1/responses` | ✓ (opcional) | reescreve → chat | Grok nativo xAI |
 | `/v1/messages` | ✓* | — | Formato Anthropic (caminho Grok) |
 | `/v1/search` | ✓ | — | **Pesquisa nativa xAI** (`web_search` + `x_search`) |
 | `POST /v1/sso` | ✓ | — | Importar SSO Grok |
@@ -282,7 +301,7 @@ No app: **Provedor → Kimi Work · Auth** → **+ Conta Kimi** → **Login com 
 
 - Multi-conta = vários usuários Kimi (cada login Google → uma entrada `sk-kimi` no pool).
 - **Não** precisa do Kimi Desktop instalado.
-- O id de fio no agent-gw costuma ser **`kimi-for-coding`** (SKU coding da família K3). Labels `k3-agent` / swarm são aliases.
+- O id de fio no agent-gw costuma ser **`kimi-for-coding`** (SKU coding da família K3). Labels `k3-agent` e variantes (`-low`, `-medium`, `-high`, `-xhigh`) são aliases que definem o reasoning effort automaticamente.
 
 ### Preço estimado (lista da platform)
 
@@ -313,7 +332,7 @@ Fonte: [pricing Kimi K3](https://platform.kimi.ai/docs/pricing/chat-k3). Conta c
 ### UX compartilhada
 
 - Troque o **provedor** em Global
-- **Ver contas** lista só o pool do **provedor ativo**
+- **Ver contas** na UI lista o pool do provedor selecionado no app; o proxy HTTP usa o pool certo pelo `model`
 - A conta ativa alimenta o chat da UI **e** o proxy local daquele provedor
 
 ### Onde ficam os dados (não vai pro git)

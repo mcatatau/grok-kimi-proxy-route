@@ -24,10 +24,15 @@ import {
   IsSignupRunning,
   SetAutoCreateOnExhausted,
   GetAutoCreateOnExhausted,
+  GetKimiStealthHeadless,
+  SetKimiStealthHeadless,
   StartKimiBrowserLogin,
+  StartKimiStealthLogin,
   AddKimiFromJWT,
   AddKimiAPIKey,
+  LogoffKimiAccount,
 } from "../wailsjs/go/main/App";
+import { openStatsModal } from "./stats.js";
 import { EventsOn } from "../wailsjs/runtime/runtime";
 
 // Markdown like ChatGPT: GFM, breaks for soft newlines
@@ -375,7 +380,7 @@ function ensureShell() {
             <div class="stat"><label>Lat. méd</label><b id="u-lat">—</b></div>
           </div>
           <div class="rail-actions" style="margin-top:10px">
-            <button class="btn btn-quiet" id="btn-stats">Estatísticas</button>
+            <button class="btn btn-quiet" id="btn-stats">Ver mais da API</button>
           </div>
         </div>
 
@@ -421,7 +426,7 @@ function ensureShell() {
             <span>think <b id="sess-think">0</b></span>
             <span class="cost" id="sess-cost">$0</span>
             <span id="sess-lat" style="display:none"></span>
-            <button class="icon-btn" id="btn-stats-top" type="button">Stats</button>
+            <button class="icon-btn" id="btn-stats-top" type="button">API</button>
           </div>
         </header>
 
@@ -499,7 +504,10 @@ function ensureShell() {
       return [
         { id: "kimi-for-coding", name: "Kimi For Coding" },
         { id: "k3-agent", name: "K3 Max (Work)" },
-        { id: "k3-agent-swarm", name: "K3 Swarm Max (Work)" },
+        { id: "k3-agent-low", name: "K3 Max — Low Think" },
+        { id: "k3-agent-medium", name: "K3 Max — Medium Think" },
+        { id: "k3-agent-high", name: "K3 Max — High Think" },
+        { id: "k3-agent-xhigh", name: "K3 Max — Extra High Think" },
         { id: "k2d6-agent", name: "K2.6 Agent (Work)" },
       ];
     }
@@ -683,6 +691,77 @@ function fillModels() {
   }
 }
 
+function isKimiProvider(p) {
+  const v = (p || state.settings?.provider || "").toLowerCase();
+  return v === "kimi_work" || v === "kimi" || v === "kimi-work" || v.startsWith("kimi");
+}
+
+/** Yes/No confirm sheet (replaces window.confirm for delete account). */
+function confirmYesNo({ title, message, yesLabel = "Sim", noLabel = "Não", danger = true }) {
+  return new Promise((resolve) => {
+    const overlay = document.createElement("div");
+    overlay.className = "overlay overlay-glass";
+    overlay.innerHTML = `
+      <div class="sheet sheet-confirm">
+        <h3>${escapeHtml(title || "Confirmar")}</h3>
+        <p class="confirm-msg">${message || ""}</p>
+        <div class="sheet-actions confirm-actions">
+          <button type="button" class="btn btn-quiet" data-ans="no">${escapeHtml(noLabel)}</button>
+          <button type="button" class="btn ${danger ? "btn-danger" : "btn-solid"}" data-ans="yes">${escapeHtml(yesLabel)}</button>
+        </div>
+      </div>`;
+    const finish = (v) => {
+      overlay.remove();
+      resolve(v);
+    };
+    overlay.addEventListener("click", (e) => {
+      if (e.target === overlay) finish(false);
+    });
+    overlay.querySelector('[data-ans="no"]').onclick = () => finish(false);
+    overlay.querySelector('[data-ans="yes"]').onclick = () => finish(true);
+    document.body.appendChild(overlay);
+  });
+}
+
+async function confirmAndLogoffKimi(account) {
+  const name = account.label || account.email || account.id;
+  const hasWeb = !!account.has_web_session || !!account.has_refresh;
+  const msg = hasWeb
+    ? `Deletar a conta <b>${escapeHtml(name)}</b> no <b>kimi.com</b>?<br/><br/>Isso apaga a conta de verdade (irreversível) e remove do proxy.`
+    : `A conta <b>${escapeHtml(name)}</b> não tem sessão web (só sk-kimi).<br/>Não dá para deletar no site — só remover do proxy local.`;
+  if (hasWeb) {
+    const ok = await confirmYesNo({
+      title: "Deletar conta Kimi?",
+      message: msg,
+      yesLabel: "Sim, deletar",
+      noLabel: "Não",
+      danger: true,
+    });
+    if (!ok) return;
+    try {
+      setStatus("Deletando conta no kimi.com…");
+      await LogoffKimiAccount(account.id);
+      await refreshBootstrap(false);
+      setStatus("Conta deletada no kimi.com");
+    } catch (e) {
+      alert("Falha ao deletar: " + e);
+      setStatus("Erro ao deletar conta");
+    }
+    return;
+  }
+  const ok = await confirmYesNo({
+    title: "Remover do proxy?",
+    message: msg,
+    yesLabel: "Sim, remover",
+    noLabel: "Não",
+    danger: true,
+  });
+  if (!ok) return;
+  await RemoveAccount(account.id);
+  await refreshBootstrap(false);
+  setStatus("Conta removida do proxy");
+}
+
 function paintChrome() {
   ensureShell();
   const u = globalUsage();
@@ -710,6 +789,7 @@ function paintChrome() {
   }
   list.innerHTML = "";
   const pNow = (state.settings?.provider || "xai").toLowerCase();
+  const kimiUI = isKimiProvider(pNow);
   if (providerAuthMode(pNow) !== "auth") {
     list.innerHTML = `<div class="account empty-hint">Provedor <b>API key</b> — sem pool de contas de sessão.<br/>Credencial direta (Ollie keyless / Gemini ADC).</div>`;
   } else if (!state.accounts.length) {
@@ -731,6 +811,7 @@ function paintChrome() {
               ${a.active ? `<span class="badge badge-live">ativa</span>` : `<span class="badge badge-ok">salva</span>`}
               ${a.exhausted ? `<span class="badge badge-danger">esgotada</span>` : ""}
               ${a.expired ? `<span class="badge badge-warn">token exp.</span>` : ""}
+              ${kimiUI && a.has_web_session ? `<span class="badge badge-ok" title="Sessão web (pode deletar no site)">web</span>` : ""}
               <span>${escapeHtml((a.email || "").split("@")[0] || a.id.slice(0, 8))}</span>
             </div>
           </div>
@@ -747,7 +828,11 @@ function paintChrome() {
               : `<button type="button" class="primary" data-act="select">Usar</button>`
           }
           <button type="button" data-act="rename">Renomear</button>
-          <button type="button" class="danger" data-act="remove">Remover</button>
+          ${
+            kimiUI
+              ? `<button type="button" class="danger" data-act="logoff" title="Deletar conta no kimi.com">Deletar</button>`
+              : `<button type="button" class="danger" data-act="remove">Remover</button>`
+          }
         </div>
       `;
       card.querySelectorAll("[data-act]").forEach((btn) => {
@@ -766,6 +851,8 @@ function paintChrome() {
             } catch (err) {
               alert("Rename: " + err);
             }
+          } else if (act === "logoff") {
+            await confirmAndLogoffKimi(a);
           } else if (act === "remove") {
             if (!confirm(`Remover conta ${a.label || a.email}?`)) return;
             await RemoveAccount(a.id);
@@ -1096,8 +1183,16 @@ function showAddKimiChooser() {
           <strong>Login com Google</strong>
           <span>Abre seu Chrome/Edge normal. Escolha a conta Google. Ao voltar, a conta Kimi Work entra no pool sozinha.</span>
         </button>
+        <button type="button" class="choose-card" id="m-stealth">
+          <strong>Login Automático (Stealth)</strong>
+          <span>Usa Playwright com perfil persistente. Primeira vez você loga no Google; depois o login é automático ao deletar/recarregar.</span>
+        </button>
       </div>
       <p class="hint" style="margin-top:10px;font-size:12px;opacity:.65">Multi-conta: repita o login com outra conta Google. Refresh token fica salvo.</p>
+      <label style="display:flex;align-items:center;gap:8px;margin-top:10px;font-size:13px;cursor:pointer;">
+        <input type="checkbox" id="m-kimi-headless" style="width:16px;height:16px;" />
+        Playwright em modo <b>headless</b> (sem janela visível)
+      </label>
       <div class="sheet-actions">
         <button class="btn btn-quiet" id="m-cancel">Fechar</button>
       </div>
@@ -1107,6 +1202,15 @@ function showAddKimiChooser() {
   overlay.addEventListener("click", (e) => {
     if (e.target === overlay) overlay.remove();
   });
+  GetKimiStealthHeadless()
+    .then((v) => {
+      const el = $("#m-kimi-headless", overlay);
+      if (el) el.checked = !!v;
+    })
+    .catch(() => {});
+  $("#m-kimi-headless", overlay).onchange = (e) => {
+    SetKimiStealthHeadless(!!e.target.checked).catch(() => {});
+  };
   $("#m-browser", overlay).onclick = async () => {
     try {
       setStatus("Kimi: abra o navegador e escolha a conta Google…");
@@ -1117,6 +1221,18 @@ function showAddKimiChooser() {
     } catch (e) {
       alert("Falha login Kimi: " + e);
       setStatus("Falha login Kimi");
+    }
+  };
+  $("#m-stealth", overlay).onclick = async () => {
+    try {
+      setStatus("Kimi: iniciando login automático com Playwright…");
+      overlay.remove();
+      const rec = await StartKimiStealthLogin(false);
+      await refreshBootstrap(false);
+      setStatus(`Kimi stealth ok · ${rec.label || rec.id}${rec.has_refresh ? " · refresh salvo" : ""}`);
+    } catch (e) {
+      alert("Falha login stealth Kimi: " + e);
+      setStatus("Falha login stealth Kimi");
     }
   };
 }
@@ -1169,7 +1285,8 @@ async function openAccountsModal() {
   try {
     accounts = (await ListAccountsForProvider(p)) || accounts;
   } catch (_) {}
-  const title = p.startsWith("kimi") ? "Contas Kimi Work" : "Contas Grok";
+  const kimiUI = isKimiProvider(p);
+  const title = kimiUI ? "Contas Kimi Work" : "Contas Grok";
   const overlay = document.createElement("div");
   overlay.className = "overlay overlay-glass";
   const rows =
@@ -1185,6 +1302,7 @@ async function openAccountsModal() {
                   ${a.active ? `<span class="badge badge-live">ativa</span>` : `<span class="badge badge-ok">salva</span>`}
                   ${a.exhausted ? `<span class="badge badge-danger">esgotada</span>` : ""}
                   ${a.auth_denied ? `<span class="badge badge-danger">auth</span>` : ""}
+                  ${kimiUI && a.has_web_session ? `<span class="badge badge-ok">web</span>` : ""}
                   ${a.api_key_hint ? `<span class="badge badge-ok">${escapeHtml(a.api_key_hint)}</span>` : ""}
                   <span>${fmt(u.total_tokens || 0)} tok · ${fmtUSD(u.cost_usd || 0)}</span>
                 </div>
@@ -1192,7 +1310,11 @@ async function openAccountsModal() {
               <div class="acc-actions">
                 ${a.active ? "" : `<button type="button" class="btn btn-solid btn-xs" data-act="use">Usar</button>`}
                 <button type="button" class="btn btn-quiet btn-xs" data-act="rename">Renomear</button>
-                <button type="button" class="btn btn-quiet btn-xs danger" data-act="remove">Remover</button>
+                ${
+                  kimiUI
+                    ? `<button type="button" class="btn btn-quiet btn-xs danger" data-act="logoff">Deletar</button>`
+                    : `<button type="button" class="btn btn-quiet btn-xs danger" data-act="remove">Remover</button>`
+                }
               </div>
             </div>`;
           })
@@ -1235,6 +1357,13 @@ async function openAccountsModal() {
           if (next != null && next.trim()) {
             await RenameAccount(id, next.trim());
             await refreshBootstrap(false);
+            openAccountsModal();
+          }
+        } else if (act === "logoff") {
+          const a = accounts.find((x) => x.id === id);
+          if (a) {
+            overlay.remove();
+            await confirmAndLogoffKimi(a);
             openAccountsModal();
           }
         } else if (act === "remove") {
@@ -1953,9 +2082,31 @@ function wireEvents() {
     const st = $("#status-text");
     if (st) st.innerHTML = `Cota esgotada — <strong>criando conta nova…</strong>`;
   });
+  EventsOn("kimi:relogin", async (p) => {
+    const st = $("#status-text");
+    const phase = p?.phase || "";
+    if (st) {
+      if (phase === "start") {
+        st.innerHTML = `Cota Kimi — <strong>Playwright recriando conta…</strong>`;
+      } else if (phase === "ok") {
+        st.innerHTML = `Nova conta Kimi · <strong>${escapeHtml(p?.account?.email || p?.account?.label || "ok")}</strong>`;
+      } else if (phase === "error") {
+        st.innerHTML = `Falha re-login Kimi · <strong>${escapeHtml(p?.error || p?.message || "")}</strong>`;
+      } else if (p?.message) {
+        st.innerHTML = escapeHtml(String(p.message));
+      }
+    }
+    if (phase === "ok") await refreshBootstrap(false);
+  });
   EventsOn("account:exhausted", async (p) => {
     const st = $("#status-text");
-    if (st) st.innerHTML = `Conta esgotada · <strong>${escapeHtml(p?.email || p?.id || "")}</strong>`;
+    if (st) {
+      if (p?.logoff) {
+        st.innerHTML = `Kimi apagada · <strong>${escapeHtml(p?.email || p?.id || "")}</strong> — recriando…`;
+      } else {
+        st.innerHTML = `Conta esgotada · <strong>${escapeHtml(p?.email || p?.id || "")}</strong>`;
+      }
+    }
     await refreshBootstrap(false);
   });
   EventsOn("account:rotated", async (p) => {
@@ -1963,148 +2114,6 @@ function wireEvents() {
     const st = $("#status-text");
     if (st) st.innerHTML = `Trocou pra conta <strong>${escapeHtml(p?.id || "")}</strong>`;
   });
-}
-
-function sparklineSVG(values, color = "rgba(125,211,252,0.9)") {
-  const nums = (values || []).map((v) => Number(v) || 0);
-  if (!nums.length) {
-    return `<div class="chart-empty">Sem amostras ainda — envie um chat</div>`;
-  }
-  const w = 320;
-  const h = 88;
-  const pad = 6;
-  const max = Math.max(...nums, 1);
-  const min = Math.min(...nums, 0);
-  const span = Math.max(max - min, 1);
-  const pts = nums.map((v, i) => {
-    const x = pad + (i * (w - pad * 2)) / Math.max(nums.length - 1, 1);
-    const y = h - pad - ((v - min) / span) * (h - pad * 2);
-    return [x, y];
-  });
-  const line = pts.map((p, i) => (i === 0 ? `M ${p[0]} ${p[1]}` : `L ${p[0]} ${p[1]}`)).join(" ");
-  const area =
-    line +
-    ` L ${pts[pts.length - 1][0]} ${h - pad} L ${pts[0][0]} ${h - pad} Z`;
-  const last = nums[nums.length - 1];
-  return `
-    <svg viewBox="0 0 ${w} ${h}" preserveAspectRatio="none">
-      <defs>
-        <linearGradient id="g-${color.replace(/[^a-z0-9]/gi, "")}" x1="0" y1="0" x2="0" y2="1">
-          <stop offset="0%" stop-color="${color}" stop-opacity="0.35"/>
-          <stop offset="100%" stop-color="${color}" stop-opacity="0"/>
-        </linearGradient>
-      </defs>
-      <path d="${area}" fill="url(#g-${color.replace(/[^a-z0-9]/gi, "")})"/>
-      <path d="${line}" fill="none" stroke="${color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
-      <text x="${w - pad}" y="${pad + 10}" text-anchor="end" fill="rgba(255,255,255,0.35)" font-size="10">${fmt(last)}</text>
-    </svg>
-  `;
-}
-
-async function openStatsModal() {
-  document.querySelector(".stats-overlay")?.remove();
-  let stats;
-  try {
-    stats = await GetStats();
-  } catch (e) {
-    alert("Stats: " + e);
-    return;
-  }
-  const g = stats.global || {};
-  const proxy = stats.proxy || {};
-  const rate = stats.active_rate || {};
-  const snippets = {
-    opencode: proxy.opencode || "",
-    env: proxy.openai_env || "",
-    curl: proxy.curl || "",
-  };
-  let tab = "opencode";
-
-  const overlay = document.createElement("div");
-  overlay.className = "stats-overlay";
-  overlay.innerHTML = `
-    <div class="stats-panel" role="dialog" aria-label="Estatísticas">
-      <div class="stats-head">
-        <div>
-          <h2>Estatísticas & integração</h2>
-          <p>Tokens, latência, custo estimado (Grok 4.5 API) e config OpenAI-compatible</p>
-        </div>
-        <button class="icon-btn" id="stats-close">Fechar</button>
-      </div>
-
-      <div class="stats-grid">
-        <div class="kpi"><label>Tokens total</label><strong>${fmt(g.total_tokens)}</strong><span>${fmt(g.requests)} requests</span></div>
-        <div class="kpi"><label>Custo est.</label><strong>${fmtUSD(g.cost_usd)}</strong><span>in $${rate.input_per_m ?? 2}/M · out $${rate.output_per_m ?? 6}/M</span></div>
-        <div class="kpi"><label>Latência méd.</label><strong>${fmtMs(stats.avg_latency_ms)}</strong><span>TTFT méd. ${fmtMs(stats.avg_ttft_ms)}</span></div>
-        <div class="kpi"><label>Reasoning</label><strong>${fmt(g.reasoning_tokens)}</strong><span>prompt ${fmt(g.prompt_tokens)} · out ${fmt(g.completion_tokens)}</span></div>
-      </div>
-
-      <div class="charts">
-        <div class="chart-card">
-          <h3>Latência total (ms) — últimas requests</h3>
-          <div id="chart-lat">${sparklineSVG(stats.latency_series, "rgba(125,211,252,0.95)")}</div>
-        </div>
-        <div class="chart-card">
-          <h3>Time to first token (ms)</h3>
-          <div id="chart-ttft">${sparklineSVG(stats.ttft_series, "rgba(167,139,250,0.95)")}</div>
-        </div>
-      </div>
-
-      <div class="snippet-card">
-        <h3>OpenAI-compatible · Open Code / Cursor / Continue</h3>
-        <p class="sub">Base URL do proxy local embutido. Cole no Open Code (provider openai-compatible) ou use as envs.</p>
-        <div class="snippet-tabs">
-          <button type="button" data-tab="opencode" class="on">Open Code JSON</button>
-          <button type="button" data-tab="env">ENV</button>
-          <button type="button" data-tab="curl">cURL</button>
-        </div>
-        <div class="snippet-body">
-          <pre id="snippet-pre">${escapeHtml(snippets.opencode)}</pre>
-          <button type="button" class="copy" id="snippet-copy">Copiar</button>
-        </div>
-      </div>
-
-      <p class="pricing-note">
-        Preço de referência Grok 4.5 (docs.x.ai): <b>$2.00 / 1M input</b>, <b>$0.50 / 1M cached</b>, <b>$6.00 / 1M output</b>.
-        Reasoning conta como output. Valores são estimativas da sessão local — a fatura real depende do plano/conta xAI.
-        ${proxy.base_url ? `Proxy: <code>${escapeHtml(proxy.base_url)}</code>` : ""}
-      </p>
-    </div>
-  `;
-  document.body.appendChild(overlay);
-
-  const close = () => overlay.remove();
-  $("#stats-close", overlay).onclick = close;
-  overlay.addEventListener("click", (e) => {
-    if (e.target === overlay) close();
-  });
-  document.addEventListener(
-    "keydown",
-    function esc(e) {
-      if (e.key === "Escape") {
-        close();
-        document.removeEventListener("keydown", esc);
-      }
-    },
-    { once: true }
-  );
-
-  const pre = $("#snippet-pre", overlay);
-  const tabs = overlay.querySelectorAll(".snippet-tabs button");
-  tabs.forEach((btn) => {
-    btn.onclick = () => {
-      tabs.forEach((b) => b.classList.remove("on"));
-      btn.classList.add("on");
-      tab = btn.dataset.tab;
-      pre.textContent = snippets[tab] || "";
-    };
-  });
-  $("#snippet-copy", overlay).onclick = async () => {
-    await navigator.clipboard.writeText(snippets[tab] || "");
-    const b = $("#snippet-copy", overlay);
-    b.textContent = "Copiado";
-    setTimeout(() => (b.textContent = "Copiar"), 1200);
-  };
 }
 
 async function main() {

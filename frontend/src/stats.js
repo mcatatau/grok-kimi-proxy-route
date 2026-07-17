@@ -43,14 +43,20 @@ export async function openStatsModal() {
   try {
     stats = await GetStats();
   } catch (e) {
-    alert("Stats: " + e);
+    alert("API: " + e);
     return;
   }
   const g = stats.global || {};
   const proxy = stats.proxy || {};
   const rate = stats.active_rate || {};
+  const base = proxy.base_url || "http://127.0.0.1:8787/v1";
+  const modelsURL = proxy.models_url || base + "/models";
+  const key = proxy.api_key || "local";
+  const modelList = (proxy.models_example || ["grok-4.5", "kimi-for-coding", "k3-agent", "k3-agent-low", "k3-agent-medium", "k3-agent-high", "k3-agent-xhigh"]).join(", ");
+
   const snippets = {
     opencode: proxy.opencode || "",
+    kilo: proxy.kilo || "",
     env: proxy.openai_env || "",
     curl: proxy.curl || "",
   };
@@ -59,38 +65,63 @@ export async function openStatsModal() {
   const overlay = document.createElement("div");
   overlay.className = "stats-overlay";
   overlay.innerHTML = `
-    <div class="stats-panel" role="dialog" aria-label="Estatísticas">
+    <div class="stats-panel api-panel" role="dialog" aria-label="Ver mais da API">
       <div class="stats-head">
         <div>
-          <h2>Estatísticas & integração</h2>
-          <p>Tokens, latência, custo estimado (Grok 4.5 API) e config OpenAI-compatible</p>
+          <h2>Ver mais da API</h2>
+          <p>Proxy local OpenAI-compatible · OpenCode · Kilo Code · models pela base URL</p>
         </div>
         <button class="icon-btn" id="stats-close">Fechar</button>
       </div>
 
-      <div class="stats-grid">
-        <div class="kpi"><label>Tokens total</label><strong>${fmt(g.total_tokens)}</strong><span>${fmt(g.requests)} requests</span></div>
-        <div class="kpi"><label>Custo est.</label><strong>${fmtUSD(g.cost_usd)}</strong><span>in $${rate.input_per_m ?? 2}/M · out $${rate.output_per_m ?? 6}/M</span></div>
-        <div class="kpi"><label>Latência méd.</label><strong>${fmtMs(stats.avg_latency_ms)}</strong><span>TTFT méd. ${fmtMs(stats.avg_ttft_ms)}</span></div>
-        <div class="kpi"><label>Reasoning</label><strong>${fmt(g.reasoning_tokens)}</strong><span>prompt ${fmt(g.prompt_tokens)} · out ${fmt(g.completion_tokens)}</span></div>
+      <div class="api-hero">
+        <div class="api-row">
+          <label>Base URL</label>
+          <code id="api-base">${escapeHtml(base)}</code>
+          <button type="button" class="copy-inline" data-copy="${escapeHtml(base)}">Copiar</button>
+        </div>
+        <div class="api-row">
+          <label>Models URL</label>
+          <code id="api-models">${escapeHtml(modelsURL)}</code>
+          <button type="button" class="copy-inline" data-copy="${escapeHtml(modelsURL)}">Copiar</button>
+        </div>
+        <div class="api-row">
+          <label>API key</label>
+          <code>${escapeHtml(key)}</code>
+          <button type="button" class="copy-inline" data-copy="${escapeHtml(key)}">Copiar</button>
+        </div>
       </div>
 
-      <div class="charts">
-        <div class="chart-card">
-          <h3>Latência total (ms) — últimas requests</h3>
-          <div id="chart-lat">${sparklineSVG(stats.latency_series, "rgba(125,211,252,0.95)")}</div>
-        </div>
-        <div class="chart-card">
-          <h3>Time to first token (ms)</h3>
-          <div id="chart-ttft">${sparklineSVG(stats.ttft_series, "rgba(167,139,250,0.95)")}</div>
-        </div>
+      <div class="api-explain">
+        <h3>Como o OpenCode / Kilo puxam os models</h3>
+        <ol>
+          <li>Você cola a <b>Base URL</b> no client (provider OpenAI Compatible).</li>
+          <li>O client chama <code>GET ${escapeHtml(modelsURL)}</code>.</li>
+          <li>A lista vem com <b>Grok + Kimi</b> juntos (mesma porta).</li>
+          <li>Na hora do chat, o client manda o <b>model</b> escolhido — o proxy roteia sozinho:
+            <ul>
+              <li><code>grok-4.5</code> → Grok · <code>POST /v1/responses</code></li>
+              <li><code>kimi-for-coding</code> / <code>k3-agent</code> → Kimi · <code>POST /v1/chat/completions</code></li>
+            </ul>
+          </li>
+        </ol>
+        <p class="api-models-line">Models: <code>${escapeHtml(modelList)}</code></p>
+        <p class="sub">Não precisa trocar “provedor ativo” no app. O model do client manda. App precisa estar aberto.</p>
+      </div>
+
+      <div class="stats-grid api-kpis">
+        <div class="kpi"><label>Tokens total</label><strong>${fmt(g.total_tokens)}</strong><span>${fmt(g.requests)} requests</span></div>
+        <div class="kpi"><label>Custo est.</label><strong>${fmtUSD(g.cost_usd)}</strong><span>in $${rate.input_per_m ?? 2}/M · out $${rate.output_per_m ?? 6}/M</span></div>
+        <div class="kpi"><label>Latência méd.</label><strong>${fmtMs(stats.avg_latency_ms)}</strong><span>TTFT ${fmtMs(stats.avg_ttft_ms)}</span></div>
+        <div class="kpi"><label>Roteamento</label><strong>por model</strong><span>base + /v1/models</span></div>
       </div>
 
       <div class="snippet-card">
-        <h3>OpenAI-compatible · Open Code / Cursor / Continue</h3>
-        <p class="sub">Base URL do proxy local embutido. Cole no Open Code (provider openai-compatible) ou use as envs.</p>
+        <h3>Configurar OpenCode / Kilo / ENV / cURL</h3>
+        <p class="sub">Cole o snippet no client. OpenCode usa JSON; Kilo usa provider OpenAI Compatible com a Base URL.</p>
         <div class="snippet-tabs">
-          <button type="button" data-tab="opencode" class="on">Open Code JSON</button>
+          <button type="button" data-tab="opencode" class="on">OpenCode JSON</button>
+          <button type="button" data-tab="kilo">Kilo Code</button>
           <button type="button" data-tab="env">ENV</button>
           <button type="button" data-tab="curl">cURL</button>
         </div>
@@ -100,10 +131,20 @@ export async function openStatsModal() {
         </div>
       </div>
 
+      <div class="charts">
+        <div class="chart-card">
+          <h3>Latência (ms)</h3>
+          <div id="chart-lat">${sparklineSVG(stats.latency_series, "rgba(125,211,252,0.95)")}</div>
+        </div>
+        <div class="chart-card">
+          <h3>TTFT (ms)</h3>
+          <div id="chart-ttft">${sparklineSVG(stats.ttft_series, "rgba(167,139,250,0.95)")}</div>
+        </div>
+      </div>
+
       <p class="pricing-note">
-        Preço de referência Grok 4.5 (docs.x.ai): <b>$2.00 / 1M input</b>, <b>$0.50 / 1M cached</b>, <b>$6.00 / 1M output</b>.
-        Reasoning conta como output. Valores são estimativas da sessão local — a fatura real depende do plano/conta xAI.
-        ${proxy.base_url ? `Proxy: <code>${escapeHtml(proxy.base_url)}</code>` : ""}
+        Proxy local: <code>${escapeHtml(base)}</code> ·
+        Models: <code>${escapeHtml(modelsURL)}</code>
       </p>
     </div>
   `;
@@ -141,4 +182,12 @@ export async function openStatsModal() {
     b.textContent = "Copiado";
     setTimeout(() => (b.textContent = "Copiar"), 1200);
   };
+  overlay.querySelectorAll(".copy-inline").forEach((btn) => {
+    btn.onclick = async () => {
+      await navigator.clipboard.writeText(btn.dataset.copy || "");
+      const t = btn.textContent;
+      btn.textContent = "OK";
+      setTimeout(() => (btn.textContent = t), 900);
+    };
+  });
 }

@@ -225,6 +225,7 @@ type Settings struct {
 	GeminiProject  string `json:"gemini_project,omitempty"`
 	GeminiLocation string `json:"gemini_location,omitempty"`
 	ThemeAccent    string `json:"theme_accent,omitempty"`
+	KimiStealthHeadless bool `json:"kimi_stealth_headless"`
 }
 
 // ForceModel reports whether the proxy should ignore the client's model field.
@@ -304,9 +305,10 @@ func (s Settings) resolveModel(requested string, force bool) string {
 
 func resolveKimiWorkModel(requested string) string {
 	m := strings.ToLower(strings.TrimSpace(requested))
+	m = StripKimiEffortSuffix(m)
 	switch m {
 	case "", "default", "proxy", "auto", "kimi-work", "kimi-code", "kimi-for-coding",
-		"k3-agent", "k3-max", "k3", "k3-agent-swarm", "k3-agent-ultra", "k3-swarm",
+		"k3-agent", "k3-max", "k3", "k3-agent-ultra", "k3-swarm",
 		"k2d6-agent", "k2p6", "k2p6-agent", "kimi-for-coding-chat":
 		return KimiWorkDefaultModel
 	default:
@@ -319,7 +321,7 @@ func resolveKimiWorkModel(requested string) string {
 
 // WithProviderForModel returns a copy of settings with Provider/Upstream switched
 // to match the requested model id (so client-selected models route correctly).
-// Unrecognized ids leave settings unchanged.
+// Unrecognized ids leave settings unchanged. Does not mutate the store.
 func (s Settings) WithProviderForModel(requested string) Settings {
 	req := strings.TrimSpace(requested)
 	if req == "" {
@@ -340,7 +342,8 @@ func (s Settings) WithProviderForModel(requested string) Settings {
 	case looksLikeKimiWorkModel(id):
 		out.Provider = ProviderKimiWork
 		out.UpstreamBase = KimiWorkUpstream
-		out.APIMode = "responses"
+		// agent-gw has no /responses — chat/completions only.
+		out.APIMode = "chat"
 	case looksLikeGeminiModel(id):
 		out.Provider = ProviderGemini
 		if strings.TrimSpace(out.GeminiLocation) == "" {
@@ -349,13 +352,41 @@ func (s Settings) WithProviderForModel(requested string) Settings {
 	case looksLikeOllieModel(id):
 		out.Provider = ProviderOllie
 		out.UpstreamBase = OllieUpstream
+		out.APIMode = "chat"
 	case looksLikeXAIModel(id):
 		out.Provider = ProviderXAI
+		out.APIMode = "responses"
 		if out.UpstreamBase == "" || strings.Contains(strings.ToLower(out.UpstreamBase), "ollie") ||
 			strings.Contains(strings.ToLower(out.UpstreamBase), "aiplatform") ||
 			strings.Contains(strings.ToLower(out.UpstreamBase), "agent-gw") {
 			out.UpstreamBase = DefaultUpstream
 		}
+	}
+	return out
+}
+
+// WithProvider returns a copy of settings forced to provider (request-scoped routing).
+func (s Settings) WithProvider(provider string) Settings {
+	out := s
+	p := strings.ToLower(strings.TrimSpace(provider))
+	switch p {
+	case ProviderKimiWork, "kimi", "kimi-work", "kimiwork", "moonshot-work":
+		out.Provider = ProviderKimiWork
+		out.UpstreamBase = KimiWorkUpstream
+		out.APIMode = "chat"
+	case ProviderOllie:
+		out.Provider = ProviderOllie
+		out.UpstreamBase = OllieUpstream
+		out.APIMode = "chat"
+	case ProviderGemini:
+		out.Provider = ProviderGemini
+		if strings.TrimSpace(out.GeminiLocation) == "" {
+			out.GeminiLocation = GeminiDefaultLocation
+		}
+	case ProviderXAI, "grok", "x.ai":
+		out.Provider = ProviderXAI
+		out.UpstreamBase = DefaultUpstream
+		out.APIMode = "responses"
 	}
 	return out
 }
@@ -601,13 +632,38 @@ func looksLikeOllieModel(model string) bool {
 	return false
 }
 
+func StripKimiEffortSuffix(m string) string {
+	for _, suffix := range []string{"-low", "-medium", "-high", "-xhigh", "-extra-high", "-extra_high", "-max"} {
+		if strings.HasSuffix(m, suffix) {
+			return strings.TrimSuffix(m, suffix)
+		}
+	}
+	return m
+}
+
+// ExtractKimiWorkEffort returns the reasoning-effort suffix embedded in a Kimi model alias.
+// Examples: "k3-agent-high" → ("k3-agent", "high"); "k3-agent" → ("k3-agent", "").
+func ExtractKimiWorkEffort(model string) (base string, effort string) {
+	m := strings.ToLower(strings.TrimSpace(model))
+	for _, suffix := range []string{"-xhigh", "-extra-high", "-extra_high", "-max", "-high", "-medium", "-low"} {
+		if strings.HasSuffix(m, suffix) {
+			effort = strings.TrimPrefix(suffix, "-")
+			effort = strings.ReplaceAll(effort, "extra-high", "xhigh")
+			effort = strings.ReplaceAll(effort, "extra_high", "xhigh")
+			base = strings.TrimSuffix(m, suffix)
+			return base, effort
+		}
+	}
+	return m, ""
+}
+
 func looksLikeKimiWorkModel(model string) bool {
 	m := strings.ToLower(strings.TrimSpace(model))
 	if m == "" {
 		return false
 	}
 	switch m {
-	case "kimi-for-coding", "kimi-code", "k3-agent", "k3-agent-swarm", "k3-agent-ultra",
+	case "kimi-for-coding", "kimi-code", "k3-agent", "k3-agent-ultra",
 		"k3-max", "k3-swarm", "k2d6-agent", "k2p6", "k2p6-agent", "kimi-work":
 		return true
 	}
@@ -618,6 +674,10 @@ func looksLikeKimiWorkModel(model string) bool {
 		return true
 	}
 	if strings.Contains(m, "agent-swarm") {
+		return true
+	}
+	// Variant effort suffixes: k3-agent-low, k3-agent-medium, etc.
+	if base := StripKimiEffortSuffix(m); base != m && looksLikeKimiWorkModel(base) {
 		return true
 	}
 	return false
@@ -1275,6 +1335,9 @@ func (s *Store) PublicAccountsForProvider(provider string) []map[string]any {
 				keyHint = k
 			}
 		}
+		hasWeb := a.NormalizedProvider() == ProviderKimiWork &&
+			(strings.TrimSpace(a.RefreshToken) != "" ||
+				(strings.TrimSpace(a.AccessToken) != "" && !strings.HasPrefix(strings.TrimSpace(a.AccessToken), "sk-kimi-")))
 		out = append(out, map[string]any{
 			"id":                 a.ID,
 			"provider":           a.NormalizedProvider(),
@@ -1284,6 +1347,8 @@ func (s *Store) PublicAccountsForProvider(provider string) []map[string]any {
 			"team_id":            a.TeamID,
 			"source":             a.Source,
 			"api_key_hint":       keyHint,
+			"has_web_session":    hasWeb,
+			"has_refresh":        strings.TrimSpace(a.RefreshToken) != "",
 			"expires_at":         a.ExpiresAt,
 			"expired":            a.Expired(),
 			"exhausted":          a.Exhausted(),
@@ -1359,41 +1424,130 @@ func (s *Store) ActiveAccount() (*Account, bool) {
 // PreferUsableAccount returns the active account if still usable; otherwise the first
 // non-exhausted / non-auth-denied account for the active provider.
 func (s *Store) PreferUsableAccount() (*Account, bool) {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-	want := s.settings.NormalizedProvider()
-	try := func(id string) (*Account, bool) {
-		if id == "" {
-			return nil, false
-		}
-		a, ok := s.accounts[id]
-		if !ok || !a.Usable() || a.NormalizedProvider() != want {
-			return nil, false
-		}
-		cp := a
-		return &cp, true
-	}
-	if acc, ok := try(s.settings.ActiveAccountID); ok {
-		return acc, true
-	}
-	var fallback *Account
-	for _, a := range s.accounts {
-		if a.NormalizedProvider() != want || !a.Usable() {
-			continue
-		}
-		cp := a
-		// Prefer non-expired tokens when several remain.
-		if !cp.Expired() {
+	return s.PreferUsableAccountForProvider("")
+}
+
+// PreferUsableAccountForProvider is like PreferUsableAccount but for an explicit provider
+// (empty = active settings provider). Used by HTTP multi-route (model → provider).
+func (s *Store) PreferUsableAccountForProvider(provider string) (*Account, bool) {
+	want := s.normalizeProviderFilter(provider)
+	tryPick := func() (*Account, bool) {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		try := func(id string) (*Account, bool) {
+			if id == "" {
+				return nil, false
+			}
+			a, ok := s.accounts[id]
+			if !ok || !a.Usable() || a.NormalizedProvider() != want {
+				return nil, false
+			}
+			cp := a
 			return &cp, true
 		}
-		if fallback == nil {
-			fallback = &cp
+		// Only prefer ActiveAccountID when it already belongs to the requested provider.
+		// Global active often stays on an xAI row while provider=kimi_work / model routes to Kimi.
+		if acc, ok := try(s.settings.ActiveAccountID); ok {
+			return acc, true
+		}
+		var fallback *Account
+		for _, a := range s.accounts {
+			if a.NormalizedProvider() != want || !a.Usable() {
+				continue
+			}
+			cp := a
+			// Kimi Work: sk-kimi does not expire with web JWT — ignore ExpiresAt.
+			if want == ProviderKimiWork || !cp.Expired() {
+				return &cp, true
+			}
+			if fallback == nil {
+				fallback = &cp
+			}
+		}
+		if fallback != nil {
+			return fallback, true
+		}
+		return nil, false
+	}
+	if acc, ok := tryPick(); ok {
+		return acc, true
+	}
+	// Another process may have added accounts (shared SQLite); reload once.
+	if s.db != nil {
+		if err := s.ReloadAccountsFromDB(); err == nil {
+			return tryPick()
 		}
 	}
-	if fallback != nil {
-		return fallback, true
-	}
 	return nil, false
+}
+
+func (s *Store) normalizeProviderFilter(provider string) string {
+	want := strings.ToLower(strings.TrimSpace(provider))
+	if want == "" {
+		s.mu.RLock()
+		want = s.settings.NormalizedProvider()
+		s.mu.RUnlock()
+	}
+	switch want {
+	case "kimi", "kimi-work", "kimiwork", "moonshot-work":
+		return ProviderKimiWork
+	case "grok", "x.ai":
+		return ProviderXAI
+	default:
+		return want
+	}
+}
+
+// ReloadAccountsFromDB re-reads accounts from SQLite into memory (multi-instance / external writes).
+func (s *Store) ReloadAccountsFromDB() error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.db == nil {
+		return fmt.Errorf("db not open")
+	}
+	rows, err := s.db.Query(`SELECT id, provider, label, email, team_id, user_id,
+		access_token, refresh_token, expires_at, api_key, device_id, source,
+		exhausted_at, exhaust_reason, auth_denied_at, auth_denied_reason,
+		client_id, issuer, scope, created_at, updated_at FROM accounts`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	next := make(map[string]Account, len(s.accounts))
+	for rows.Next() {
+		var a Account
+		var exp, exh, auth, created, updated string
+		if err := rows.Scan(
+			&a.ID, &a.Provider, &a.Label, &a.Email, &a.TeamID, &a.UserID,
+			&a.AccessToken, &a.RefreshToken, &exp, &a.APIKey, &a.DeviceID, &a.Source,
+			&exh, &a.ExhaustReason, &auth, &a.AuthDeniedReason,
+			&a.ClientID, &a.Issuer, &a.Scope, &created, &updated,
+		); err != nil {
+			continue
+		}
+		a.DeviceID = cleanDeviceID(a.DeviceID)
+		a.ExpiresAt = timeFromSQL(exp)
+		a.ExhaustedAt = timeFromSQL(exh)
+		a.AuthDeniedAt = timeFromSQL(auth)
+		a.CreatedAt = timeFromSQL(created)
+		a.UpdatedAt = timeFromSQL(updated)
+		if strings.TrimSpace(a.Provider) == "" {
+			a.Provider = ProviderXAI
+		}
+		a.Provider = a.NormalizedProvider()
+		if a.AccessToken == "" && a.APIKey == "" {
+			continue
+		}
+		if a.NormalizedProvider() == ProviderKimiWork && a.APIKey == "" && strings.HasPrefix(a.AccessToken, "sk-kimi-") {
+			a.APIKey = a.AccessToken
+		}
+		next[a.ID] = a
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	s.accounts = next
+	return nil
 }
 
 // NextUsableAccountID picks another usable account excluding exceptID (same provider as active settings).
@@ -1421,26 +1575,44 @@ func (s *Store) NextUsableAccountID(exceptID string) string {
 	return fallback
 }
 
-// PreferHealthyActive switches active to a usable non-expired account when current is dead.
+// PreferHealthyActive switches active to a usable account of the current provider when
+// current active is missing, wrong provider, exhausted, or auth-denied.
+// Kimi Work: sk-kimi does not follow web JWT ExpiresAt — expired JWT is fine if key exists.
 func (s *Store) PreferHealthyActive() bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	want := s.settings.NormalizedProvider()
 	curID := s.settings.ActiveAccountID
 	if curID != "" {
-		if a, ok := s.accounts[curID]; ok && a.NormalizedProvider() == want && a.Usable() && !a.Expired() {
-			return false
+		if a, ok := s.accounts[curID]; ok && a.NormalizedProvider() == want && a.Usable() {
+			// xAI: prefer non-expired when possible; still keep if only expired+refresh remains.
+			if want == ProviderKimiWork || !a.Expired() || a.RefreshToken != "" {
+				return false
+			}
 		}
 	}
 	var bestID string
-	var bestExp time.Time
+	var bestScore int
 	for _, a := range s.accounts {
-		if a.NormalizedProvider() != want || !a.Usable() || a.Expired() {
+		if a.NormalizedProvider() != want || !a.Usable() {
 			continue
 		}
-		if bestID == "" || a.ExpiresAt.After(bestExp) {
+		score := 1
+		if want == ProviderKimiWork {
+			if strings.TrimSpace(a.APIKey) != "" {
+				score += 2
+			}
+			if strings.TrimSpace(a.RefreshToken) != "" {
+				score++
+			}
+		} else if !a.Expired() {
+			score += 2
+		} else if a.RefreshToken != "" {
+			score++
+		}
+		if bestID == "" || score > bestScore {
 			bestID = a.ID
-			bestExp = a.ExpiresAt
+			bestScore = score
 		}
 	}
 	if bestID == "" || bestID == curID {

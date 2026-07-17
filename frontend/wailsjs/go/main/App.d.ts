@@ -29,6 +29,8 @@ export function GetBootstrap():Promise<Record<string, any>>;
 
 export function GetDeviceLoginState():Promise<main.deviceLoginState>;
 
+export function GetKimiStealthHeadless():Promise<boolean>;
+
 export function GetSettings():Promise<store.Settings>;
 
 export function GetSkill(arg1:string):Promise<skills.Skill>;
@@ -51,6 +53,8 @@ export function ListProviders():Promise<Array<Record<string, any>>>;
 
 export function ListSkills():Promise<Array<skills.Skill>>;
 
+export function LogoffKimiAccount(arg1:string):Promise<Record<string, any>>;
+
 export function OpenExternal(arg1:string):Promise<void>;
 
 export function RemoveAccount(arg1:string):Promise<void>;
@@ -63,11 +67,15 @@ export function SetActiveAccount(arg1:string):Promise<void>;
 
 export function SetAutoCreateOnExhausted(arg1:boolean):Promise<void>;
 
+export function SetKimiStealthHeadless(arg1:boolean):Promise<void>;
+
 export function StartAutoSignup():Promise<void>;
 
 export function StartDeviceLogin():Promise<main.deviceLoginState>;
 
 export function StartKimiBrowserLogin():Promise<Record<string, any>>;
+
+export function StartKimiStealthLogin(arg1:boolean):Promise<Record<string, any>>;
 
 export function SyncGrokCLI():Promise<Record<string, any>>;
 

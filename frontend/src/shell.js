@@ -68,7 +68,7 @@ export function ensureShell() {
             <div class="stat"><label>Lat. méd</label><b id="u-lat">—</b></div>
           </div>
           <div class="rail-actions" style="margin-top:10px">
-            <button class="btn btn-quiet" id="btn-stats">Estatísticas</button>
+            <button class="btn btn-quiet" id="btn-stats">Ver mais da API</button>
           </div>
         </div>
 
@@ -108,7 +108,7 @@ export function ensureShell() {
             <span>think <b id="sess-think">0</b></span>
             <span class="cost" id="sess-cost">$0</span>
             <span id="sess-lat" style="display:none"></span>
-            <button class="icon-btn" id="btn-stats-top" type="button">Stats</button>
+            <button class="icon-btn" id="btn-stats-top" type="button">API</button>
           </div>
         </header>
 

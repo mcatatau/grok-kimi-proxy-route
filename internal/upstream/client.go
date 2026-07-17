@@ -130,10 +130,16 @@ func (c *Client) ListModels(ctx context.Context, token string, settings store.Se
 	if settings.IsKimiWork() {
 		// UI may show "responses" preference, but upstream is chat/completions only.
 		return []ModelInfo{
-			{ID: "kimi-for-coding", Name: "Kimi For Coding (K3 wire)", Description: "agent-gw · chat/completions · K3 rates", APIMode: "chat"},
-			{ID: "k3-agent", Name: "K3 Max (Work)", Description: "Desktop K3 · Max · chat/completions", APIMode: "chat"},
-			{ID: "k3-agent-swarm", Name: "K3 Swarm Max (Work)", Description: "Desktop K3 Swarm · chat/completions", APIMode: "chat"},
-			{ID: "k2d6-agent", Name: "K2.6 Agent (Work)", Description: "Desktop K2.6 · chat/completions", APIMode: "chat"},
+			{ID: "k3-agent", Name: "K3 Max (Work)", Description: "agent-gw · chat/completions · K3 rates", APIMode: "chat"},
+			{ID: "k3-agent-low", Name: "K3 Max — Low Think", Description: "Desktop K3 · low reasoning effort", APIMode: "chat"},
+			{ID: "k3-agent-medium", Name: "K3 Max — Medium Think", Description: "Desktop K3 · medium reasoning effort", APIMode: "chat"},
+			{ID: "k3-agent-high", Name: "K3 Max — High Think", Description: "Desktop K3 · high reasoning effort", APIMode: "chat"},
+			{ID: "k3-agent-xhigh", Name: "K3 Max — Extra High Think", Description: "Desktop K3 · xhigh reasoning effort", APIMode: "chat"},
+			{ID: "k2d6-agent", Name: "K2.6 Agent (Work)", Description: "agent-gw · chat/completions · K2.6 rates", APIMode: "chat"},
+			{ID: "k2d6-agent-low", Name: "K2.6 Agent — Low Think", Description: "Desktop K2.6 · low reasoning effort", APIMode: "chat"},
+			{ID: "k2d6-agent-medium", Name: "K2.6 Agent — Medium Think", Description: "Desktop K2.6 · medium reasoning effort", APIMode: "chat"},
+			{ID: "k2d6-agent-high", Name: "K2.6 Agent — High Think", Description: "Desktop K2.6 · high reasoning effort", APIMode: "chat"},
+			{ID: "k2d6-agent-xhigh", Name: "K2.6 Agent — Extra High Think", Description: "Desktop K2.6 · xhigh reasoning effort", APIMode: "chat"},
 		}, nil
 	}
 	if settings.IsOllie() {
@@ -333,9 +339,10 @@ func resolveKimiUpstreamModel(model string) string {
 	m := strings.ToLower(strings.TrimSpace(model))
 	m = strings.TrimSuffix(m, "-responses")
 	m = strings.TrimSuffix(m, "-chat")
+	m = store.StripKimiEffortSuffix(m)
 	switch m {
 	case "", "default", "proxy", "auto", "kimi-work", "kimi-code", "kimi-for-coding",
-		"k3-agent", "k3-max", "k3", "k3-agent-swarm", "k3-agent-ultra", "k3-swarm",
+		"k3-agent", "k3-max", "k3", "k3-agent-ultra", "k3-swarm",
 		"k2d6-agent", "k2p6", "k2p6-agent":
 		return "kimi-for-coding"
 	default:
@@ -466,6 +473,11 @@ func (c *Client) streamChatCompletions(
 		}
 	}
 	if settings.IsKimiWork() {
+		// Kimi Work: model alias may embed effort (k3-agent-high → high)
+		_, modelEffort := store.ExtractKimiWorkEffort(model)
+		if modelEffort != "" {
+			effort = modelEffort
+		}
 		body["model"] = resolveKimiUpstreamModel(model)
 	}
 	raw, _ := json.Marshal(body)

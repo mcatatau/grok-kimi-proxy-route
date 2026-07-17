@@ -50,6 +50,10 @@ export function GetDeviceLoginState() {
   return window['go']['main']['App']['GetDeviceLoginState']();
 }
 
+export function GetKimiStealthHeadless() {
+  return window['go']['main']['App']['GetKimiStealthHeadless']();
+}
+
 export function GetSettings() {
   return window['go']['main']['App']['GetSettings']();
 }
@@ -94,6 +98,10 @@ export function ListSkills() {
   return window['go']['main']['App']['ListSkills']();
 }
 
+export function LogoffKimiAccount(arg1) {
+  return window['go']['main']['App']['LogoffKimiAccount'](arg1);
+}
+
 export function OpenExternal(arg1) {
   return window['go']['main']['App']['OpenExternal'](arg1);
 }
@@ -118,6 +126,10 @@ export function SetAutoCreateOnExhausted(arg1) {
   return window['go']['main']['App']['SetAutoCreateOnExhausted'](arg1);
 }
 
+export function SetKimiStealthHeadless(arg1) {
+  return window['go']['main']['App']['SetKimiStealthHeadless'](arg1);
+}
+
 export function StartAutoSignup() {
   return window['go']['main']['App']['StartAutoSignup']();
 }
@@ -128,6 +140,10 @@ export function StartDeviceLogin() {
 
 export function StartKimiBrowserLogin() {
   return window['go']['main']['App']['StartKimiBrowserLogin']();
+}
+
+export function StartKimiStealthLogin(arg1) {
+  return window['go']['main']['App']['StartKimiStealthLogin'](arg1);
 }
 
 export function SyncGrokCLI() {

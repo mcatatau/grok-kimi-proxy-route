@@ -274,7 +274,7 @@ func ResolveKimiModel(requested string) string {
 	m = strings.TrimSuffix(m, "@responses")
 	switch m {
 	case "", "default", "proxy", "auto", "kimi-work", "kimi-code", "kimi-for-coding",
-		"k3-agent", "k3-max", "k3", "k3-agent-swarm", "k3-agent-ultra", "k3-swarm",
+		"k3-agent", "k3-max", "k3", "k3-agent-ultra", "k3-swarm",
 		"k2d6-agent", "k2p6", "k2p6-agent":
 		return "kimi-for-coding"
 	default:
@@ -290,10 +290,15 @@ func ResolveKimiModel(requested string) string {
 // It is the coding/agent SKU backed by K3-class models on membership; platform list price ≈ K3.
 func StaticModels() []map[string]string {
 	return []map[string]string{
-		{"id": "kimi-for-coding", "name": "Kimi For Coding (K3 wire)", "api_mode": "responses"},
 		{"id": "k3-agent", "name": "K3 Max (Work)", "api_mode": "responses"},
-		{"id": "k3-agent-swarm", "name": "K3 Swarm Max (Work)", "api_mode": "responses"},
+		{"id": "k3-agent-low", "name": "K3 Max — Low Think", "api_mode": "responses"},
+		{"id": "k3-agent-medium", "name": "K3 Max — Medium Think", "api_mode": "responses"},
+		{"id": "k3-agent-high", "name": "K3 Max — High Think", "api_mode": "responses"},
+		{"id": "k3-agent-xhigh", "name": "K3 Max — Extra High Think", "api_mode": "responses"},
 		{"id": "k2d6-agent", "name": "K2.6 Agent (Work)", "api_mode": "responses"},
-		{"id": "kimi-for-coding-chat", "name": "Kimi For Coding (Chat API)", "api_mode": "chat"},
+		{"id": "k2d6-agent-low", "name": "K2.6 Agent — Low Think", "api_mode": "responses"},
+		{"id": "k2d6-agent-medium", "name": "K2.6 Agent — Medium Think", "api_mode": "responses"},
+		{"id": "k2d6-agent-high", "name": "K2.6 Agent — High Think", "api_mode": "responses"},
+		{"id": "k2d6-agent-xhigh", "name": "K2.6 Agent — Extra High Think", "api_mode": "responses"},
 	}
 }

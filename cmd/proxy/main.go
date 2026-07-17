@@ -14,6 +14,7 @@ import (
 	"syscall"
 	"time"
 
+	"grok-desktop/internal/kimi"
 	"grok-desktop/internal/oauth"
 	"grok-desktop/internal/proxyhttp"
 	"grok-desktop/internal/store"
@@ -42,6 +43,24 @@ func main() {
 	srv := proxyhttp.New(st, up, ensure)
 	srv.SetForceRefresh(forceRefresh)
 	srv.SetQuotaHandler(func(accountID, reason string) bool {
+		// Kimi: delete consumer account on kimi.com when quota ends (web JWT), then drop local.
+		if acc, ok := st.GetAccount(accountID); ok && acc != nil && acc.NormalizedProvider() == store.ProviderKimiWork {
+			if kimi.HasWebSession(acc.AccessToken, acc.RefreshToken) {
+				if _, err := kimi.LogoffWithSession(acc.AccessToken, acc.RefreshToken); err != nil {
+					log.Printf("kimi logoff failed for %s: %v — mark exhausted", accountID, err)
+				} else {
+					log.Printf("kimi logoff OK — deleted remote account %s (%s)", accountID, acc.Email)
+					_ = st.RemoveAccount(accountID)
+					if next := st.NextUsableAccountID(accountID); next != "" {
+						_ = st.SetActiveAccount(next)
+						return true
+					}
+					return false
+				}
+			} else {
+				log.Printf("kimi quota: %s has no web session (sk-kimi only?) — mark exhausted", accountID)
+			}
+		}
 		_, _ = st.MarkExhausted(accountID, reason)
 		if next := st.NextUsableAccountID(accountID); next != "" {
 			_ = st.SetActiveAccount(next)
@@ -91,6 +110,9 @@ func ensureCreds(
 	forceRefresh bool,
 ) (string, *store.Account, store.Settings, error) {
 	settings := st.Settings()
+	if rp := proxyhttp.RouteProviderFrom(ctx); rp != "" {
+		settings = settings.WithProvider(rp)
+	}
 	if settings.IsOllie() {
 		acc := &store.Account{
 			ID: "ollie", Label: "OllieChat", Email: "keyless@olliechat",
@@ -107,10 +129,32 @@ func ensureCreds(
 		}
 		return store.GeminiCredMarker, acc, settings, nil
 	}
+	if settings.IsKimiWork() {
+		_ = st.PreferHealthyActive()
+		acc, ok := st.PreferUsableAccountForProvider(store.ProviderKimiWork)
+		if preferID != "" {
+			if a, ok2 := st.GetAccount(preferID); ok2 && a != nil && a.NormalizedProvider() == store.ProviderKimiWork {
+				if !a.Exhausted() && !a.AuthDenied() {
+					acc, ok = a, true
+				}
+			}
+		}
+		if !ok || acc == nil {
+			return "", nil, settings, fmt.Errorf("nenhuma conta Kimi Work")
+		}
+		if cur, _ := st.ActiveAccount(); cur == nil || cur.NormalizedProvider() != store.ProviderKimiWork || cur.ID != acc.ID {
+			_ = st.SetActiveAccount(acc.ID)
+		}
+		return acc.BearerToken(), acc, settings, nil
+	}
 	if n, err := st.SyncFromGrokCLI(); err == nil && n > 0 {
 		_ = st.PreferHealthyActive()
 	}
-	settings = st.Settings()
+	if rp := proxyhttp.RouteProviderFrom(ctx); rp != "" {
+		settings = st.Settings().WithProvider(rp)
+	} else {
+		settings = st.Settings()
+	}
 
 	var acc *store.Account
 	var ok bool
@@ -118,7 +162,7 @@ func ensureCreds(
 		acc, ok = st.GetAccount(preferID)
 	}
 	if !ok || acc == nil {
-		acc, ok = st.PreferUsableAccount()
+		acc, ok = st.PreferUsableAccountForProvider(store.ProviderXAI)
 	}
 	if !ok || acc == nil {
 		return "", nil, settings, fmt.Errorf("nenhuma conta — faça login no Grok Desktop")

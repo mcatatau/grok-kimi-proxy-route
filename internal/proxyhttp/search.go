@@ -182,12 +182,14 @@ func (s *Server) runSearch(w http.ResponseWriter, r *http.Request, req SearchReq
 			}
 		}
 		quota := strings.Contains(low, "http 402") || strings.Contains(low, "balance exhausted") ||
+			strings.Contains(low, "usage limit") || strings.Contains(low, "resource_exhausted") ||
+			strings.Contains(low, "access_terminated") || strings.Contains(low, "billing cycle") ||
 			(strings.Contains(low, "http 429") && (strings.Contains(low, "exhausted") || strings.Contains(low, "quota") || strings.Contains(low, "balance")))
 		if quota && accountID != "" {
 			if fn := s.quotaHandler(); fn != nil {
 				if rotated := fn(accountID, msg); rotated {
 					tok2, acc2, settings2, err2 := s.ensure(r.Context())
-					if err2 == nil && (acc2 == nil || acc2.ID != accountID) {
+					if err2 == nil && tok2 != "" && (acc2 == nil || acc2.Usable()) {
 						token, acc, settings = tok2, acc2, settings2
 						if acc2 != nil {
 							accountID = acc2.ID

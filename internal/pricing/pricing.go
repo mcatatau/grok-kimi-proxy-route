@@ -34,8 +34,17 @@ var table = map[string]Rate{
 	"k3-agent": {
 		InputPerM: 3.00, CachedPerM: 0.30, OutputPerM: 15.00, Label: "K3 Max / Work (K3 rates)",
 	},
-	"k3-agent-swarm": {
-		InputPerM: 3.00, CachedPerM: 0.30, OutputPerM: 15.00, Label: "K3 Swarm Max (K3 rates)",
+	"k3-agent-low": {
+		InputPerM: 3.00, CachedPerM: 0.30, OutputPerM: 15.00, Label: "K3 Max Low Think (K3 rates)",
+	},
+	"k3-agent-medium": {
+		InputPerM: 3.00, CachedPerM: 0.30, OutputPerM: 15.00, Label: "K3 Max Medium Think (K3 rates)",
+	},
+	"k3-agent-high": {
+		InputPerM: 3.00, CachedPerM: 0.30, OutputPerM: 15.00, Label: "K3 Max High Think (K3 rates)",
+	},
+	"k3-agent-xhigh": {
+		InputPerM: 3.00, CachedPerM: 0.30, OutputPerM: 15.00, Label: "K3 Max XHigh Think (K3 rates)",
 	},
 	"k3-agent-ultra": {
 		InputPerM: 3.00, CachedPerM: 0.30, OutputPerM: 15.00, Label: "K3 Swarm Max (K3 rates)",
